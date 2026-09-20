@@ -254,6 +254,7 @@ def transcribe_track(
     model_path: Path,
     speech_regions: list[float],
     progress: tqdm.tqdm,
+    initial_prompt: str | None = None,
 ) -> tuple[list[tuple[float, str]], str | None]:
     """Transcribe one audio track into ((segment_start_offset, text) tuples, detected language).
 
@@ -272,17 +273,111 @@ def transcribe_track(
             path_or_hf_repo=str(model_path),
             clip_timestamps=speech_regions,
             verbose=None,
+            initial_prompt=initial_prompt,
         )
     segments = [(segment["start"], segment["text"]) for segment in result["segments"]]
     return segments, result.get("language")
 
 
-def apply_vocabulary(text: str, vocabulary: dict[str, list[str]]) -> str:
-    """Case-insensitively replace known wrong variants with the correct term."""
-    for correct_term, variants in vocabulary.items():
-        for variant in variants:
-            text = re.sub(re.escape(variant), correct_term, text, flags=re.IGNORECASE)
+class VocabularyParseError(Exception):
+    """Raised for a structural or content error in a vocabulary.md file."""
+
+
+def parse_vocabulary(path: Path) -> dict[str, dict]:
+    """Parse a `vocabulary.md` file into `{term: {misheard_as, fields}}`.
+
+    See docs/plans/completed/9-add-campaign-vocabulary-file.md for the format.
+    """
+    vocabulary: dict[str, dict] = {}
+    current_term: str | None = None
+
+    for lineno, raw_line in enumerate(path.read_text().splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("### "):
+            name = line[len("### "):].strip()
+            if name in vocabulary:
+                raise VocabularyParseError(
+                    f"{path}:{lineno}: duplicate term '{name}'"
+                )
+            vocabulary[name] = {"misheard_as": [], "fields": {}}
+            current_term = name
+            continue
+        if line.startswith("# ") or line.startswith("## "):
+            continue
+        if line.startswith("- "):
+            if current_term is None:
+                raise VocabularyParseError(
+                    f"{path}:{lineno}: bullet found outside any term section: {raw_line!r}"
+                )
+            body = line[len("- "):]
+            if ":" not in body:
+                raise VocabularyParseError(
+                    f"{path}:{lineno}: malformed bullet (expected 'Label: value'): {raw_line!r}"
+                )
+            label, value = body.split(":", 1)
+            label = label.strip()
+            value = value.strip()
+            if label.lower() == "misheard as":
+                vocabulary[current_term]["misheard_as"] = [
+                    v.strip() for v in value.split(",")
+                ]
+            else:
+                vocabulary[current_term]["fields"][label] = value
+            continue
+        raise VocabularyParseError(f"{path}:{lineno}: malformed line: {raw_line!r}")
+
+    return vocabulary
+
+
+_SENTENCE_START = re.compile(r"^\s*$|[.!?]\s*$")
+
+
+def apply_vocabulary(text: str, vocabulary: dict) -> str:
+    """Case-insensitively replace known `misheard_as` variants with the canonical term.
+
+    Capitalizes only the replacement's first letter, regardless of the
+    term's own casing, when the match starts `text` or follows `.`/`!`/`?`
+    plus whitespace; otherwise uses the term's exact canonical casing.
+    """
+    for term, data in vocabulary.items():
+        for variant in data["misheard_as"]:
+            pattern = re.compile(re.escape(variant), re.IGNORECASE)
+
+            def _replace(match: re.Match, term: str = term) -> str:
+                prefix = text[: match.start()]
+                if _SENTENCE_START.search(prefix):
+                    return term[:1].upper() + term[1:]
+                return term
+
+            text = pattern.sub(_replace, text)
     return text
+
+
+def build_initial_prompt(vocabulary: dict, enrich_fields: set[str] | None) -> str:
+    """Build Whisper's `initial_prompt` from vocabulary term names.
+
+    `enrich_fields is None` -> bare term names only. `enrich_fields == set()`
+    -> append every field found per term ("all"). Non-empty `enrich_fields`
+    -> append only fields whose label case-insensitively matches an entry.
+    """
+    parts = []
+    for term, data in vocabulary.items():
+        fields = data["fields"]
+        if enrich_fields is None or not fields:
+            parts.append(term)
+            continue
+        if enrich_fields:
+            wanted_lower = {f.lower() for f in enrich_fields}
+            values = [v for label, v in fields.items() if label.lower() in wanted_lower]
+        else:
+            values = list(fields.values())
+        if values:
+            parts.append(f"{term} ({'; '.join(values)})")
+        else:
+            parts.append(term)
+    return ", ".join(parts)
 
 
 def resolve_speaker(username: str, speaker_map: dict[str, str], warned: set[str]) -> str:
@@ -387,6 +482,22 @@ def main() -> None:
     )
     parser.add_argument("--model", help="Override the configured whisper_model")
     parser.add_argument("--title", help="Override the session title")
+    parser.add_argument(
+        "--vocabulary",
+        type=Path,
+        default=None,
+        help="Path to vocabulary.md. Overrides the config `vocabulary_file` key "
+        "and the default ./vocabulary.md lookup.",
+    )
+    parser.add_argument(
+        "--enrich-vocabulary",
+        nargs="?",
+        const="",
+        default=None,
+        help="Seed Whisper's initial_prompt with vocabulary enrichment fields "
+        "in addition to term names. Bare flag includes every field found; "
+        "a comma-separated list (e.g. Tagline,Description) includes only those.",
+    )
     args = parser.parse_args()
 
     if not args.config.exists():
@@ -401,6 +512,47 @@ def main() -> None:
     vad_min_silence_ms = config.get("vad_min_silence_ms", 800)
     timestamp_format = config.get("timestamp_format", "%H:%M:%S")
     line_format = config.get("line_format", "[{timestamp}] {speaker}: {text}")
+
+    default_vocab_path = Path("./vocabulary.md")
+    if args.vocabulary is not None:
+        vocabulary_path = args.vocabulary
+    elif config.get("vocabulary_file"):
+        vocabulary_path = Path(config["vocabulary_file"])
+    elif default_vocab_path.exists():
+        vocabulary_path = default_vocab_path
+    else:
+        vocabulary_path = None
+
+    if vocabulary_path is None:
+        print("No vocabulary file configured or found; continuing without vocabulary.")
+        vocabulary: dict = {}
+    else:
+        try:
+            vocabulary = parse_vocabulary(vocabulary_path)
+        except VocabularyParseError as e:
+            sys.exit(f"error: {e}")
+        field_counts: dict[str, tuple[str, int]] = {}
+        for term_data in vocabulary.values():
+            for label in term_data["fields"]:
+                key = label.lower()
+                display, count = field_counts.get(key, (label, 0))
+                field_counts[key] = (display, count + 1)
+        fields_summary = ", ".join(
+            f"{display} ×{count}" for display, count in field_counts.values()
+        )
+        fields_note = f" (fields found: {fields_summary})" if fields_summary else ""
+        print(
+            f"Loaded vocabulary: {len(vocabulary)} terms from {vocabulary_path.name}"
+            f"{fields_note}"
+        )
+
+    if args.enrich_vocabulary is None:
+        enrich_fields = None
+    elif args.enrich_vocabulary == "":
+        enrich_fields = set()
+    else:
+        enrich_fields = {f.strip() for f in args.enrich_vocabulary.split(",")}
+    initial_prompt = build_initial_prompt(vocabulary, enrich_fields)
 
     if args.craig_folder is None:
         found_zip = find_default_zip(input_dir)
@@ -467,13 +619,13 @@ def main() -> None:
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
                 progress.write(f"Transcribing track {i}/{total}: {username}...")
                 segments, language = transcribe_track(
-                    audio_path, model_path, track_regions[username], progress
+                    audio_path, model_path, track_regions[username], progress, initial_prompt
                 )
                 if language:
                     progress.write(f"Detected language: {LANGUAGES.get(language, language).title()}")
                 progress.write(f"  -> {len(segments)} segments")
                 transcripts[username] = [
-                    (offset, apply_vocabulary(text, config["vocabulary"]))
+                    (offset, apply_vocabulary(text, vocabulary))
                     for offset, text in segments
                 ]
         print()

@@ -1,6 +1,7 @@
 .DS_Store
 docs/craig-test-files/
 config.yaml
+vocabulary.md
 .venv/
 __pycache__/
 models/

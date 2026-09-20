@@ -17,12 +17,11 @@ speaker_map:
   alice42: Alice
   someplayer: Some Player
 
-# Word-replacement post-pass: correct term -> list of wrong transcriptions
-# Whisper commonly produces for it. Case-insensitive find/replace.
-vocabulary:
-  goblin:
-    - groblin
-    - gobblin
+# Path to a vocabulary.md file (campaign terms, post-fix corrections, and
+# Whisper prompt seeding). Optional — if omitted, ./vocabulary.md is used
+# when it exists. Overridable per-run with `transcribe.py --vocabulary <path>`.
+# See vocabulary.example.md for the file format.
+vocabulary_file: ./vocabulary.md
 
 # Directory the transcript Markdown files are written to.
 output_dir: ./transcripts
