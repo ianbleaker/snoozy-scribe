@@ -1,2 +1,6 @@
 .DS_Store
 docs/craig-test-files/
+config.yaml
+.venv/
+__pycache__/
+models/

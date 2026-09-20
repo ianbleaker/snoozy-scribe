@@ -1,0 +1,28 @@
+# Copy this file to config.yaml and fill in real values. config.yaml is
+# gitignored and never pushed to GitHub.
+
+# mlx-whisper model repo (Hugging Face). Larger/non-quantized models are
+# slower but more accurate. Can be overridden per-run with
+# `transcribe.py --model <repo-id>`.
+whisper_model: mlx-community/whisper-large-v3-turbo-q4
+
+# Local directory model weights are downloaded into (and read from). Created
+# automatically on first run if missing. Gitignored — weights are large and
+# environment-specific.
+model_dir: ./models
+
+# Maps Craig's Discord usernames (discriminator stripped, e.g. "alice42#0"
+# becomes "alice42") to the name that should appear in the transcript.
+speaker_map:
+  alice42: Alice
+  someplayer: Some Player
+
+# Word-replacement post-pass: correct term -> list of wrong transcriptions
+# Whisper commonly produces for it. Case-insensitive find/replace.
+vocabulary:
+  goblin:
+    - groblin
+    - gobblin
+
+# Directory the transcript Markdown files are written to.
+output_dir: ./transcripts
