@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import re
 import shutil
 import sys
@@ -19,8 +20,10 @@ import mlx_whisper
 import numpy as np
 import silero_vad
 import torch
+import tqdm
 import yaml
 from huggingface_hub import snapshot_download
+from mlx_whisper.audio import FRAMES_PER_SECOND
 
 VAD_SAMPLE_RATE = 16000
 
@@ -146,8 +149,10 @@ def _read_audio_for_vad(audio_path: Path) -> torch.Tensor:
     return torch.from_numpy(samples)
 
 
-def detect_speech_regions(audio_path: Path, min_silence_ms: int) -> list[float]:
-    """Return flat [start1, end1, start2, end2, ...] speech regions in seconds.
+def detect_speech_regions(
+    audio_path: Path, min_silence_ms: int
+) -> tuple[list[float], float]:
+    """Return (flat [start1, end1, start2, end2, ...] speech regions, raw duration), in seconds.
 
     `min_silence_ms` sets how long a pause must be before it splits speech
     into separate regions. Silero's own default (100ms) fragments speech on
@@ -175,23 +180,89 @@ def detect_speech_regions(audio_path: Path, min_silence_ms: int) -> list[float]:
     for entry in timestamps:
         regions.append(entry["start"])
         regions.append(entry["end"])
-    return regions
+    duration = len(wav) / VAD_SAMPLE_RATE
+    return regions, duration
+
+
+def speech_seconds(regions: list[float]) -> float:
+    """Sum of region durations in a flat [start1, end1, start2, end2, ...] list."""
+    return sum(end - start for start, end in zip(regions[::2], regions[1::2]))
+
+
+def speech_frames(regions: list[float]) -> int:
+    """Whisper mel-frame count Whisper will actually decode for these regions.
+
+    Mirrors mlx_whisper's own `seek_points = round(ts * FRAMES_PER_SECOND)`
+    rounding so this matches, frame for frame, what its internal progress
+    bar advances by.
+    """
+    frames = [round(ts * FRAMES_PER_SECOND) for ts in regions]
+    return sum(end - start for start, end in zip(frames[::2], frames[1::2]))
+
+
+class _ForwardingPbar:
+    """Stand-in for `tqdm.tqdm` that forwards `.update()` calls to a shared bar."""
+
+    def __init__(self, master: tqdm.tqdm):
+        self._master = master
+
+    def update(self, n: int = 1) -> None:
+        self._master.update(n)
+
+    def __enter__(self) -> "_ForwardingPbar":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+
+class _TqdmShim:
+    """Replaces the `tqdm` name mlx_whisper.transcribe's module sees.
+
+    mlx_whisper's internal progress bar is keyed to the full audio file's
+    frame count, not to the speech-only regions we hand it via
+    `clip_timestamps` — so it stalls well short of 100% on any track with
+    real silence. Its `pbar.update(n)` calls only ever fire for frames it
+    actually decodes though, so redirecting them into one master bar sized
+    to the true speech-frame total (from VAD) gives an accurate, live,
+    whole-job progress percentage instead.
+    """
+
+    def __init__(self, master: tqdm.tqdm):
+        self._master = master
+
+    def tqdm(self, *args: object, **kwargs: object) -> _ForwardingPbar:
+        return _ForwardingPbar(self._master)
+
+
+@contextlib.contextmanager
+def _redirect_mlx_whisper_progress(master: tqdm.tqdm):
+    transcribe_module = importlib.import_module("mlx_whisper.transcribe")
+    original_tqdm = transcribe_module.tqdm
+    transcribe_module.tqdm = _TqdmShim(master)
+    try:
+        yield
+    finally:
+        transcribe_module.tqdm = original_tqdm
 
 
 def transcribe_track(
-    audio_path: Path, model_path: Path, vad_min_silence_ms: int
+    audio_path: Path,
+    model_path: Path,
+    speech_regions: list[float],
+    progress: tqdm.tqdm,
 ) -> list[tuple[float, str]]:
     """Transcribe one audio track into (segment_start_offset, text) tuples."""
-    speech_regions = detect_speech_regions(audio_path, vad_min_silence_ms)
     if not speech_regions:
         return []
 
-    result = mlx_whisper.transcribe(
-        str(audio_path),
-        path_or_hf_repo=str(model_path),
-        clip_timestamps=speech_regions,
-        verbose=False,
-    )
+    with _redirect_mlx_whisper_progress(progress):
+        result = mlx_whisper.transcribe(
+            str(audio_path),
+            path_or_hf_repo=str(model_path),
+            clip_timestamps=speech_regions,
+            verbose=False,
+        )
     return [(segment["start"], segment["text"]) for segment in result["segments"]]
 
 
@@ -281,6 +352,11 @@ def write_transcript(
     return output_path
 
 
+def _format_duration(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m {secs}s" if minutes else f"{secs}s"
+
+
 def main() -> None:
     start_time = time.monotonic()
 
@@ -345,6 +421,21 @@ def main() -> None:
         print(f"Parsed manifest: {len(usernames)} speakers, session started {session_start}")
         matched = match_tracks(craig_folder, usernames)
 
+        print(f"Analyzing speech regions (VAD) for {len(matched)} tracks...")
+        track_regions: dict[str, list[float]] = {}
+        total_raw_s = 0.0
+        total_speech_s = 0.0
+        for username, audio_path in matched.items():
+            regions, duration = detect_speech_regions(audio_path, vad_min_silence_ms)
+            track_regions[username] = regions
+            total_raw_s += duration
+            total_speech_s += speech_seconds(regions)
+        speech_pct = (total_speech_s / total_raw_s * 100) if total_raw_s else 0.0
+        print(
+            f"VAD: {_format_duration(total_speech_s)} speech / "
+            f"{_format_duration(total_raw_s)} raw audio ({speech_pct:.0f}%) to transcribe"
+        )
+
         model_dir = Path(config["model_dir"])
         target_model_dir = model_dir / model_repo.split("/")[-1]
         print(f"Resolving model {model_repo}...")
@@ -352,16 +443,22 @@ def main() -> None:
             print("Downloading model (first run)...")
         model_path = resolve_model_path(model_repo, model_dir)
 
+        total_frames = sum(speech_frames(regions) for regions in track_regions.values())
         transcripts = {}
         total = len(matched)
-        for i, (username, audio_path) in enumerate(matched.items(), start=1):
-            print(f"Transcribing track {i}/{total}: {username}...")
-            segments = transcribe_track(audio_path, model_path, vad_min_silence_ms)
-            print(f"  -> {len(segments)} segments")
-            transcripts[username] = [
-                (offset, apply_vocabulary(text, config["vocabulary"]))
-                for offset, text in segments
-            ]
+        with tqdm.tqdm(
+            total=total_frames, unit="frames", desc="Transcribing", disable=total_frames == 0
+        ) as progress:
+            for i, (username, audio_path) in enumerate(matched.items(), start=1):
+                print(f"Transcribing track {i}/{total}: {username}...")
+                segments = transcribe_track(
+                    audio_path, model_path, track_regions[username], progress
+                )
+                print(f"  -> {len(segments)} segments")
+                transcripts[username] = [
+                    (offset, apply_vocabulary(text, config["vocabulary"]))
+                    for offset, text in segments
+                ]
 
         print("Merging tracks...")
         merged = merge_tracks(session_start, transcripts)
@@ -380,9 +477,7 @@ def main() -> None:
             mark_zip_processed(resolved_input_path, input_dir)
 
     elapsed = time.monotonic() - start_time
-    minutes, seconds = divmod(int(elapsed), 60)
-    elapsed_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
-    print(f"Wrote transcript to {output_path} ({elapsed_str})")
+    print(f"Wrote transcript to {output_path} ({_format_duration(elapsed)})")
 
 
 if __name__ == "__main__":
