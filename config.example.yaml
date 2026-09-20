@@ -37,6 +37,28 @@ input_dir: ./input
 # distinct utterances together. Defaults to 800 if omitted.
 vad_min_silence_ms: 800
 
+# Minimum speech duration (in milliseconds) for a detected region to be kept.
+# Shorter detected "speech" (coughs, breath, mic pops) is dropped before it
+# ever reaches Whisper. Defaults to 250 if omitted, matching Silero's own
+# default.
+vad_min_speech_ms: 250
+
+# Maximum silence (in milliseconds) between two segments from the *same
+# speaker* before they're merged into one transcript line instead of kept as
+# separate fragmented lines. Whisper often splits one sentence into several
+# segments; this stitches them back together. May need tuning alongside
+# vad_min_silence_ms for best results, since VAD's own silence-gap merging
+# affects how Whisper chunks speech in the first place. Defaults to 2000 if
+# omitted.
+merge_gap_ms: 2000
+
+# Words dropped entirely when they're a transcript line's whole text
+# (case/trailing-punctuation-insensitive) — cut-off speech, coughs, or
+# laughs that Whisper mistranscribed as a bare word. Never strips a word out
+# of a longer real sentence, and never applies to a "!! "-flagged line.
+# Defaults to the list below if omitted.
+filler_words: ["so", "you", "um", "uh", "hm", "hmm"]
+
 # strftime() format for each line's timestamp. Defaults to "%H:%M:%S" if
 # omitted.
 timestamp_format: "%H:%M:%S"

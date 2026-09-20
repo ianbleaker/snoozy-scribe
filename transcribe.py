@@ -96,7 +96,7 @@ def write_track_partial(
     partial_dir: Path,
     username: str,
     audio_path: Path,
-    segments: list[tuple[float, str, float]],
+    segments: list[tuple[float, float, str, float]],
     language: str | None,
 ) -> None:
     stat = audio_path.stat()
@@ -112,7 +112,7 @@ def write_track_partial(
 
 def load_track_partial(
     partial_dir: Path, username: str, audio_path: Path, progress: tqdm.tqdm | None = None
-) -> tuple[list[tuple[float, str, float]], str | None] | None:
+) -> tuple[list[tuple[float, float, str, float]], str | None] | None:
     partial_path = partial_dir / f"{_safe_track_filename(username)}.json"
     try:
         data = json.loads(partial_path.read_text())
@@ -126,7 +126,8 @@ def load_track_partial(
         return None
 
     segments = [
-        (offset, text, compression_ratio) for offset, text, compression_ratio in data["segments"]
+        (start, end, text, compression_ratio)
+        for start, end, text, compression_ratio in data["segments"]
     ]
     return segments, data["language"]
 
@@ -285,6 +286,7 @@ def crop_track(audio_path: Path, start: float, length: float, dest_dir: Path, us
 def detect_speech_regions(
     audio_path: Path,
     min_silence_ms: int,
+    min_speech_ms: int = 250,
     progress_callback: Callable[[float], None] | None = None,
 ) -> tuple[list[float], float]:
     """Return (flat [start1, end1, start2, end2, ...] speech regions, raw duration), in seconds.
@@ -292,6 +294,10 @@ def detect_speech_regions(
     `min_silence_ms` sets how long a pause must be before it splits speech
     into separate regions; see docs/design/transcription-pipeline.md for why
     the default (800ms) overrides Silero's own 100ms.
+
+    `min_speech_ms` drops detected speech regions shorter than this (coughs,
+    breath, mic pops) before they reach Whisper; defaults to Silero's own
+    250ms default. See docs/design/transcription-pipeline.md.
     """
     global _vad_model
     if _vad_model is None:
@@ -304,6 +310,7 @@ def detect_speech_regions(
         sampling_rate=VAD_SAMPLE_RATE,
         return_seconds=True,
         min_silence_duration_ms=min_silence_ms,
+        min_speech_duration_ms=min_speech_ms,
         progress_tracking_callback=progress_callback,
     )
 
@@ -377,9 +384,9 @@ def transcribe_track(
     speech_regions: list[float],
     progress: tqdm.tqdm,
     initial_prompt: str | None = None,
-) -> tuple[list[tuple[float, str, float]], str | None]:
-    """Transcribe one audio track into ((segment_start_offset, text, compression_ratio)
-    tuples, detected language)."""
+) -> tuple[list[tuple[float, float, str, float]], str | None]:
+    """Transcribe one audio track into ((segment_start_offset, segment_end_offset,
+    text, compression_ratio) tuples, detected language)."""
     # verbose=None (not mlx_whisper's default False) suppresses its own prints,
     # which would otherwise corrupt the live progress bar; see
     # docs/design/transcription-pipeline.md.
@@ -395,7 +402,7 @@ def transcribe_track(
             initial_prompt=initial_prompt,
         )
     segments = [
-        (segment["start"], segment["text"], segment["compression_ratio"])
+        (segment["start"], segment["end"], segment["text"], segment["compression_ratio"])
         for segment in result["segments"]
     ]
     return segments, result.get("language")
@@ -516,33 +523,85 @@ def resolve_speaker(username: str, speaker_map: dict[str, str], warned: set[str]
     return username
 
 
+_TRAILING_PUNCTUATION = re.compile(r"[.,!?;:\s]+$")
+
+
+def _normalize(text: str) -> str:
+    """Lowercase and strip trailing punctuation/whitespace, for repeat/filler comparisons."""
+    return _TRAILING_PUNCTUATION.sub("", text.lower())
+
+
 def merge_tracks(
     session_start: datetime,
-    transcripts: dict[str, list[tuple[float, str, float]]],
+    transcripts: dict[str, list[tuple[float, float, str, float]]],
+    merge_gap_seconds: float,
+    filler_words: list[str],
 ) -> list[tuple[datetime, str, str]]:
     """Interleave per-track segments into one chronological transcript.
+
+    Consecutive segments from the same speaker (per-track, ignoring what
+    other speakers' tracks were doing at the same time) are merged into one
+    line when the silence between them (`next.start - prev.end`) is at most
+    `merge_gap_seconds`; see docs/design/transcription-pipeline.md.
+
+    A segment is dropped entirely if its text, normalized (lowercased,
+    trailing punctuation stripped), exactly matches an entry in
+    `filler_words` (whole-line match only) or matches the previous surviving
+    segment from the same speaker (repeat dedup, also normalized so
+    "Okay."/"okay"/"Okay," collapse). The original, non-normalized text is
+    kept for whichever occurrence is emitted.
 
     Segments whose compression ratio is still above
     `COMPRESSION_RATIO_THRESHOLD` after mlx_whisper's own temperature
     fallback are flagged with a "!! " prefix rather than silently emitted —
     that ratio means mlx_whisper itself treated the decode as a repetition
-    failure and had nothing better to fall back to.
+    failure and had nothing better to fall back to. A flagged segment is
+    exempt from filler-word dropping and repeat dedup, and is never merged
+    with a neighbor in either direction — it's always emitted as its own
+    line, unchanged, for human review.
     """
     merged: list[tuple[datetime, str, str]] = []
+    normalized_filler_words = {_normalize(word) for word in filler_words}
 
     for username, segments in transcripts.items():
-        previous_text: str | None = None
-        for offset, text, compression_ratio in segments:
+        previous_normalized: str | None = None
+        buffer_start: float | None = None
+        buffer_end: float | None = None
+        buffer_text: str | None = None
+
+        for start, end, text, compression_ratio in segments:
             stripped = text.strip()
             if stripped in ("", "..."):
                 continue
-            if stripped == previous_text:
+            flagged = compression_ratio > COMPRESSION_RATIO_THRESHOLD
+            normalized = _normalize(stripped)
+            if not flagged and normalized in normalized_filler_words:
                 continue
-            previous_text = stripped
-            if compression_ratio > COMPRESSION_RATIO_THRESHOLD:
-                stripped = f"!! {stripped}"
-            timestamp = session_start + timedelta(seconds=offset)
-            merged.append((timestamp, username, stripped))
+            if not flagged and normalized == previous_normalized:
+                continue
+            previous_normalized = normalized
+
+            if flagged:
+                if buffer_text is not None:
+                    timestamp = session_start + timedelta(seconds=buffer_start)
+                    merged.append((timestamp, username, buffer_text))
+                    buffer_start = buffer_end = buffer_text = None
+                timestamp = session_start + timedelta(seconds=start)
+                merged.append((timestamp, username, f"!! {stripped}"))
+                continue
+
+            if buffer_text is not None and start - buffer_end <= merge_gap_seconds:
+                buffer_text = f"{buffer_text} {stripped}"
+                buffer_end = end
+            else:
+                if buffer_text is not None:
+                    timestamp = session_start + timedelta(seconds=buffer_start)
+                    merged.append((timestamp, username, buffer_text))
+                buffer_start, buffer_end, buffer_text = start, end, stripped
+
+        if buffer_text is not None:
+            timestamp = session_start + timedelta(seconds=buffer_start)
+            merged.append((timestamp, username, buffer_text))
 
     merged.sort(key=lambda entry: entry[0])
     return merged
@@ -681,8 +740,11 @@ def main() -> None:
     model_repo = args.model or config["whisper_model"]
     input_dir = Path(config.get("input_dir", "./input"))
     vad_min_silence_ms = config.get("vad_min_silence_ms", 800)
+    vad_min_speech_ms = config.get("vad_min_speech_ms", 250)
+    merge_gap_ms = config.get("merge_gap_ms", 2000)
     timestamp_format = config.get("timestamp_format", "%H:%M:%S")
     line_format = config.get("line_format", "[{timestamp}] {speaker}: {text}")
+    filler_words = config.get("filler_words", ["so", "you", "um", "uh", "hm", "hmm"])
 
     default_vocab_path = Path("./vocabulary.md")
     if args.vocabulary is not None:
@@ -806,7 +868,10 @@ def main() -> None:
                 vad_progress.reset(total=100)
                 vad_progress.set_description(f"VAD {i}/{vad_total}: {username}")
                 regions, duration = detect_speech_regions(
-                    audio_path, vad_min_silence_ms, _on_vad_progress
+                    audio_path,
+                    vad_min_silence_ms,
+                    vad_min_speech_ms,
+                    _on_vad_progress,
                 )
                 track_regions[username] = regions
                 track_speech_s = speech_seconds(regions)
@@ -876,13 +941,18 @@ def main() -> None:
                     progress.write(f"  Detected language: {LANGUAGES.get(language, language).title()}")
                 progress.write(f"  -> {len(segments)} segments")
                 transcripts[username] = [
-                    (offset + window_start, apply_vocabulary(text, vocabulary), compression_ratio)
-                    for offset, text, compression_ratio in segments
+                    (
+                        offset + window_start,
+                        end + window_start,
+                        apply_vocabulary(text, vocabulary),
+                        compression_ratio,
+                    )
+                    for offset, end, text, compression_ratio in segments
                 ]
         print()
 
         print("Merging tracks...")
-        merged = merge_tracks(session_start, transcripts)
+        merged = merge_tracks(session_start, transcripts, merge_gap_ms / 1000, filler_words)
         warned_speakers: set[str] = set()
         resolved = [
             (timestamp, resolve_speaker(username, config["speaker_map"], warned_speakers), text)
