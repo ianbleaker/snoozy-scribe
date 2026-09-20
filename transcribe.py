@@ -30,6 +30,13 @@ VAD_SAMPLE_RATE = 16000
 
 AUDIO_EXTENSIONS = {".flac", ".wav", ".mp3", ".m4a", ".ogg", ".aac"}
 
+# Matches mlx_whisper.transcribe's own default: a segment above this gzip
+# compression ratio is repetitive enough that mlx_whisper already retried it
+# at higher temperatures internally. If it's still above threshold here,
+# every retry failed and mlx_whisper fell back to the last (still bad)
+# decode rather than dropping it — see docs/design/transcription-pipeline.md.
+COMPRESSION_RATIO_THRESHOLD = 2.4
+
 _vad_model = None
 
 
@@ -234,8 +241,9 @@ def transcribe_track(
     speech_regions: list[float],
     progress: tqdm.tqdm,
     initial_prompt: str | None = None,
-) -> tuple[list[tuple[float, str]], str | None]:
-    """Transcribe one audio track into ((segment_start_offset, text) tuples, detected language)."""
+) -> tuple[list[tuple[float, str, float]], str | None]:
+    """Transcribe one audio track into ((segment_start_offset, text, compression_ratio)
+    tuples, detected language)."""
     # verbose=None (not mlx_whisper's default False) suppresses its own prints,
     # which would otherwise corrupt the live progress bar; see
     # docs/design/transcription-pipeline.md.
@@ -250,7 +258,10 @@ def transcribe_track(
             verbose=None,
             initial_prompt=initial_prompt,
         )
-    segments = [(segment["start"], segment["text"]) for segment in result["segments"]]
+    segments = [
+        (segment["start"], segment["text"], segment["compression_ratio"])
+        for segment in result["segments"]
+    ]
     return segments, result.get("language")
 
 
@@ -371,20 +382,29 @@ def resolve_speaker(username: str, speaker_map: dict[str, str], warned: set[str]
 
 def merge_tracks(
     session_start: datetime,
-    transcripts: dict[str, list[tuple[float, str]]],
+    transcripts: dict[str, list[tuple[float, str, float]]],
 ) -> list[tuple[datetime, str, str]]:
-    """Interleave per-track segments into one chronological transcript."""
+    """Interleave per-track segments into one chronological transcript.
+
+    Segments whose compression ratio is still above
+    `COMPRESSION_RATIO_THRESHOLD` after mlx_whisper's own temperature
+    fallback are flagged with a "!! " prefix rather than silently emitted —
+    that ratio means mlx_whisper itself treated the decode as a repetition
+    failure and had nothing better to fall back to.
+    """
     merged: list[tuple[datetime, str, str]] = []
 
     for username, segments in transcripts.items():
         previous_text: str | None = None
-        for offset, text in segments:
+        for offset, text, compression_ratio in segments:
             stripped = text.strip()
             if stripped in ("", "..."):
                 continue
             if stripped == previous_text:
                 continue
             previous_text = stripped
+            if compression_ratio > COMPRESSION_RATIO_THRESHOLD:
+                stripped = f"!! {stripped}"
             timestamp = session_start + timedelta(seconds=offset)
             merged.append((timestamp, username, stripped))
 
@@ -610,8 +630,8 @@ def main() -> None:
                     progress.write(f"  Detected language: {LANGUAGES.get(language, language).title()}")
                 progress.write(f"  -> {len(segments)} segments")
                 transcripts[username] = [
-                    (offset, apply_vocabulary(text, vocabulary))
-                    for offset, text in segments
+                    (offset, apply_vocabulary(text, vocabulary), compression_ratio)
+                    for offset, text, compression_ratio in segments
                 ]
         print()
 
