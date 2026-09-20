@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib
+import json
 import re
 import shutil
 import sys
@@ -43,6 +45,89 @@ _vad_model = None
 
 def _strip_discriminator(username: str) -> str:
     return username.split("#", 1)[0]
+
+
+def _slugify(session_title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", session_title.lower()).strip("-")
+
+
+def _safe_track_filename(username: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", username)
+
+
+def partial_dir_for(output_dir: Path, slug: str) -> Path:
+    return output_dir / ".partial" / slug
+
+
+def write_partial_meta(
+    partial_dir: Path, model_repo: str, vad_min_silence_ms: int, initial_prompt: str
+) -> None:
+    partial_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "model_repo": model_repo,
+        "vad_min_silence_ms": vad_min_silence_ms,
+        "initial_prompt_hash": hashlib.sha256(initial_prompt.encode()).hexdigest(),
+    }
+    (partial_dir / "_meta.json").write_text(json.dumps(meta))
+
+
+def load_partial_meta(partial_dir: Path) -> dict | None:
+    try:
+        return json.loads((partial_dir / "_meta.json").read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def meta_matches(
+    meta: dict | None, model_repo: str, vad_min_silence_ms: int, initial_prompt: str
+) -> bool:
+    if meta is None:
+        return False
+    return (
+        meta.get("model_repo") == model_repo
+        and meta.get("vad_min_silence_ms") == vad_min_silence_ms
+        and meta.get("initial_prompt_hash")
+        == hashlib.sha256(initial_prompt.encode()).hexdigest()
+    )
+
+
+def write_track_partial(
+    partial_dir: Path,
+    username: str,
+    audio_path: Path,
+    segments: list[tuple[float, str, float]],
+    language: str | None,
+) -> None:
+    stat = audio_path.stat()
+    data = {
+        "audio_mtime": stat.st_mtime,
+        "audio_size": stat.st_size,
+        "language": language,
+        "segments": segments,
+    }
+    partial_path = partial_dir / f"{_safe_track_filename(username)}.json"
+    partial_path.write_text(json.dumps(data))
+
+
+def load_track_partial(
+    partial_dir: Path, username: str, audio_path: Path, progress: tqdm.tqdm | None = None
+) -> tuple[list[tuple[float, str, float]], str | None] | None:
+    partial_path = partial_dir / f"{_safe_track_filename(username)}.json"
+    try:
+        data = json.loads(partial_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    stat = audio_path.stat()
+    if data["audio_mtime"] != stat.st_mtime or data["audio_size"] != stat.st_size:
+        message = f"!! warning: partial for {username} is stale (audio file changed), retranscribing"
+        progress.write(message) if progress is not None else print(message)
+        return None
+
+    segments = [
+        (offset, text, compression_ratio) for offset, text, compression_ratio in data["segments"]
+    ]
+    return segments, data["language"]
 
 
 def parse_manifest(craig_folder: Path) -> tuple[datetime, list[str]]:
@@ -432,7 +517,7 @@ def write_transcript(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    slug = re.sub(r"[^a-z0-9]+", "-", session_title.lower()).strip("-")
+    slug = _slugify(session_title)
     output_path = output_dir / f"{slug}.md"
 
     speakers = list(dict.fromkeys(name for _, name, _ in merged))
@@ -508,6 +593,12 @@ def main() -> None:
         "in addition to term names. Bare flag includes every field found; "
         "a comma-separated list (e.g. Tagline,Description) includes only those.",
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Ignore any saved partial output for this session and retranscribe "
+        "every track from scratch.",
+    )
     args = parser.parse_args()
 
     if not args.config.exists():
@@ -582,6 +673,9 @@ def main() -> None:
         resolved_input_path.resolve().stem if is_zip else resolved_input_path.resolve().name
     )
 
+    slug = _slugify(session_title)
+    partial_dir = partial_dir_for(Path(config["output_dir"]), slug)
+
     extraction_ctx = tempfile.TemporaryDirectory() if is_zip else contextlib.nullcontext()
     with extraction_ctx as tmp_dir:
         if is_zip:
@@ -639,14 +733,38 @@ def main() -> None:
         total_frames = sum(speech_frames(regions) for regions in track_regions.values())
         transcripts = {}
         total = len(matched)
+
+        if args.fresh and partial_dir.exists():
+            shutil.rmtree(partial_dir)
+            print("Ignoring saved partial output (--fresh).")
+        elif partial_dir.exists():
+            meta = load_partial_meta(partial_dir)
+            if not meta_matches(meta, model_repo, vad_min_silence_ms, initial_prompt):
+                print(
+                    "!! warning: saved partial output for this session doesn't match the "
+                    "current model/VAD/vocabulary config, discarding and retranscribing "
+                    "all tracks"
+                )
+                shutil.rmtree(partial_dir)
+        write_partial_meta(partial_dir, model_repo, vad_min_silence_ms, initial_prompt)
+
         with tqdm.tqdm(
             total=total_frames, unit="frames", desc="Transcribing", disable=total_frames == 0
         ) as progress:
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
-                progress.write(f"Transcribing track {i}/{total}: {username}...")
-                segments, language = transcribe_track(
-                    audio_path, model_path, track_regions[username], progress, initial_prompt
-                )
+                partial = load_track_partial(partial_dir, username, audio_path, progress)
+                if partial is not None:
+                    segments, language = partial
+                    progress.write(
+                        f"Resuming track {i}/{total}: {username} (from saved partial)..."
+                    )
+                    progress.update(speech_frames(track_regions[username]))
+                else:
+                    progress.write(f"Transcribing track {i}/{total}: {username}...")
+                    segments, language = transcribe_track(
+                        audio_path, model_path, track_regions[username], progress, initial_prompt
+                    )
+                    write_track_partial(partial_dir, username, audio_path, segments, language)
                 if language:
                     progress.write(f"  Detected language: {LANGUAGES.get(language, language).title()}")
                 progress.write(f"  -> {len(segments)} segments")
@@ -669,6 +787,7 @@ def main() -> None:
         output_path = write_transcript(
             resolved, session_title, Path(config["output_dir"]), timestamp_format, line_format
         )
+        shutil.rmtree(partial_dir, ignore_errors=True)
 
         if is_zip:
             mark_zip_processed(resolved_input_path, input_dir)
