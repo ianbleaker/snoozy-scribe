@@ -24,6 +24,7 @@ import tqdm
 import yaml
 from huggingface_hub import snapshot_download
 from mlx_whisper.audio import FRAMES_PER_SECOND
+from mlx_whisper.tokenizer import LANGUAGES
 
 VAD_SAMPLE_RATE = 16000
 
@@ -207,7 +208,9 @@ class _ForwardingPbar:
         self._master = master
 
     def update(self, n: int = 1) -> None:
-        self._master.update(n)
+        n = min(n, max(self._master.total - self._master.n, 0))
+        if n:
+            self._master.update(n)
 
     def __enter__(self) -> "_ForwardingPbar":
         return self
@@ -251,19 +254,27 @@ def transcribe_track(
     model_path: Path,
     speech_regions: list[float],
     progress: tqdm.tqdm,
-) -> list[tuple[float, str]]:
-    """Transcribe one audio track into (segment_start_offset, text) tuples."""
+) -> tuple[list[tuple[float, str]], str | None]:
+    """Transcribe one audio track into ((segment_start_offset, text) tuples, detected language).
+
+    Passes `verbose=None` rather than mlx_whisper's default `False`: `False`
+    still unconditionally prints "Detected language: ..." mid-decode, which
+    corrupts the live progress bar's line. `None` suppresses mlx_whisper's
+    own prints entirely; we report the detected language ourselves, cleanly,
+    once decoding finishes.
+    """
     if not speech_regions:
-        return []
+        return [], None
 
     with _redirect_mlx_whisper_progress(progress):
         result = mlx_whisper.transcribe(
             str(audio_path),
             path_or_hf_repo=str(model_path),
             clip_timestamps=speech_regions,
-            verbose=False,
+            verbose=None,
         )
-    return [(segment["start"], segment["text"]) for segment in result["segments"]]
+    segments = [(segment["start"], segment["text"]) for segment in result["segments"]]
+    return segments, result.get("language")
 
 
 def apply_vocabulary(text: str, vocabulary: dict[str, list[str]]) -> str:
@@ -416,10 +427,12 @@ def main() -> None:
             craig_folder = extract_zip(resolved_input_path, Path(tmp_dir))
         else:
             craig_folder = resolved_input_path
+        print()
 
         session_start, usernames = parse_manifest(craig_folder)
         print(f"Parsed manifest: {len(usernames)} speakers, session started {session_start}")
         matched = match_tracks(craig_folder, usernames)
+        print()
 
         print(f"Analyzing speech regions (VAD) for {len(matched)} tracks...")
         track_regions: dict[str, list[float]] = {}
@@ -435,6 +448,7 @@ def main() -> None:
             f"VAD: {_format_duration(total_speech_s)} speech / "
             f"{_format_duration(total_raw_s)} raw audio ({speech_pct:.0f}%) to transcribe"
         )
+        print()
 
         model_dir = Path(config["model_dir"])
         target_model_dir = model_dir / model_repo.split("/")[-1]
@@ -442,6 +456,7 @@ def main() -> None:
         if not target_model_dir.exists() or not any(target_model_dir.iterdir()):
             print("Downloading model (first run)...")
         model_path = resolve_model_path(model_repo, model_dir)
+        print()
 
         total_frames = sum(speech_frames(regions) for regions in track_regions.values())
         transcripts = {}
@@ -450,15 +465,18 @@ def main() -> None:
             total=total_frames, unit="frames", desc="Transcribing", disable=total_frames == 0
         ) as progress:
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
-                print(f"Transcribing track {i}/{total}: {username}...")
-                segments = transcribe_track(
+                progress.write(f"Transcribing track {i}/{total}: {username}...")
+                segments, language = transcribe_track(
                     audio_path, model_path, track_regions[username], progress
                 )
-                print(f"  -> {len(segments)} segments")
+                if language:
+                    progress.write(f"Detected language: {LANGUAGES.get(language, language).title()}")
+                progress.write(f"  -> {len(segments)} segments")
                 transcripts[username] = [
                     (offset, apply_vocabulary(text, config["vocabulary"]))
                     for offset, text in segments
                 ]
+        print()
 
         print("Merging tracks...")
         merged = merge_tracks(session_start, transcripts)
@@ -467,6 +485,7 @@ def main() -> None:
             (timestamp, resolve_speaker(username, config["speaker_map"], warned_speakers), text)
             for timestamp, username, text in merged
         ]
+        print()
 
         print("Writing transcript...")
         output_path = write_transcript(
