@@ -463,8 +463,18 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}m {secs}s" if minutes else f"{secs}s"
 
 
+def _rule(char: str = "=") -> str:
+    width = min(shutil.get_terminal_size((80, 20)).columns, 80)
+    return char * width
+
+
 def main() -> None:
     start_time = time.monotonic()
+
+    print(_rule())
+    print("rpg-scribe".center(len(_rule())))
+    print(_rule())
+    print()
 
     parser = argparse.ArgumentParser(
         description="Transcribe a Craig-recorded Discord TTRPG session into Markdown."
@@ -649,6 +659,8 @@ def main() -> None:
 
     elapsed = time.monotonic() - start_time
     print(f"Wrote transcript to {output_path} ({_format_duration(elapsed)})")
+    print()
+    print(_rule())
 
 
 if __name__ == "__main__":
