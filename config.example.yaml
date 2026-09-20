@@ -26,3 +26,7 @@ vocabulary:
 
 # Directory the transcript Markdown files are written to.
 output_dir: ./transcripts
+
+# Directory to drop Craig .zip exports into for automatic pickup. Processed
+# zips are moved into a `processed/` subfolder here.
+input_dir: ./input

@@ -24,19 +24,36 @@ Edit `config.yaml` with your Discord usernames → display name mapping
 ## Usage
 
 ```sh
-python3 transcribe.py <craig_folder>
+python3 transcribe.py [craig_folder]
 ```
 
-`<craig_folder>` is the folder Craig's Discord bot exports for a session
-(containing `info.txt` and the per-speaker audio files). The transcript is
-written to `output_dir` (from `config.yaml`) as `<session-title>.md`.
+`<craig_folder>` is optional, and accepts either:
+
+- The folder Craig's Discord bot exports for a session (containing
+  `info.txt` and the per-speaker audio files) — used as-is.
+- A path to a Craig `.zip` export — extracted automatically before
+  transcription.
+
+If omitted, the oldest `.zip` file in `input_dir` (from `config.yaml`) is
+picked up automatically — drop Craig `.zip` exports there and run without
+arguments. After a successful run, a zip that was extracted (whether passed
+explicitly or auto-picked) is moved into `<input_dir>/processed/`.
+
+The transcript is written to `output_dir` (from `config.yaml`) as
+`<session-title>.md`.
 
 Options:
 
 - `--config <path>` — use a config file other than `config.yaml`.
 - `--model <repo-id>` — override the configured `whisper_model`.
-- `--title <title>` — override the session title (defaults to the Craig
-  folder's basename).
+- `--title <title>` — override the session title (defaults to the input's
+  basename, without the `.zip` extension if applicable).
 
 On first run, the configured Whisper model is downloaded into `model_dir`
 (from `config.yaml`) and reused on subsequent runs.
+
+Config keys:
+
+- `output_dir` — directory transcript Markdown files are written to.
+- `input_dir` — directory to drop Craig `.zip` exports into for automatic
+  pickup. Defaults to `./input`.

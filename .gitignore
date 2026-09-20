@@ -4,3 +4,5 @@ config.yaml
 .venv/
 __pycache__/
 models/
+input/
+transcripts/

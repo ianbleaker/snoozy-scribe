@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import re
+import shutil
 import sys
+import tempfile
+import time
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -79,6 +84,36 @@ def resolve_model_path(model_repo: str, model_dir: Path) -> Path:
     if not target_dir.exists() or not any(target_dir.iterdir()):
         snapshot_download(repo_id=model_repo, local_dir=str(target_dir))
     return target_dir
+
+
+def find_default_zip(input_dir: Path) -> Path | None:
+    """Return the oldest-by-mtime `*.zip` directly inside `input_dir`, if any."""
+    if not input_dir.exists():
+        return None
+    zips = list(input_dir.glob("*.zip"))
+    if not zips:
+        return None
+    return min(zips, key=lambda path: path.stat().st_mtime)
+
+
+def extract_zip(zip_path: Path, dest_dir: Path) -> Path:
+    """Extract `zip_path` into `dest_dir` and return the Craig export root."""
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(dest_dir)
+
+    entries = list(dest_dir.iterdir())
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return dest_dir
+
+
+def mark_zip_processed(zip_path: Path, input_dir: Path) -> Path:
+    """Move `zip_path` into `<input_dir>/processed/`, creating it if needed."""
+    processed_dir = input_dir / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    new_path = processed_dir / zip_path.name
+    shutil.move(str(zip_path), str(new_path))
+    return new_path
 
 
 def _read_audio_for_vad(audio_path: Path) -> torch.Tensor:
@@ -196,10 +231,19 @@ def write_transcript(
 
 
 def main() -> None:
+    start_time = time.monotonic()
+
     parser = argparse.ArgumentParser(
         description="Transcribe a Craig-recorded Discord TTRPG session into Markdown."
     )
-    parser.add_argument("craig_folder", type=Path, help="Path to the Craig export folder")
+    parser.add_argument(
+        "craig_folder",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="Path to the Craig export folder or .zip file. If omitted, the oldest "
+        "*.zip in input_dir is picked up automatically.",
+    )
     parser.add_argument(
         "--config", type=Path, default=Path("config.yaml"), help="Path to config.yaml"
     )
@@ -215,29 +259,73 @@ def main() -> None:
     config = yaml.safe_load(args.config.read_text())
 
     model_repo = args.model or config["whisper_model"]
-    session_title = args.title or args.craig_folder.resolve().name
+    input_dir = Path(config.get("input_dir", "./input"))
 
-    session_start, usernames = parse_manifest(args.craig_folder)
-    matched = match_tracks(args.craig_folder, usernames)
+    if args.craig_folder is None:
+        found_zip = find_default_zip(input_dir)
+        if found_zip is None:
+            sys.exit(
+                f"error: no .zip files found in {input_dir}. "
+                "Drop a Craig export there, or pass a path explicitly."
+            )
+        resolved_input_path = found_zip
+    else:
+        resolved_input_path = args.craig_folder
 
-    model_path = resolve_model_path(model_repo, Path(config["model_dir"]))
+    print(f"Input: {resolved_input_path.name}")
 
-    transcripts = {}
-    for username, audio_path in matched.items():
-        segments = transcribe_track(audio_path, model_path)
-        transcripts[username] = [
-            (offset, apply_vocabulary(text, config["vocabulary"]))
-            for offset, text in segments
+    is_zip = resolved_input_path.suffix == ".zip"
+    session_title = args.title or (
+        resolved_input_path.resolve().stem if is_zip else resolved_input_path.resolve().name
+    )
+
+    extraction_ctx = tempfile.TemporaryDirectory() if is_zip else contextlib.nullcontext()
+    with extraction_ctx as tmp_dir:
+        if is_zip:
+            print("Extracting zip...")
+            craig_folder = extract_zip(resolved_input_path, Path(tmp_dir))
+        else:
+            craig_folder = resolved_input_path
+
+        session_start, usernames = parse_manifest(craig_folder)
+        print(f"Parsed manifest: {len(usernames)} speakers, session started {session_start}")
+        matched = match_tracks(craig_folder, usernames)
+
+        model_dir = Path(config["model_dir"])
+        target_model_dir = model_dir / model_repo.split("/")[-1]
+        print(f"Resolving model {model_repo}...")
+        if not target_model_dir.exists() or not any(target_model_dir.iterdir()):
+            print("Downloading model (first run)...")
+        model_path = resolve_model_path(model_repo, model_dir)
+
+        transcripts = {}
+        total = len(matched)
+        for i, (username, audio_path) in enumerate(matched.items(), start=1):
+            print(f"Transcribing track {i}/{total}: {username}...")
+            segments = transcribe_track(audio_path, model_path)
+            print(f"  -> {len(segments)} segments")
+            transcripts[username] = [
+                (offset, apply_vocabulary(text, config["vocabulary"]))
+                for offset, text in segments
+            ]
+
+        print("Merging tracks...")
+        merged = merge_tracks(session_start, transcripts)
+        resolved = [
+            (timestamp, resolve_speaker(username, config["speaker_map"]), text)
+            for timestamp, username, text in merged
         ]
 
-    merged = merge_tracks(session_start, transcripts)
-    resolved = [
-        (timestamp, resolve_speaker(username, config["speaker_map"]), text)
-        for timestamp, username, text in merged
-    ]
+        print("Writing transcript...")
+        output_path = write_transcript(resolved, session_title, Path(config["output_dir"]))
 
-    output_path = write_transcript(resolved, session_title, Path(config["output_dir"]))
-    print(f"wrote transcript to {output_path}")
+        if is_zip:
+            mark_zip_processed(resolved_input_path, input_dir)
+
+    elapsed = time.monotonic() - start_time
+    minutes, seconds = divmod(int(elapsed), 60)
+    elapsed_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+    print(f"Wrote transcript to {output_path} ({elapsed_str})")
 
 
 if __name__ == "__main__":
