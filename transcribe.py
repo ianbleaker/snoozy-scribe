@@ -122,16 +122,9 @@ def mark_zip_processed(zip_path: Path, input_dir: Path) -> Path:
 
 
 def _read_audio_for_vad(audio_path: Path) -> torch.Tensor:
-    """Load audio as a mono float32 tensor resampled to `VAD_SAMPLE_RATE`.
-
-    Shells out to ffmpeg (mirroring `mlx_whisper.audio.load_audio`) rather than
-    using `soundfile`/`torchaudio`, since Craig tracks are commonly AAC and
-    libsndfile cannot decode AAC. This also bypasses `silero_vad.read_audio()`,
-    which fails on this environment: `torchaudio` >=2.9 (the only versions
-    with Python 3.14 wheels) requires `torchcodec` for audio I/O, and the
-    available `torchcodec` build has an ABI mismatch with `torch` 2.9.1 (see
-    plan doc Escalation section).
-    """
+    """Load audio as a mono float32 tensor resampled to `VAD_SAMPLE_RATE`."""
+    # Shells out to ffmpeg rather than soundfile/torchaudio; see
+    # docs/design/transcription-pipeline.md for why.
     cmd = [
         "ffmpeg", "-nostdin", "-i", str(audio_path),
         "-threads", "0",
@@ -156,13 +149,8 @@ def detect_speech_regions(
     """Return (flat [start1, end1, start2, end2, ...] speech regions, raw duration), in seconds.
 
     `min_silence_ms` sets how long a pause must be before it splits speech
-    into separate regions. Silero's own default (100ms) fragments speech on
-    tiny pauses/breaths, forcing Whisper to decode across many small seek
-    boundaries. That fragmentation reliably triggers Whisper's low-confidence
-    temperature-fallback decoding at region edges, which can degrade into
-    garbled/wrong-language text. Wider gaps merge natural pauses back into
-    one clip, eliminating the trigger (verified locally: 8/8 clean runs at
-    800ms vs. 8/8 degraded runs at the 100ms default, same test audio).
+    into separate regions; see docs/design/transcription-pipeline.md for why
+    the default (800ms) overrides Silero's own 100ms.
     """
     global _vad_model
     if _vad_model is None:
@@ -193,9 +181,8 @@ def speech_seconds(regions: list[float]) -> float:
 def speech_frames(regions: list[float]) -> int:
     """Whisper mel-frame count Whisper will actually decode for these regions.
 
-    Mirrors mlx_whisper's own `seek_points = round(ts * FRAMES_PER_SECOND)`
-    rounding so this matches, frame for frame, what its internal progress
-    bar advances by.
+    Mirrors mlx_whisper's own seek-point rounding; see
+    docs/design/transcription-pipeline.md.
     """
     frames = [round(ts * FRAMES_PER_SECOND) for ts in regions]
     return sum(end - start for start, end in zip(frames[::2], frames[1::2]))
@@ -220,16 +207,8 @@ class _ForwardingPbar:
 
 
 class _TqdmShim:
-    """Replaces the `tqdm` name mlx_whisper.transcribe's module sees.
-
-    mlx_whisper's internal progress bar is keyed to the full audio file's
-    frame count, not to the speech-only regions we hand it via
-    `clip_timestamps` — so it stalls well short of 100% on any track with
-    real silence. Its `pbar.update(n)` calls only ever fire for frames it
-    actually decodes though, so redirecting them into one master bar sized
-    to the true speech-frame total (from VAD) gives an accurate, live,
-    whole-job progress percentage instead.
-    """
+    """Replaces the `tqdm` name mlx_whisper.transcribe's module sees; see
+    docs/design/transcription-pipeline.md for why."""
 
     def __init__(self, master: tqdm.tqdm):
         self._master = master
@@ -256,14 +235,10 @@ def transcribe_track(
     progress: tqdm.tqdm,
     initial_prompt: str | None = None,
 ) -> tuple[list[tuple[float, str]], str | None]:
-    """Transcribe one audio track into ((segment_start_offset, text) tuples, detected language).
-
-    Passes `verbose=None` rather than mlx_whisper's default `False`: `False`
-    still unconditionally prints "Detected language: ..." mid-decode, which
-    corrupts the live progress bar's line. `None` suppresses mlx_whisper's
-    own prints entirely; we report the detected language ourselves, cleanly,
-    once decoding finishes.
-    """
+    """Transcribe one audio track into ((segment_start_offset, text) tuples, detected language)."""
+    # verbose=None (not mlx_whisper's default False) suppresses its own prints,
+    # which would otherwise corrupt the live progress bar; see
+    # docs/design/transcription-pipeline.md.
     if not speech_regions:
         return [], None
 
