@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -151,7 +152,9 @@ def _read_audio_for_vad(audio_path: Path) -> torch.Tensor:
 
 
 def detect_speech_regions(
-    audio_path: Path, min_silence_ms: int
+    audio_path: Path,
+    min_silence_ms: int,
+    progress_callback: Callable[[float], None] | None = None,
 ) -> tuple[list[float], float]:
     """Return (flat [start1, end1, start2, end2, ...] speech regions, raw duration), in seconds.
 
@@ -170,6 +173,7 @@ def detect_speech_regions(
         sampling_rate=VAD_SAMPLE_RATE,
         return_seconds=True,
         min_silence_duration_ms=min_silence_ms,
+        progress_tracking_callback=progress_callback,
     )
 
     regions: list[float] = []
@@ -202,9 +206,10 @@ class _ForwardingPbar:
         self._master = master
 
     def update(self, n: int = 1) -> None:
-        n = min(n, max(self._master.total - self._master.n, 0))
-        if n:
-            self._master.update(n)
+        remaining = self._master.total - self._master.n
+        if n > remaining:
+            self._master.total += n - remaining
+        self._master.update(n)
 
     def __enter__(self) -> "_ForwardingPbar":
         return self
@@ -595,11 +600,27 @@ def main() -> None:
         track_regions: dict[str, list[float]] = {}
         total_raw_s = 0.0
         total_speech_s = 0.0
-        for username, audio_path in matched.items():
-            regions, duration = detect_speech_regions(audio_path, vad_min_silence_ms)
-            track_regions[username] = regions
-            total_raw_s += duration
-            total_speech_s += speech_seconds(regions)
+        vad_total = len(matched)
+        with tqdm.tqdm(total=100, unit="%") as vad_progress:
+
+            def _on_vad_progress(pct: float) -> None:
+                vad_progress.n = round(pct)
+                vad_progress.refresh()
+
+            for i, (username, audio_path) in enumerate(matched.items(), start=1):
+                vad_progress.reset(total=100)
+                vad_progress.set_description(f"VAD {i}/{vad_total}: {username}")
+                regions, duration = detect_speech_regions(
+                    audio_path, vad_min_silence_ms, _on_vad_progress
+                )
+                track_regions[username] = regions
+                track_speech_s = speech_seconds(regions)
+                total_raw_s += duration
+                total_speech_s += track_speech_s
+                vad_progress.write(
+                    f"  -> {_format_duration(track_speech_s)} speech / "
+                    f"{_format_duration(duration)} raw ({track_speech_s / duration * 100:.0f}%)"
+                )
         speech_pct = (total_speech_s / total_raw_s * 100) if total_raw_s else 0.0
         print(
             f"  VAD: {_format_duration(total_speech_s)} speech / "
