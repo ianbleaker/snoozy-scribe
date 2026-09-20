@@ -78,7 +78,7 @@ def match_tracks(craig_folder: Path, usernames: list[str]) -> dict[str, Path]:
                 matched[username] = path
                 break
         else:
-            print(f"warning: no audio file found for {username}, skipping")
+            print(f"!! warning: no audio file found for {username}, skipping")
 
     return matched
 
@@ -364,7 +364,7 @@ def resolve_speaker(username: str, speaker_map: dict[str, str], warned: set[str]
     if username in speaker_map:
         return speaker_map[username]
     if username not in warned:
-        print(f"warning: no speaker_map entry for {username}, using raw Discord name")
+        print(f"!! warning: no speaker_map entry for {username}, using raw Discord name")
         warned.add(username)
     return username
 
@@ -582,7 +582,7 @@ def main() -> None:
             total_speech_s += speech_seconds(regions)
         speech_pct = (total_speech_s / total_raw_s * 100) if total_raw_s else 0.0
         print(
-            f"VAD: {_format_duration(total_speech_s)} speech / "
+            f"  VAD: {_format_duration(total_speech_s)} speech / "
             f"{_format_duration(total_raw_s)} raw audio ({speech_pct:.0f}%) to transcribe"
         )
         print()
@@ -591,7 +591,7 @@ def main() -> None:
         target_model_dir = model_dir / model_repo.split("/")[-1]
         print(f"Resolving model {model_repo}...")
         if not target_model_dir.exists() or not any(target_model_dir.iterdir()):
-            print("Downloading model (first run)...")
+            print("  Downloading model (first run)...")
         model_path = resolve_model_path(model_repo, model_dir)
         print()
 
@@ -607,7 +607,7 @@ def main() -> None:
                     audio_path, model_path, track_regions[username], progress, initial_prompt
                 )
                 if language:
-                    progress.write(f"Detected language: {LANGUAGES.get(language, language).title()}")
+                    progress.write(f"  Detected language: {LANGUAGES.get(language, language).title()}")
                 progress.write(f"  -> {len(segments)} segments")
                 transcripts[username] = [
                     (offset, apply_vocabulary(text, vocabulary))
