@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import importlib
 import json
+import random
 import re
 import shutil
 import sys
@@ -234,6 +235,51 @@ def _read_audio_for_vad(audio_path: Path) -> torch.Tensor:
 
     samples = np.frombuffer(out, np.int16).astype(np.float32) / 32768.0
     return torch.from_numpy(samples)
+
+
+def _probe_duration(audio_path: Path) -> float:
+    """Return an audio file's duration in seconds via `ffprobe`."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0",
+        str(audio_path),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, check=True).stdout
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"failed to probe duration of {audio_path}: {e.stderr.decode()}") from e
+    return float(out.decode().strip())
+
+
+def _parse_hms(value: str) -> float:
+    """Parse an `HH:MM:SS` string into seconds."""
+    parts = value.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"expected HH:MM:SS, got {value!r}")
+    try:
+        hours, minutes, seconds = (float(part) for part in parts)
+    except ValueError as e:
+        raise ValueError(f"expected HH:MM:SS, got {value!r}") from e
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def crop_track(audio_path: Path, start: float, length: float, dest_dir: Path, username: str) -> Path:
+    """Crop `audio_path` to `[start, start + length)` into a wav under `dest_dir`."""
+    dest_path = dest_dir / f"{_safe_track_filename(username)}.wav"
+    cmd = [
+        "ffmpeg", "-nostdin",
+        "-ss", str(start),
+        "-t", str(length),
+        "-i", str(audio_path),
+        "-acodec", "pcm_s16le",
+        str(dest_path),
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"failed to crop {audio_path}: {e.stderr.decode()}") from e
+    return dest_path
 
 
 def detect_speech_regions(
@@ -508,6 +554,7 @@ def write_transcript(
     output_dir: Path,
     timestamp_format: str,
     line_format: str,
+    filename_suffix: str = "",
 ) -> Path:
     """Write the merged transcript as a Markdown file with YAML frontmatter.
 
@@ -518,7 +565,7 @@ def write_transcript(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     slug = _slugify(session_title)
-    output_path = output_dir / f"{slug}.md"
+    output_path = output_dir / f"{slug}{filename_suffix}.md"
 
     speakers = list(dict.fromkeys(name for _, name, _ in merged))
     date = merged[0][0].date().isoformat() if merged else ""
@@ -599,7 +646,30 @@ def main() -> None:
         help="Ignore any saved partial output for this session and retranscribe "
         "every track from scratch.",
     )
+    parser.add_argument(
+        "--test",
+        nargs="?",
+        type=int,
+        const=120,
+        default=None,
+        metavar="SECONDS",
+        help="Rapid-iteration mode: only VAD and transcribe a shared window of "
+        "SECONDS (default 120) across all tracks, picked randomly unless "
+        "--test-start is given. Writes to <slug>-test.md and never touches "
+        "partial output or the input zip.",
+    )
+    parser.add_argument(
+        "--test-start",
+        type=str,
+        default=None,
+        metavar="HH:MM:SS",
+        help="Pin the --test window's start instead of picking randomly. "
+        "Only meaningful alongside --test.",
+    )
     args = parser.parse_args()
+
+    if args.test_start is not None and args.test is None:
+        sys.exit("error: --test-start requires --test")
 
     if not args.config.exists():
         sys.exit(
@@ -677,7 +747,7 @@ def main() -> None:
     partial_dir = partial_dir_for(Path(config["output_dir"]), slug)
 
     extraction_ctx = tempfile.TemporaryDirectory() if is_zip else contextlib.nullcontext()
-    with extraction_ctx as tmp_dir:
+    with extraction_ctx as tmp_dir, contextlib.ExitStack() as exit_stack:
         if is_zip:
             print("Extracting zip...")
             craig_folder = extract_zip(resolved_input_path, Path(tmp_dir))
@@ -689,6 +759,37 @@ def main() -> None:
         print(f"Parsed manifest: {len(usernames)} speakers, session started {session_start}")
         matched = match_tracks(craig_folder, usernames)
         print()
+
+        window_start = 0.0
+        if args.test is not None:
+            durations = {username: _probe_duration(path) for username, path in matched.items()}
+            shortest_username = min(durations, key=durations.get)
+            min_duration = durations[shortest_username]
+            if args.test_start is not None:
+                try:
+                    window_start = _parse_hms(args.test_start)
+                except ValueError as e:
+                    sys.exit(f"error: invalid --test-start: {e}")
+            else:
+                window_start = random.uniform(0, max(0.0, min_duration - args.test))
+            if window_start + args.test > min_duration:
+                sys.exit(
+                    f"error: requested --test window "
+                    f"({timedelta(seconds=round(window_start))}-"
+                    f"{timedelta(seconds=round(window_start + args.test))}) exceeds the "
+                    f"shortest matched track's duration ({shortest_username}: "
+                    f"{timedelta(seconds=round(min_duration))})"
+                )
+            crop_dir = Path(exit_stack.enter_context(tempfile.TemporaryDirectory()))
+            matched = {
+                username: crop_track(path, window_start, args.test, crop_dir, username)
+                for username, path in matched.items()
+            }
+            print(
+                f"Test mode: using window {timedelta(seconds=round(window_start))}-"
+                f"{timedelta(seconds=round(window_start + args.test))} ({args.test}s)"
+            )
+            print()
 
         print(f"Analyzing speech regions (VAD) for {len(matched)} tracks...")
         track_regions: dict[str, list[float]] = {}
@@ -734,25 +835,30 @@ def main() -> None:
         transcripts = {}
         total = len(matched)
 
-        if args.fresh and partial_dir.exists():
-            shutil.rmtree(partial_dir)
-            print("Ignoring saved partial output (--fresh).")
-        elif partial_dir.exists():
-            meta = load_partial_meta(partial_dir)
-            if not meta_matches(meta, model_repo, vad_min_silence_ms, initial_prompt):
-                print(
-                    "!! warning: saved partial output for this session doesn't match the "
-                    "current model/VAD/vocabulary config, discarding and retranscribing "
-                    "all tracks"
-                )
+        if args.test is None:
+            if args.fresh and partial_dir.exists():
                 shutil.rmtree(partial_dir)
-        write_partial_meta(partial_dir, model_repo, vad_min_silence_ms, initial_prompt)
+                print("Ignoring saved partial output (--fresh).")
+            elif partial_dir.exists():
+                meta = load_partial_meta(partial_dir)
+                if not meta_matches(meta, model_repo, vad_min_silence_ms, initial_prompt):
+                    print(
+                        "!! warning: saved partial output for this session doesn't match the "
+                        "current model/VAD/vocabulary config, discarding and retranscribing "
+                        "all tracks"
+                    )
+                    shutil.rmtree(partial_dir)
+            write_partial_meta(partial_dir, model_repo, vad_min_silence_ms, initial_prompt)
 
         with tqdm.tqdm(
             total=total_frames, unit="frames", desc="Transcribing", disable=total_frames == 0
         ) as progress:
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
-                partial = load_track_partial(partial_dir, username, audio_path, progress)
+                partial = (
+                    None
+                    if args.test is not None
+                    else load_track_partial(partial_dir, username, audio_path, progress)
+                )
                 if partial is not None:
                     segments, language = partial
                     progress.write(
@@ -764,12 +870,13 @@ def main() -> None:
                     segments, language = transcribe_track(
                         audio_path, model_path, track_regions[username], progress, initial_prompt
                     )
-                    write_track_partial(partial_dir, username, audio_path, segments, language)
+                    if args.test is None:
+                        write_track_partial(partial_dir, username, audio_path, segments, language)
                 if language:
                     progress.write(f"  Detected language: {LANGUAGES.get(language, language).title()}")
                 progress.write(f"  -> {len(segments)} segments")
                 transcripts[username] = [
-                    (offset, apply_vocabulary(text, vocabulary), compression_ratio)
+                    (offset + window_start, apply_vocabulary(text, vocabulary), compression_ratio)
                     for offset, text, compression_ratio in segments
                 ]
         print()
@@ -785,11 +892,17 @@ def main() -> None:
 
         print("Writing transcript...")
         output_path = write_transcript(
-            resolved, session_title, Path(config["output_dir"]), timestamp_format, line_format
+            resolved,
+            session_title,
+            Path(config["output_dir"]),
+            timestamp_format,
+            line_format,
+            filename_suffix="-test" if args.test is not None else "",
         )
-        shutil.rmtree(partial_dir, ignore_errors=True)
+        if args.test is None:
+            shutil.rmtree(partial_dir, ignore_errors=True)
 
-        if is_zip:
+        if is_zip and args.test is None:
             mark_zip_processed(resolved_input_path, input_dir)
 
     elapsed = time.monotonic() - start_time
