@@ -57,3 +57,11 @@ Config keys:
 - `output_dir` — directory transcript Markdown files are written to.
 - `input_dir` — directory to drop Craig `.zip` exports into for automatic
   pickup. Defaults to `./input`.
+- `vad_min_silence_ms` — minimum pause (in milliseconds) that splits speech
+  into separate regions before transcription. Defaults to `800`.
+- `timestamp_format` — `strftime()` format for each line's timestamp.
+  Defaults to `"%H:%M:%S"`.
+- `line_format` — `str.format()` template for each transcript line, with
+  `{timestamp}`, `{speaker}`, and `{text}` placeholders. Use Markdown here to
+  style the output, e.g. `"[{timestamp}] **{speaker}**: {text}"` to bold
+  speaker names. Defaults to `"[{timestamp}] {speaker}: {text}"`.

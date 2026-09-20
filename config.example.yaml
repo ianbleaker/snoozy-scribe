@@ -30,3 +30,20 @@ output_dir: ./transcripts
 # Directory to drop Craig .zip exports into for automatic pickup. Processed
 # zips are moved into a `processed/` subfolder here.
 input_dir: ./input
+
+# Minimum pause (in milliseconds) that splits speech into separate regions
+# before transcription. Too low fragments speech on tiny pauses/breaths,
+# which can degrade transcription quality (occasional garbled/wrong-language
+# text) and produces more, shorter transcript lines. Too high risks merging
+# distinct utterances together. Defaults to 800 if omitted.
+vad_min_silence_ms: 800
+
+# strftime() format for each line's timestamp. Defaults to "%H:%M:%S" if
+# omitted.
+timestamp_format: "%H:%M:%S"
+
+# str.format() template for each transcript line. Supports {timestamp},
+# {speaker}, and {text} placeholders — use Markdown here to control the
+# output styling, e.g. bold speaker names with "**{speaker}**". Defaults to
+# "[{timestamp}] {speaker}: {text}" if omitted.
+line_format: "[{timestamp}] {speaker}: {text}"

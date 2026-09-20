@@ -13,11 +13,12 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import subprocess
+
 import mlx_whisper
+import numpy as np
 import silero_vad
-import soundfile
 import torch
-import torchaudio.functional as AF
 import yaml
 from huggingface_hub import snapshot_download
 
@@ -119,27 +120,55 @@ def mark_zip_processed(zip_path: Path, input_dir: Path) -> Path:
 def _read_audio_for_vad(audio_path: Path) -> torch.Tensor:
     """Load audio as a mono float32 tensor resampled to `VAD_SAMPLE_RATE`.
 
-    Bypasses `silero_vad.read_audio()`, which fails on this environment:
-    `torchaudio` >=2.9 (the only versions with Python 3.14 wheels) requires
-    `torchcodec` for audio I/O, and the available `torchcodec` build has an
-    ABI mismatch with `torch` 2.9.1 (see plan doc Escalation section).
+    Shells out to ffmpeg (mirroring `mlx_whisper.audio.load_audio`) rather than
+    using `soundfile`/`torchaudio`, since Craig tracks are commonly AAC and
+    libsndfile cannot decode AAC. This also bypasses `silero_vad.read_audio()`,
+    which fails on this environment: `torchaudio` >=2.9 (the only versions
+    with Python 3.14 wheels) requires `torchcodec` for audio I/O, and the
+    available `torchcodec` build has an ABI mismatch with `torch` 2.9.1 (see
+    plan doc Escalation section).
     """
-    data, sample_rate = soundfile.read(str(audio_path), dtype="float32", always_2d=True)
-    wav = torch.from_numpy(data).mean(dim=1)
-    if sample_rate != VAD_SAMPLE_RATE:
-        wav = AF.resample(wav, sample_rate, VAD_SAMPLE_RATE)
-    return wav
+    cmd = [
+        "ffmpeg", "-nostdin", "-i", str(audio_path),
+        "-threads", "0",
+        "-f", "s16le",
+        "-ac", "1",
+        "-acodec", "pcm_s16le",
+        "-ar", str(VAD_SAMPLE_RATE),
+        "-",
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, check=True).stdout
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"failed to decode {audio_path}: {e.stderr.decode()}") from e
+
+    samples = np.frombuffer(out, np.int16).astype(np.float32) / 32768.0
+    return torch.from_numpy(samples)
 
 
-def detect_speech_regions(audio_path: Path) -> list[float]:
-    """Return flat [start1, end1, start2, end2, ...] speech regions in seconds."""
+def detect_speech_regions(audio_path: Path, min_silence_ms: int) -> list[float]:
+    """Return flat [start1, end1, start2, end2, ...] speech regions in seconds.
+
+    `min_silence_ms` sets how long a pause must be before it splits speech
+    into separate regions. Silero's own default (100ms) fragments speech on
+    tiny pauses/breaths, forcing Whisper to decode across many small seek
+    boundaries. That fragmentation reliably triggers Whisper's low-confidence
+    temperature-fallback decoding at region edges, which can degrade into
+    garbled/wrong-language text. Wider gaps merge natural pauses back into
+    one clip, eliminating the trigger (verified locally: 8/8 clean runs at
+    800ms vs. 8/8 degraded runs at the 100ms default, same test audio).
+    """
     global _vad_model
     if _vad_model is None:
         _vad_model = silero_vad.load_silero_vad()
 
     wav = _read_audio_for_vad(audio_path)
     timestamps = silero_vad.get_speech_timestamps(
-        wav, _vad_model, sampling_rate=VAD_SAMPLE_RATE, return_seconds=True
+        wav,
+        _vad_model,
+        sampling_rate=VAD_SAMPLE_RATE,
+        return_seconds=True,
+        min_silence_duration_ms=min_silence_ms,
     )
 
     regions: list[float] = []
@@ -149,9 +178,11 @@ def detect_speech_regions(audio_path: Path) -> list[float]:
     return regions
 
 
-def transcribe_track(audio_path: Path, model_path: Path) -> list[tuple[float, str]]:
+def transcribe_track(
+    audio_path: Path, model_path: Path, vad_min_silence_ms: int
+) -> list[tuple[float, str]]:
     """Transcribe one audio track into (segment_start_offset, text) tuples."""
-    speech_regions = detect_speech_regions(audio_path)
+    speech_regions = detect_speech_regions(audio_path, vad_min_silence_ms)
     if not speech_regions:
         return []
 
@@ -159,6 +190,7 @@ def transcribe_track(audio_path: Path, model_path: Path) -> list[tuple[float, st
         str(audio_path),
         path_or_hf_repo=str(model_path),
         clip_timestamps=speech_regions,
+        verbose=False,
     )
     return [(segment["start"], segment["text"]) for segment in result["segments"]]
 
@@ -171,11 +203,17 @@ def apply_vocabulary(text: str, vocabulary: dict[str, list[str]]) -> str:
     return text
 
 
-def resolve_speaker(username: str, speaker_map: dict[str, str]) -> str:
-    """Map a Discord username to its configured display name."""
+def resolve_speaker(username: str, speaker_map: dict[str, str], warned: set[str]) -> str:
+    """Map a Discord username to its configured display name.
+
+    Warns at most once per username, since a missing speaker_map entry
+    applies to every segment from that track.
+    """
     if username in speaker_map:
         return speaker_map[username]
-    print(f"warning: no speaker_map entry for {username}, using raw Discord name")
+    if username not in warned:
+        print(f"warning: no speaker_map entry for {username}, using raw Discord name")
+        warned.add(username)
     return username
 
 
@@ -206,8 +244,15 @@ def write_transcript(
     merged: list[tuple[datetime, str, str]],
     session_title: str,
     output_dir: Path,
+    timestamp_format: str,
+    line_format: str,
 ) -> Path:
-    """Write the merged transcript as a Markdown file with YAML frontmatter."""
+    """Write the merged transcript as a Markdown file with YAML frontmatter.
+
+    `line_format` is a str.format() template with `{timestamp}`, `{speaker}`,
+    and `{text}` placeholders, letting the config control per-line Markdown
+    (e.g. `**{speaker}**` to bold speaker names).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     slug = re.sub(r"[^a-z0-9]+", "-", session_title.lower()).strip("-")
@@ -221,10 +266,16 @@ def write_transcript(
         sort_keys=False,
     )
 
-    lines = [
-        f"[{timestamp.strftime('%H:%M:%S')}] {name}: {text}"
-        for timestamp, name, text in merged
-    ]
+    try:
+        lines = [
+            line_format.format(timestamp=timestamp.strftime(timestamp_format), speaker=name, text=text)
+            for timestamp, name, text in merged
+        ]
+    except KeyError as e:
+        raise ValueError(
+            f"config `line_format` uses unknown placeholder {e}; "
+            "only {timestamp}, {speaker}, {text} are supported"
+        ) from e
 
     output_path.write_text(f"---\n{frontmatter}---\n\n" + "\n".join(lines) + "\n")
     return output_path
@@ -260,6 +311,9 @@ def main() -> None:
 
     model_repo = args.model or config["whisper_model"]
     input_dir = Path(config.get("input_dir", "./input"))
+    vad_min_silence_ms = config.get("vad_min_silence_ms", 800)
+    timestamp_format = config.get("timestamp_format", "%H:%M:%S")
+    line_format = config.get("line_format", "[{timestamp}] {speaker}: {text}")
 
     if args.craig_folder is None:
         found_zip = find_default_zip(input_dir)
@@ -302,7 +356,7 @@ def main() -> None:
         total = len(matched)
         for i, (username, audio_path) in enumerate(matched.items(), start=1):
             print(f"Transcribing track {i}/{total}: {username}...")
-            segments = transcribe_track(audio_path, model_path)
+            segments = transcribe_track(audio_path, model_path, vad_min_silence_ms)
             print(f"  -> {len(segments)} segments")
             transcripts[username] = [
                 (offset, apply_vocabulary(text, config["vocabulary"]))
@@ -311,13 +365,16 @@ def main() -> None:
 
         print("Merging tracks...")
         merged = merge_tracks(session_start, transcripts)
+        warned_speakers: set[str] = set()
         resolved = [
-            (timestamp, resolve_speaker(username, config["speaker_map"]), text)
+            (timestamp, resolve_speaker(username, config["speaker_map"], warned_speakers), text)
             for timestamp, username, text in merged
         ]
 
         print("Writing transcript...")
-        output_path = write_transcript(resolved, session_title, Path(config["output_dir"]))
+        output_path = write_transcript(
+            resolved, session_title, Path(config["output_dir"]), timestamp_format, line_format
+        )
 
         if is_zip:
             mark_zip_processed(resolved_input_path, input_dir)
