@@ -67,7 +67,13 @@ def partial_dir_for(output_dir: Path, slug: str) -> Path:
 
 
 def write_partial_meta(
-    partial_dir: Path, model_repo: str, vad_min_silence_ms: int, initial_prompt: str
+    partial_dir: Path,
+    model_repo: str,
+    vad_min_silence_ms: int,
+    initial_prompt: str,
+    language: str | None,
+    compression_ratio_threshold: float,
+    best_of: int | None,
 ) -> None:
     partial_dir.mkdir(parents=True, exist_ok=True)
     meta = {
@@ -75,6 +81,9 @@ def write_partial_meta(
         "model_repo": model_repo,
         "vad_min_silence_ms": vad_min_silence_ms,
         "initial_prompt_hash": hashlib.sha256(initial_prompt.encode()).hexdigest(),
+        "language": language,
+        "compression_ratio_threshold": compression_ratio_threshold,
+        "best_of": best_of,
     }
     (partial_dir / "_meta.json").write_text(json.dumps(meta))
 
@@ -87,7 +96,13 @@ def load_partial_meta(partial_dir: Path) -> dict | None:
 
 
 def meta_matches(
-    meta: dict | None, model_repo: str, vad_min_silence_ms: int, initial_prompt: str
+    meta: dict | None,
+    model_repo: str,
+    vad_min_silence_ms: int,
+    initial_prompt: str,
+    language: str | None,
+    compression_ratio_threshold: float,
+    best_of: int | None,
 ) -> bool:
     if meta is None:
         return False
@@ -97,6 +112,9 @@ def meta_matches(
         and meta.get("vad_min_silence_ms") == vad_min_silence_ms
         and meta.get("initial_prompt_hash")
         == hashlib.sha256(initial_prompt.encode()).hexdigest()
+        and meta.get("language") == language
+        and meta.get("compression_ratio_threshold") == compression_ratio_threshold
+        and meta.get("best_of") == best_of
     )
 
 
@@ -403,6 +421,9 @@ def transcribe_track(
     speech_regions: list[float],
     progress: tqdm.tqdm,
     initial_prompt: str | None = None,
+    language: str | None = None,
+    compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
+    best_of: int | None = None,
 ) -> tuple[list[tuple[float, float, str, float]], str | None]:
     """Transcribe one audio track into ((segment_start_offset, segment_end_offset,
     text, compression_ratio) tuples, detected language).
@@ -413,6 +434,33 @@ def transcribe_track(
     single batched call decodes straight through the silence between
     regions. A single-clip-per-call shape sidesteps that entirely. See
     docs/design/transcription-pipeline.md.
+
+    `language`, if given, is forced for every region's call instead of being
+    auto-detected from the first region. Auto-detection runs Whisper's own
+    language guess on whatever audio happens to be in that first region; a
+    short, noisy, or ambiguous one (a grunt, a game sound effect) can guess
+    wrong, and that wrong guess then gets pinned for the rest of the track,
+    producing hallucinated non-English text throughout. Forcing a known
+    language (e.g. "en" for an English-speaking group) skips that guess
+    entirely.
+
+    `compression_ratio_threshold` controls how eagerly mlx_whisper retries a
+    region's decode at a higher temperature: a segment whose gzip
+    compression ratio exceeds it is treated as a repetition failure and
+    retried. Lowering it triggers more retries (slower, but catches more
+    repetitive/garbled decodes); it also becomes the threshold `merge_tracks`
+    uses to flag a segment for human review, since a segment still above it
+    after retrying means every retry failed. See
+    docs/design/transcription-pipeline.md.
+
+    `best_of` only affects those same retries: mlx_whisper's first decode
+    attempt is always greedy (temperature 0), and `best_of` is silently
+    disabled at temperature 0, so it has no effect unless a segment already
+    failed and is being retried at a higher temperature. When it does apply,
+    mlx_whisper samples `best_of` independent decodes at that temperature and
+    keeps the one it ranks highest, instead of a single resample — mlx_whisper
+    doesn't implement beam search (`beam_size` raises `NotImplementedError`),
+    so this is the available way to spend extra compute on a hard segment.
     """
     # verbose=None (not mlx_whisper's default False) suppresses its own prints,
     # which would otherwise corrupt the live progress bar; see
@@ -423,7 +471,6 @@ def transcribe_track(
     audio = _decode_audio_mono16k(audio_path).numpy()
 
     segments: list[tuple[float, float, str, float]] = []
-    language: str | None = None
     prompt = initial_prompt
     with _redirect_mlx_whisper_progress(progress):
         for start, end in zip(speech_regions[::2], speech_regions[1::2]):
@@ -434,6 +481,8 @@ def transcribe_track(
                 verbose=None,
                 initial_prompt=prompt,
                 language=language,
+                compression_ratio_threshold=compression_ratio_threshold,
+                best_of=best_of,
             )
             if language is None:
                 language = result.get("language")
@@ -579,6 +628,7 @@ def merge_tracks(
     transcripts: dict[str, list[tuple[float, float, str, float]]],
     merge_gap_seconds: float,
     filler_words: list[str],
+    compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
 ) -> list[tuple[datetime, str, str]]:
     """Interleave per-track segments into one chronological transcript.
 
@@ -595,13 +645,16 @@ def merge_tracks(
     kept for whichever occurrence is emitted.
 
     Segments whose compression ratio is still above
-    `COMPRESSION_RATIO_THRESHOLD` after mlx_whisper's own temperature
+    `compression_ratio_threshold` after mlx_whisper's own temperature
     fallback are flagged with a "!! " prefix rather than silently emitted —
     that ratio means mlx_whisper itself treated the decode as a repetition
-    failure and had nothing better to fall back to. A flagged segment is
-    exempt from filler-word dropping and repeat dedup, and is never merged
-    with a neighbor in either direction — it's always emitted as its own
-    line, unchanged, for human review.
+    failure and had nothing better to fall back to. This must be the same
+    threshold passed to `transcribe_track`'s `compression_ratio_threshold`,
+    since a segment's compression ratio is only meaningful relative to the
+    threshold that drove its own retries. A flagged segment is exempt from
+    filler-word dropping and repeat dedup, and is never merged with a
+    neighbor in either direction — it's always emitted as its own line,
+    unchanged, for human review.
     """
     merged: list[tuple[datetime, str, str]] = []
     normalized_filler_words = {_normalize(word) for word in filler_words}
@@ -616,7 +669,7 @@ def merge_tracks(
             stripped = text.strip()
             if stripped in ("", "..."):
                 continue
-            flagged = compression_ratio > COMPRESSION_RATIO_THRESHOLD
+            flagged = compression_ratio > compression_ratio_threshold
             normalized = _normalize(stripped)
             if not flagged and normalized in normalized_filler_words:
                 continue
@@ -725,6 +778,31 @@ def main() -> None:
         "--config", type=Path, default=Path("config.yaml"), help="Path to config.yaml"
     )
     parser.add_argument("--model", help="Override the configured whisper_model")
+    parser.add_argument(
+        "--language",
+        help="Force this language code (e.g. 'en') for every track instead of "
+        "auto-detecting per track. Overrides the config `language` key.",
+    )
+    parser.add_argument(
+        "--compression-ratio-threshold",
+        type=float,
+        default=None,
+        help="Gzip compression ratio above which mlx_whisper retries a decode "
+        "at a higher temperature, and above which a segment still failing "
+        "after retries is flagged for review. Lower catches more repetitive/"
+        "garbled decodes at the cost of more retries. Defaults to 2.4 if "
+        "omitted. Overrides the config `compression_ratio_threshold` key.",
+    )
+    parser.add_argument(
+        "--best-of",
+        type=int,
+        default=None,
+        help="Sample this many independent decodes and keep the best-ranked one, "
+        "but only for segments already being retried at a higher temperature "
+        "(mlx_whisper disables best_of on its initial greedy decode). "
+        "mlx_whisper doesn't implement beam search. Omit to leave mlx_whisper's "
+        "default (a single resample per retry). Overrides the config `best_of` key.",
+    )
     parser.add_argument("--title", help="Override the session title")
     parser.add_argument(
         "--vocabulary",
@@ -781,6 +859,15 @@ def main() -> None:
     config = yaml.safe_load(args.config.read_text())
 
     model_repo = args.model or config["whisper_model"]
+    language = args.language or config.get("language")
+    if language is not None and language not in LANGUAGES:
+        sys.exit(f"error: unknown language code '{language}'")
+    compression_ratio_threshold = (
+        args.compression_ratio_threshold
+        if args.compression_ratio_threshold is not None
+        else config.get("compression_ratio_threshold", COMPRESSION_RATIO_THRESHOLD)
+    )
+    best_of = args.best_of if args.best_of is not None else config.get("best_of")
     input_dir = Path(config.get("input_dir", "./input"))
     vad_min_silence_ms = config.get("vad_min_silence_ms", 800)
     vad_min_speech_ms = config.get("vad_min_speech_ms", 250)
@@ -792,7 +879,7 @@ def main() -> None:
     default_vocab_path = Path("./vocabulary.md")
     if args.vocabulary is not None:
         vocabulary_path = args.vocabulary
-    elif config.get("vocabulary_file"):
+    elif config.get("vocabulary_file") and Path(config["vocabulary_file"]).exists():
         vocabulary_path = Path(config["vocabulary_file"])
     elif default_vocab_path.exists():
         vocabulary_path = default_vocab_path
@@ -949,14 +1036,30 @@ def main() -> None:
                 print("Ignoring saved partial output (--fresh).")
             elif partial_dir.exists():
                 meta = load_partial_meta(partial_dir)
-                if not meta_matches(meta, model_repo, vad_min_silence_ms, initial_prompt):
+                if not meta_matches(
+                    meta,
+                    model_repo,
+                    vad_min_silence_ms,
+                    initial_prompt,
+                    language,
+                    compression_ratio_threshold,
+                    best_of,
+                ):
                     print(
                         "!! warning: saved partial output for this session doesn't match the "
-                        "current model/VAD/vocabulary config, discarding and retranscribing "
-                        "all tracks"
+                        "current model/VAD/vocabulary/language/compression-ratio/best-of config, "
+                        "discarding and retranscribing all tracks"
                     )
                     shutil.rmtree(partial_dir)
-            write_partial_meta(partial_dir, model_repo, vad_min_silence_ms, initial_prompt)
+            write_partial_meta(
+                partial_dir,
+                model_repo,
+                vad_min_silence_ms,
+                initial_prompt,
+                language,
+                compression_ratio_threshold,
+                best_of,
+            )
 
         with tqdm.tqdm(
             total=total_frames,
@@ -972,20 +1075,32 @@ def main() -> None:
                     else load_track_partial(partial_dir, username, audio_path, progress)
                 )
                 if partial is not None:
-                    segments, language = partial
+                    segments, detected_language = partial
                     progress.write(
                         f"Resuming track {i}/{total}: {username} (from saved partial)..."
                     )
                     progress.update(speech_frames(track_regions[username]))
                 else:
                     progress.write(f"Transcribing track {i}/{total}: {username}...")
-                    segments, language = transcribe_track(
-                        audio_path, model_path, track_regions[username], progress, initial_prompt
+                    segments, detected_language = transcribe_track(
+                        audio_path,
+                        model_path,
+                        track_regions[username],
+                        progress,
+                        initial_prompt,
+                        language,
+                        compression_ratio_threshold,
+                        best_of,
                     )
                     if args.test is None:
-                        write_track_partial(partial_dir, username, audio_path, segments, language)
-                if language:
-                    progress.write(f"  Detected language: {LANGUAGES.get(language, language).title()}")
+                        write_track_partial(
+                            partial_dir, username, audio_path, segments, detected_language
+                        )
+                if detected_language:
+                    progress.write(
+                        f"  Detected language: "
+                        f"{LANGUAGES.get(detected_language, detected_language).title()}"
+                    )
                 progress.write(f"  -> {len(segments)} segments")
                 transcripts[username] = [
                     (
@@ -999,7 +1114,13 @@ def main() -> None:
         print()
 
         print("Merging tracks...")
-        merged = merge_tracks(session_start, transcripts, merge_gap_ms / 1000, filler_words)
+        merged = merge_tracks(
+            session_start,
+            transcripts,
+            merge_gap_ms / 1000,
+            filler_words,
+            compression_ratio_threshold,
+        )
         warned_speakers: set[str] = set()
         resolved = [
             (timestamp, resolve_speaker(username, config["speaker_map"], warned_speakers), text)
