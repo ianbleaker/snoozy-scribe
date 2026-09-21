@@ -729,7 +729,7 @@ def merge_tracks(
     merge_gap_seconds: float,
     filler_words: list[str],
     compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
-) -> list[tuple[datetime, str, str]]:
+) -> tuple[list[tuple[datetime, str, str]], dict[str, int]]:
     """Interleave per-track segments into one chronological transcript.
 
     Consecutive segments from the same speaker (per-track, ignoring what
@@ -765,9 +765,22 @@ def merge_tracks(
     A flagged segment (either way) is exempt from filler-word dropping and
     repeat dedup, and is never merged with a neighbor in either direction —
     it's always emitted as its own line for human review.
+
+    Also returns a stats dict counting what was pruned along the way
+    (`segments_total`, `empty_dropped`, `repetition_collapsed`,
+    `filler_dropped`, `repeat_deduped`, `flagged_for_review`), for the
+    caller to report and to record in the transcript's frontmatter.
     """
     merged: list[tuple[datetime, str, str]] = []
     normalized_filler_words = {_normalize(word) for word in filler_words}
+    stats = {
+        "segments_total": 0,
+        "empty_dropped": 0,
+        "repetition_collapsed": 0,
+        "filler_dropped": 0,
+        "repeat_deduped": 0,
+        "flagged_for_review": 0,
+    }
 
     for username, segments in transcripts.items():
         previous_normalized: str | None = None
@@ -776,21 +789,28 @@ def merge_tracks(
         buffer_text: str | None = None
 
         for start, end, text, compression_ratio in segments:
+            stats["segments_total"] += 1
             stripped = text.strip()
             if stripped in ("", "..."):
+                stats["empty_dropped"] += 1
                 continue
             collapsed_text = collapse_repetition(stripped)
             repetition_collapsed = collapsed_text != stripped
+            if repetition_collapsed:
+                stats["repetition_collapsed"] += 1
             stripped = collapsed_text
             flagged = compression_ratio > compression_ratio_threshold or repetition_collapsed
             normalized = _normalize(stripped)
             if not flagged and normalized in normalized_filler_words:
+                stats["filler_dropped"] += 1
                 continue
             if not flagged and normalized == previous_normalized:
+                stats["repeat_deduped"] += 1
                 continue
             previous_normalized = normalized
 
             if flagged:
+                stats["flagged_for_review"] += 1
                 if buffer_text is not None:
                     timestamp = session_start + timedelta(seconds=buffer_start)
                     merged.append((timestamp, username, buffer_text))
@@ -813,7 +833,7 @@ def merge_tracks(
             merged.append((timestamp, username, buffer_text))
 
     merged.sort(key=lambda entry: entry[0])
-    return merged
+    return merged, stats
 
 
 def write_transcript(
@@ -822,6 +842,7 @@ def write_transcript(
     output_dir: Path,
     timestamp_format: str,
     line_format: str,
+    merge_stats: dict[str, int],
     filename_suffix: str = "",
 ) -> Path:
     """Write the merged transcript as a Markdown file with YAML frontmatter.
@@ -829,6 +850,10 @@ def write_transcript(
     `line_format` is a str.format() template with `{timestamp}`, `{speaker}`,
     and `{text}` placeholders, letting the config control per-line Markdown
     (e.g. `**{speaker}**` to bold speaker names).
+
+    `merge_stats` (as returned by `merge_tracks()`) is recorded in the
+    frontmatter under `pruning`, so what was dropped/collapsed/flagged stays
+    attached to the transcript file itself, not just the console output.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -839,7 +864,7 @@ def write_transcript(
     date = merged[0][0].date().isoformat() if merged else ""
 
     frontmatter = yaml.safe_dump(
-        {"date": date, "title": session_title, "speakers": speakers},
+        {"date": date, "title": session_title, "speakers": speakers, "pruning": merge_stats},
         sort_keys=False,
     )
 
@@ -1227,12 +1252,20 @@ def main() -> None:
         print()
 
         print("Merging tracks...")
-        merged = merge_tracks(
+        merged, merge_stats = merge_tracks(
             session_start,
             transcripts,
             merge_gap_ms / 1000,
             filler_words,
             compression_ratio_threshold,
+        )
+        print(
+            f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed, "
+            f"{merge_stats['filler_dropped']} filler word(s) dropped, "
+            f"{merge_stats['repeat_deduped']} repeat(s) deduped, "
+            f"{merge_stats['empty_dropped']} empty segment(s) dropped, "
+            f"{merge_stats['flagged_for_review']} line(s) flagged for review "
+            f"({merge_stats['segments_total']} segments in)"
         )
         warned_speakers: set[str] = set()
         resolved = [
@@ -1248,6 +1281,7 @@ def main() -> None:
             Path(config["output_dir"]),
             timestamp_format,
             line_format,
+            merge_stats,
             filename_suffix="-test" if args.test is not None else "",
         )
         if args.test is None:
