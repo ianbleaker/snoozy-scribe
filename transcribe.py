@@ -623,6 +623,106 @@ def _normalize(text: str) -> str:
     return _TRAILING_PUNCTUATION.sub("", text.lower())
 
 
+# Genuine emphasis ("no no no") repeats a handful of times at most; a
+# repetition-hallucination loop runs for dozens or hundreds of words (see
+# docs/analysis/best-of-decoding-analysis.md and
+# docs/analysis/model-weight-analysis.md for real examples). Set well above
+# normal speech's repeat count so collapse_repetition() only fires on loops.
+REPETITION_MIN_REPEATS = 6
+REPETITION_MAX_PHRASE_WORDS = 6
+
+# A hallucination loop can also come out as one run-on token with no spaces
+# (e.g. a single character repeated hundreds of times, tokenized as one
+# "word"). Only worth checking on words far longer than any real one, so
+# ordinary long words/interjections are never touched.
+REPETITION_MIN_WORD_LENGTH_FOR_CHAR_COLLAPSE = 20
+REPETITION_MAX_CHAR_PERIOD = 4
+
+
+def _collapse_runs(tokens: list[str], keys: list[str], min_repeats: int, max_period: int) -> list[str]:
+    """Collapse a run of `min_repeats`+ immediately-repeated `keys` down to one.
+
+    Generic over what a "token" is (a word or a single character) — the
+    caller picks `tokens` (kept verbatim in the output) and `keys` (used for
+    comparison, e.g. normalized/lowercased). At each position, tries period
+    lengths from 1 up to `max_period`, smallest first, so a 1-token period
+    ("H H H H") is preferred over a spuriously-matching longer one.
+    """
+    n = len(tokens)
+    collapsed: list[str] = []
+    i = 0
+    while i < n:
+        for period in range(1, max_period + 1):
+            if i + period > n:
+                continue
+            phrase = keys[i : i + period]
+            if any(key == "" for key in phrase):
+                continue
+            repeats = 1
+            j = i + period
+            while j + period <= n and keys[j : j + period] == phrase:
+                repeats += 1
+                j += period
+            if repeats >= min_repeats:
+                collapsed.extend(tokens[i : i + period])
+                i = j
+                break
+        else:
+            collapsed.append(tokens[i])
+            i += 1
+    return collapsed
+
+
+def collapse_char_repetition(
+    word: str,
+    min_repeats: int = REPETITION_MIN_REPEATS,
+    max_period: int = REPETITION_MAX_CHAR_PERIOD,
+    min_word_length: int = REPETITION_MIN_WORD_LENGTH_FOR_CHAR_COLLAPSE,
+) -> str:
+    """Collapse a run-on repeated-character/substring hallucination in one word.
+
+    Whisper occasionally hallucinates a single character (or short substring)
+    repeated hundreds of times with no whitespace at all — e.g. "řřřřř...ř" —
+    which `collapse_repetition()`'s word-splitting can't see since it's one
+    token. Only applies to words at least `min_word_length` long, since no
+    real word or interjection gets anywhere close to that; short ones (e.g.
+    "hahaha") are left alone. Returns `word` unchanged if nothing collapses.
+    """
+    if len(word) < min_word_length:
+        return word
+    chars = list(word)
+    collapsed = "".join(_collapse_runs(chars, [c.lower() for c in chars], min_repeats, max_period))
+    return collapsed if len(collapsed) < len(word) else word
+
+
+def collapse_repetition(
+    text: str,
+    min_repeats: int = REPETITION_MIN_REPEATS,
+    max_phrase_words: int = REPETITION_MAX_PHRASE_WORDS,
+) -> str:
+    """Collapse an immediately-repeated word/phrase run down to one occurrence.
+
+    A repetition-hallucination loop repeats the same short (1-6 word) phrase
+    dozens or hundreds of times in a row — e.g. "H H H H...", "listen listen
+    listen...", "they all work there they all work there...". Collapses a
+    run to its first occurrence once it repeats at least `min_repeats` times
+    immediately in a row; see `_collapse_runs()`. Comparison is done on
+    `_normalize()`d words so trailing punctuation ("Sh," vs "Sh") and case
+    don't block a match; the original word tokens (with punctuation/case)
+    are kept in the output.
+
+    Each resulting word is then also passed through
+    `collapse_char_repetition()`, to catch a hallucination that came out as
+    one long run-on token instead of repeated whitespace-separated words.
+
+    Returns the text unchanged if no qualifying run is found.
+    """
+    words = text.split()
+    normalized = [_normalize(word) for word in words]
+    collapsed_words = _collapse_runs(words, normalized, min_repeats, max_phrase_words)
+    return " ".join(collapse_char_repetition(word) for word in collapsed_words)
+
+
 def merge_tracks(
     session_start: datetime,
     transcripts: dict[str, list[tuple[float, float, str, float]]],
@@ -651,10 +751,20 @@ def merge_tracks(
     failure and had nothing better to fall back to. This must be the same
     threshold passed to `transcribe_track`'s `compression_ratio_threshold`,
     since a segment's compression ratio is only meaningful relative to the
-    threshold that drove its own retries. A flagged segment is exempt from
-    filler-word dropping and repeat dedup, and is never merged with a
-    neighbor in either direction — it's always emitted as its own line,
-    unchanged, for human review.
+    threshold that drove its own retries.
+
+    Every segment's text is also passed through `collapse_repetition()`
+    before anything else, regardless of its compression ratio — a
+    repetition-hallucination loop can be diluted below the ratio threshold
+    if it's only part of a longer segment. A segment collapse_repetition()
+    actually changes is flagged too, using the collapsed text, since a
+    changed segment means a real hallucination loop was caught: unedited
+    repeated-word walls made the exact case compression_ratio_threshold is
+    meant to catch unreadable even after flagging.
+
+    A flagged segment (either way) is exempt from filler-word dropping and
+    repeat dedup, and is never merged with a neighbor in either direction —
+    it's always emitted as its own line for human review.
     """
     merged: list[tuple[datetime, str, str]] = []
     normalized_filler_words = {_normalize(word) for word in filler_words}
@@ -669,7 +779,10 @@ def merge_tracks(
             stripped = text.strip()
             if stripped in ("", "..."):
                 continue
-            flagged = compression_ratio > compression_ratio_threshold
+            collapsed_text = collapse_repetition(stripped)
+            repetition_collapsed = collapsed_text != stripped
+            stripped = collapsed_text
+            flagged = compression_ratio > compression_ratio_threshold or repetition_collapsed
             normalized = _normalize(stripped)
             if not flagged and normalized in normalized_filler_words:
                 continue
