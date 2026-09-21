@@ -27,12 +27,18 @@ import torch
 import tqdm
 import yaml
 from huggingface_hub import snapshot_download
-from mlx_whisper.audio import FRAMES_PER_SECOND
+from mlx_whisper.audio import HOP_LENGTH
 from mlx_whisper.tokenizer import LANGUAGES
 
 VAD_SAMPLE_RATE = 16000
 
 AUDIO_EXTENSIONS = {".flac", ".wav", ".mp3", ".m4a", ".ogg", ".aac"}
+
+# Bump when a change alters what a .partial/ directory's saved segments mean
+# (e.g. #20: per-region transcription calls instead of one batched call per
+# track) so stale partials from before the change are discarded rather than
+# resumed as-is.
+PARTIAL_SCHEMA_VERSION = 2
 
 # Matches mlx_whisper.transcribe's own default: a segment above this gzip
 # compression ratio is repetitive enough that mlx_whisper already retried it
@@ -65,6 +71,7 @@ def write_partial_meta(
 ) -> None:
     partial_dir.mkdir(parents=True, exist_ok=True)
     meta = {
+        "schema_version": PARTIAL_SCHEMA_VERSION,
         "model_repo": model_repo,
         "vad_min_silence_ms": vad_min_silence_ms,
         "initial_prompt_hash": hashlib.sha256(initial_prompt.encode()).hexdigest(),
@@ -85,7 +92,8 @@ def meta_matches(
     if meta is None:
         return False
     return (
-        meta.get("model_repo") == model_repo
+        meta.get("schema_version") == PARTIAL_SCHEMA_VERSION
+        and meta.get("model_repo") == model_repo
         and meta.get("vad_min_silence_ms") == vad_min_silence_ms
         and meta.get("initial_prompt_hash")
         == hashlib.sha256(initial_prompt.encode()).hexdigest()
@@ -216,8 +224,11 @@ def mark_zip_processed(zip_path: Path, input_dir: Path) -> Path:
     return new_path
 
 
-def _read_audio_for_vad(audio_path: Path) -> torch.Tensor:
-    """Load audio as a mono float32 tensor resampled to `VAD_SAMPLE_RATE`."""
+def _decode_audio_mono16k(audio_path: Path) -> torch.Tensor:
+    """Load audio as a mono float32 tensor resampled to `VAD_SAMPLE_RATE`.
+
+    Shared decode helper for both VAD and transcription (Whisper itself
+    expects 16kHz mono input, same as VAD)."""
     # Shells out to ffmpeg rather than soundfile/torchaudio; see
     # docs/design/transcription-pipeline.md for why.
     cmd = [
@@ -303,7 +314,7 @@ def detect_speech_regions(
     if _vad_model is None:
         _vad_model = silero_vad.load_silero_vad()
 
-    wav = _read_audio_for_vad(audio_path)
+    wav = _decode_audio_mono16k(audio_path)
     timestamps = silero_vad.get_speech_timestamps(
         wav,
         _vad_model,
@@ -330,11 +341,14 @@ def speech_seconds(regions: list[float]) -> float:
 def speech_frames(regions: list[float]) -> int:
     """Whisper mel-frame count Whisper will actually decode for these regions.
 
-    Mirrors mlx_whisper's own seek-point rounding; see
-    docs/design/transcription-pipeline.md.
+    Mirrors `transcribe_track`'s own sample-based slicing (seconds -> samples
+    -> mel frames) so this estimate and mlx_whisper's reported frame count
+    for each region agree exactly; see docs/design/transcription-pipeline.md.
     """
-    frames = [round(ts * FRAMES_PER_SECOND) for ts in regions]
-    return sum(end - start for start, end in zip(frames[::2], frames[1::2]))
+    samples = [round(ts * VAD_SAMPLE_RATE) for ts in regions]
+    return sum(
+        (end - start) // HOP_LENGTH for start, end in zip(samples[::2], samples[1::2])
+    )
 
 
 class _ForwardingPbar:
@@ -344,10 +358,7 @@ class _ForwardingPbar:
         self._master = master
 
     def update(self, n: int = 1) -> None:
-        remaining = self._master.total - self._master.n
-        if n > remaining:
-            self._master.total += n - remaining
-        self._master.update(n)
+        self._master.update(min(n, self._master.total - self._master.n))
 
     def __enter__(self) -> "_ForwardingPbar":
         return self
@@ -378,6 +389,14 @@ def _redirect_mlx_whisper_progress(master: tqdm.tqdm):
         transcribe_module.tqdm = original_tqdm
 
 
+def _tail_words(text: str, max_chars: int = 200) -> str:
+    """Return the last `max_chars` characters of `text`, trimmed to a word boundary."""
+    tail = text[-max_chars:]
+    if len(tail) == len(text):
+        return tail
+    return tail.split(" ", 1)[-1] if " " in tail else tail
+
+
 def transcribe_track(
     audio_path: Path,
     model_path: Path,
@@ -386,26 +405,50 @@ def transcribe_track(
     initial_prompt: str | None = None,
 ) -> tuple[list[tuple[float, float, str, float]], str | None]:
     """Transcribe one audio track into ((segment_start_offset, segment_end_offset,
-    text, compression_ratio) tuples, detected language)."""
+    text, compression_ratio) tuples, detected language).
+
+    Issues one mlx_whisper.transcribe() call per VAD speech region (not one
+    batched call for the whole track): mlx_whisper's own `clip_timestamps`
+    handling never resets its internal `seek` pointer between clips, so a
+    single batched call decodes straight through the silence between
+    regions. A single-clip-per-call shape sidesteps that entirely. See
+    docs/design/transcription-pipeline.md.
+    """
     # verbose=None (not mlx_whisper's default False) suppresses its own prints,
     # which would otherwise corrupt the live progress bar; see
     # docs/design/transcription-pipeline.md.
     if not speech_regions:
         return [], None
 
+    audio = _decode_audio_mono16k(audio_path).numpy()
+
+    segments: list[tuple[float, float, str, float]] = []
+    language: str | None = None
+    prompt = initial_prompt
     with _redirect_mlx_whisper_progress(progress):
-        result = mlx_whisper.transcribe(
-            str(audio_path),
-            path_or_hf_repo=str(model_path),
-            clip_timestamps=speech_regions,
-            verbose=None,
-            initial_prompt=initial_prompt,
-        )
-    segments = [
-        (segment["start"], segment["end"], segment["text"], segment["compression_ratio"])
-        for segment in result["segments"]
-    ]
-    return segments, result.get("language")
+        for start, end in zip(speech_regions[::2], speech_regions[1::2]):
+            region_audio = audio[round(start * VAD_SAMPLE_RATE):round(end * VAD_SAMPLE_RATE)]
+            result = mlx_whisper.transcribe(
+                region_audio,
+                path_or_hf_repo=str(model_path),
+                verbose=None,
+                initial_prompt=prompt,
+                language=language,
+            )
+            if language is None:
+                language = result.get("language")
+            region_text = "".join(segment["text"] for segment in result["segments"])
+            prompt = ((initial_prompt or "") + " " + _tail_words(region_text)).strip()
+            segments.extend(
+                (
+                    segment["start"] + start,
+                    segment["end"] + start,
+                    segment["text"],
+                    segment["compression_ratio"],
+                )
+                for segment in result["segments"]
+            )
+    return segments, language
 
 
 class VocabularyParseError(Exception):
@@ -936,20 +979,9 @@ def main() -> None:
                     progress.update(speech_frames(track_regions[username]))
                 else:
                     progress.write(f"Transcribing track {i}/{total}: {username}...")
-                    track_budget = speech_frames(track_regions[username])
-                    n_before, total_before = progress.n, progress.total
                     segments, language = transcribe_track(
                         audio_path, model_path, track_regions[username], progress, initial_prompt
                     )
-                    # mlx_whisper decodes through the silence gaps between speech regions
-                    # (see docs/design/transcription-pipeline.md), so the forwarded frame
-                    # count for this track can overshoot its budget, growing progress.total
-                    # (_ForwardingPbar) along the way. Reconcile both back to their exact,
-                    # pre-known values now rather than let the overshoot pin the bar at 100%
-                    # for the rest of the run.
-                    progress.update(track_budget - (progress.n - n_before))
-                    progress.total = total_before
-                    progress.refresh()
                     if args.test is None:
                         write_track_partial(partial_dir, username, audio_path, segments, language)
                 if language:
