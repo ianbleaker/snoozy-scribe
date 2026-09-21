@@ -858,7 +858,7 @@ def main() -> None:
         total_raw_s = 0.0
         total_speech_s = 0.0
         vad_total = len(matched)
-        with tqdm.tqdm(total=100, unit="%") as vad_progress:
+        with tqdm.tqdm(total=100, unit="%", leave=False) as vad_progress:
 
             def _on_vad_progress(pct: float) -> None:
                 vad_progress.n = round(pct)
@@ -916,7 +916,11 @@ def main() -> None:
             write_partial_meta(partial_dir, model_repo, vad_min_silence_ms, initial_prompt)
 
         with tqdm.tqdm(
-            total=total_frames, unit="frames", desc="Transcribing", disable=total_frames == 0
+            total=total_frames,
+            unit="frames",
+            desc="Transcribing",
+            disable=total_frames == 0,
+            leave=False,
         ) as progress:
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
                 partial = (
@@ -932,9 +936,20 @@ def main() -> None:
                     progress.update(speech_frames(track_regions[username]))
                 else:
                     progress.write(f"Transcribing track {i}/{total}: {username}...")
+                    track_budget = speech_frames(track_regions[username])
+                    n_before, total_before = progress.n, progress.total
                     segments, language = transcribe_track(
                         audio_path, model_path, track_regions[username], progress, initial_prompt
                     )
+                    # mlx_whisper decodes through the silence gaps between speech regions
+                    # (see docs/design/transcription-pipeline.md), so the forwarded frame
+                    # count for this track can overshoot its budget, growing progress.total
+                    # (_ForwardingPbar) along the way. Reconcile both back to their exact,
+                    # pre-known values now rather than let the overshoot pin the bar at 100%
+                    # for the rest of the run.
+                    progress.update(track_budget - (progress.n - n_before))
+                    progress.total = total_before
+                    progress.refresh()
                     if args.test is None:
                         write_track_partial(partial_dir, username, audio_path, segments, language)
                 if language:
