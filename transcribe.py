@@ -9,10 +9,14 @@ import importlib
 import json
 import random
 import re
+import select
 import shutil
 import sys
 import tempfile
+import termios
+import threading
 import time
+import tty
 import zipfile
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -65,6 +69,70 @@ COMPRESSION_RATIO_THRESHOLD = 2.4
 LOGPROB_THRESHOLD = -1.0
 
 _vad_model = None
+
+
+class TranscriptionCancelled(Exception):
+    """Raised once the user confirms cancellation via the Escape-then-y prompt."""
+
+
+class _CancelWatcher:
+    """Watches stdin in a background thread for a bare Escape keypress
+    followed by 'y', setting `cancelled` so the main loop can stop between
+    work units (tracks, VAD passes, speech regions).
+
+    Runs stdin in cbreak mode so a keypress is seen immediately without
+    waiting for Enter. The confirmation prompt itself is shown inside
+    `tqdm.external_write_mode()`, which grabs tqdm's own write lock and
+    clears any active bar first — without that, an active bar's own
+    refreshes (driven by the main thread transcribing in parallel with
+    this watcher thread) redraw over the prompt line as fast as several
+    times a second, so the prompt flickers away before it can be read or
+    answered. Disabled entirely when stdin isn't a real terminal (piped
+    input, CI), since raw mode there would just consume whatever's on the
+    other end of the pipe for no benefit.
+    """
+
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self._enabled = sys.stdin.isatty()
+        self._old_settings = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_CancelWatcher":
+        if self._enabled:
+            self._old_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+            self._thread = threading.Thread(target=self._watch, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        self._stop.set()
+        if self._enabled and self._old_settings is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+        return False
+
+    def _watch(self) -> None:
+        while not self._stop.is_set():
+            if not select.select([sys.stdin], [], [], 0.2)[0]:
+                continue
+            if sys.stdin.read(1) != "\x1b":
+                continue
+            # An escape *sequence* (arrow keys etc.) sends more bytes right
+            # behind the ESC byte; a bare Escape keypress doesn't. Swallow
+            # the rest of a sequence instead of treating it as a cancel.
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                sys.stdin.read(1)
+                continue
+            with tqdm.tqdm.external_write_mode(file=sys.stderr):
+                sys.stderr.write("Cancel transcription? [y/N] ")
+                sys.stderr.flush()
+                confirm = sys.stdin.read(1) if select.select([sys.stdin], [], [], 10.0)[0] else ""
+                sys.stderr.write("\n")
+            if confirm.lower() == "y":
+                self.cancelled.set()
+                return
 
 
 def _strip_discriminator(username: str) -> str:
@@ -445,6 +513,7 @@ def transcribe_track(
     compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
     logprob_threshold: float = LOGPROB_THRESHOLD,
     best_of: int | None = None,
+    cancelled: threading.Event | None = None,
 ) -> tuple[list[tuple[float, float, str, float, float]], str | None]:
     """Transcribe one audio track into ((segment_start_offset, segment_end_offset,
     text, compression_ratio, avg_logprob) tuples, detected language).
@@ -512,6 +581,8 @@ def transcribe_track(
     prompt = initial_prompt
     with _redirect_mlx_whisper_progress(progress):
         for start, end in zip(speech_regions[::2], speech_regions[1::2]):
+            if cancelled is not None and cancelled.is_set():
+                raise TranscriptionCancelled()
             region_audio = audio[round(start * VAD_SAMPLE_RATE):round(end * VAD_SAMPLE_RATE)]
             result = mlx_whisper.transcribe(
                 region_audio,
@@ -1362,7 +1433,13 @@ def main() -> None:
     partial_dir = partial_dir_for(Path(config["output_dir"]), slug)
 
     extraction_ctx = tempfile.TemporaryDirectory() if is_zip else contextlib.nullcontext()
-    with extraction_ctx as tmp_dir, contextlib.ExitStack() as exit_stack:
+    with (
+        extraction_ctx as tmp_dir,
+        contextlib.ExitStack() as exit_stack,
+        _CancelWatcher() as cancel_watcher,
+    ):
+        print("(press Escape, then y, to cancel — progress on completed tracks is saved)")
+        print()
         if is_zip:
             print("Extracting zip...")
             craig_folder = extract_zip(resolved_input_path, Path(tmp_dir))
@@ -1419,6 +1496,8 @@ def main() -> None:
         ) as vad_progress:
             completed_s = 0.0
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
+                if cancel_watcher.cancelled.is_set():
+                    raise TranscriptionCancelled()
                 vad_progress.write(f"  VAD track {i}/{vad_total} ({username})...")
                 track_duration = track_durations[username]
 
@@ -1512,6 +1591,8 @@ def main() -> None:
             leave=False,
         ) as progress:
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
+                if cancel_watcher.cancelled.is_set():
+                    raise TranscriptionCancelled()
                 track_start = time.monotonic()
                 partial = (
                     None
@@ -1536,6 +1617,7 @@ def main() -> None:
                         compression_ratio_threshold,
                         logprob_threshold,
                         best_of,
+                        cancel_watcher.cancelled,
                     )
                     if args.test is None:
                         write_track_partial(
@@ -1622,4 +1704,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except TranscriptionCancelled:
+        print("Cancelled. Progress on completed tracks was saved; rerun to resume.")
+        sys.exit(130)
