@@ -971,6 +971,7 @@ def write_transcript(
     line_format: str,
     merge_stats: dict[str, int],
     filename_suffix: str = "",
+    output_name: str | None = None,
 ) -> Path:
     """Write the merged transcript as a Markdown file with YAML frontmatter.
 
@@ -988,10 +989,14 @@ def write_transcript(
     using the same `timestamp_format`/`line_format`, with no YAML
     frontmatter — a disposable side file, not a document. When empty, any
     stale `.errors.md` from a previous run of the same slug is removed.
+
+    `output_name`, if given, overrides the filename slug (via `--output-name`)
+    without affecting `session_title`, which is still recorded as-is in the
+    frontmatter `title` field.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    slug = _slugify(session_title)
+    slug = _slugify(output_name) if output_name else _slugify(session_title)
     output_path = output_dir / f"{slug}{filename_suffix}.md"
     errors_path = output_dir / f"{slug}{filename_suffix}.errors.md"
 
@@ -1096,6 +1101,13 @@ def main() -> None:
         "default (a single resample per retry). Overrides the config `best_of` key.",
     )
     parser.add_argument("--title", help="Override the session title")
+    parser.add_argument(
+        "--output-name",
+        help="Override the transcript filename stem (e.g. `--output-name foo` "
+        "writes foo.md and, if any lines are flagged, foo.errors.md), without "
+        "changing the session `title` recorded in the frontmatter. Defaults to "
+        "a slugified version of the session title.",
+    )
     parser.add_argument(
         "--vocabulary",
         type=Path,
@@ -1472,6 +1484,7 @@ def main() -> None:
             line_format,
             merge_stats,
             filename_suffix="-test" if args.test is not None else "",
+            output_name=args.output_name,
         )
         if args.test is None:
             shutil.rmtree(partial_dir, ignore_errors=True)
