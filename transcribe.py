@@ -1412,16 +1412,20 @@ def main() -> None:
         total_raw_s = 0.0
         total_speech_s = 0.0
         vad_total = len(matched)
+        track_durations = {username: _probe_duration(path) for username, path in matched.items()}
         vad_start = time.monotonic()
-        with tqdm.tqdm(total=100, unit="%", leave=False) as vad_progress:
-
-            def _on_vad_progress(pct: float) -> None:
-                vad_progress.n = round(pct)
-                vad_progress.refresh()
-
+        with tqdm.tqdm(
+            total=round(sum(track_durations.values())), unit="s", leave=False, desc="Analyzing speech"
+        ) as vad_progress:
+            completed_s = 0.0
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
                 vad_progress.write(f"  VAD track {i}/{vad_total} ({username})...")
-                vad_progress.reset(total=100)
+                track_duration = track_durations[username]
+
+                def _on_vad_progress(pct: float, _base=completed_s, _dur=track_duration) -> None:
+                    vad_progress.n = round(_base + _dur * pct / 100)
+                    vad_progress.refresh()
+
                 track_start = time.monotonic()
                 regions, duration = detect_speech_regions(
                     audio_path,
@@ -1434,6 +1438,9 @@ def main() -> None:
                 track_speech_s = speech_seconds(regions)
                 total_raw_s += duration
                 total_speech_s += track_speech_s
+                completed_s += track_duration
+                vad_progress.n = round(completed_s)
+                vad_progress.refresh()
                 vad_progress.write(
                     f"    -> {_format_duration(track_speech_s)} speech / "
                     f"{_format_duration(duration)} raw ({track_speech_s / duration * 100:.0f}%) "
