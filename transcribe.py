@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import subprocess
+import unicodedata
 
 import mlx.core as mx
 import mlx_whisper
@@ -805,6 +806,59 @@ def collapse_repetition(
     return " ".join(collapse_char_repetition(word) for word in collapsed_words)
 
 
+# A Unicode replacement character means mlx_whisper's decode produced a byte
+# sequence that isn't even valid text in the language it guessed — never a
+# legitimate transcription.
+_REPLACEMENT_CHAR = "�"
+
+# Script families distinct enough that seeing two-plus of them in one short
+# segment (alongside Latin, which speaker names/loanwords/URLs can
+# legitimately mix in) is a strong wrong-language hallucination signal, not
+# real code-switching — real code-switching stays within one language's
+# script(s) for a whole utterance, not several unrelated ones in one line.
+# CJK/HIRAGANA/KATAKANA are one family, not three: a single real Japanese
+# sentence routinely mixes kanji and kana.
+_SCRIPT_FAMILIES = {
+    "CYRILLIC": "CYRILLIC",
+    "CJK": "CJK",
+    "HIRAGANA": "CJK",
+    "KATAKANA": "CJK",
+    "HANGUL": "HANGUL",
+    "ARABIC": "ARABIC",
+    "HEBREW": "HEBREW",
+    "GREEK": "GREEK",
+    "THAI": "THAI",
+    "DEVANAGARI": "DEVANAGARI",
+}
+
+
+def _script_of(char: str) -> str | None:
+    """Return a coarse non-Latin script family name for `char`, or None if it's
+    Latin, a digit, punctuation, or whitespace (all of which are ignored)."""
+    try:
+        name = unicodedata.name(char)
+    except ValueError:
+        return None
+    for marker, family in _SCRIPT_FAMILIES.items():
+        if marker in name:
+            return family
+    return None
+
+
+def looks_garbled(text: str) -> bool:
+    """Return True if `text` contains a Unicode replacement character, or a
+    mix of two or more unrelated non-Latin scripts (e.g. Cyrillic and CJK in
+    the same line) — both signal a wrong-language/garbled decode that
+    compression_ratio and avg_logprob can miss, since a short, varied
+    hallucinated line doesn't always compress poorly or read as
+    low-confidence to Whisper itself.
+    """
+    if _REPLACEMENT_CHAR in text:
+        return True
+    scripts = {script for script in (_script_of(char) for char in text) if script is not None}
+    return len(scripts) > 1
+
+
 def merge_tracks(
     session_start: datetime,
     transcripts: dict[str, list[tuple[float, float, str, float, float]]],
@@ -839,7 +893,11 @@ def merge_tracks(
     These must be the same thresholds passed to `transcribe_track`'s
     `compression_ratio_threshold`/`logprob_threshold`, since a segment's
     ratio and log-probability are only meaningful relative to the thresholds
-    that drove its own retries.
+    that drove its own retries. A segment is also flagged, regardless of
+    either threshold, when `looks_garbled()` finds a Unicode replacement
+    character or a mix of unrelated non-Latin scripts — both catch
+    wrong-language decodes that stay short/varied enough to read as
+    high-confidence to mlx_whisper itself.
 
     Every segment's text is also passed through `collapse_repetition()`
     before anything else, regardless of its compression ratio — a
@@ -909,6 +967,7 @@ def merge_tracks(
                 compression_ratio > compression_ratio_threshold
                 or avg_logprob < logprob_threshold
                 or repetition_collapsed
+                or looks_garbled(stripped)
             )
             normalized = _normalize(stripped)
             if not flagged and normalized in normalized_filler_words:
