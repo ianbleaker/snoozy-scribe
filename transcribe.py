@@ -1085,8 +1085,9 @@ def main() -> None:
             craig_folder = resolved_input_path
         print()
 
+        print("PARSING MANIFEST...")
         session_start, usernames = parse_manifest(craig_folder)
-        print(f"Parsed manifest: {len(usernames)} speakers, session started {session_start}")
+        print(f"  Parsed manifest: {len(usernames)} speakers, session started {session_start}")
         matched = match_tracks(craig_folder, usernames)
         print()
 
@@ -1121,11 +1122,12 @@ def main() -> None:
             )
             print()
 
-        print(f"Analyzing speech regions (VAD) for {len(matched)} tracks...")
+        print("ANALYZING SPEECH (VAD)...")
         track_regions: dict[str, list[float]] = {}
         total_raw_s = 0.0
         total_speech_s = 0.0
         vad_total = len(matched)
+        vad_start = time.monotonic()
         with tqdm.tqdm(total=100, unit="%", leave=False) as vad_progress:
 
             def _on_vad_progress(pct: float) -> None:
@@ -1133,45 +1135,53 @@ def main() -> None:
                 vad_progress.refresh()
 
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
+                vad_progress.write(f"  VAD track {i}/{vad_total} ({username})...")
                 vad_progress.reset(total=100)
-                vad_progress.set_description(f"VAD {i}/{vad_total}: {username}")
+                track_start = time.monotonic()
                 regions, duration = detect_speech_regions(
                     audio_path,
                     vad_min_silence_ms,
                     vad_min_speech_ms,
                     _on_vad_progress,
                 )
+                track_elapsed = time.monotonic() - track_start
                 track_regions[username] = regions
                 track_speech_s = speech_seconds(regions)
                 total_raw_s += duration
                 total_speech_s += track_speech_s
                 vad_progress.write(
-                    f"  -> {_format_duration(track_speech_s)} speech / "
-                    f"{_format_duration(duration)} raw ({track_speech_s / duration * 100:.0f}%)"
+                    f"    -> {_format_duration(track_speech_s)} speech / "
+                    f"{_format_duration(duration)} raw ({track_speech_s / duration * 100:.0f}%) "
+                    f"in {_format_duration(track_elapsed)}"
                 )
+        vad_elapsed = time.monotonic() - vad_start
         speech_pct = (total_speech_s / total_raw_s * 100) if total_raw_s else 0.0
         print(
-            f"  VAD: {_format_duration(total_speech_s)} speech / "
-            f"{_format_duration(total_raw_s)} raw audio ({speech_pct:.0f}%) to transcribe"
+            f"VAD completed: {_format_duration(total_speech_s)} speech / "
+            f"{_format_duration(total_raw_s)} raw audio ({speech_pct:.0f}%) to transcribe "
+            f"in {_format_duration(vad_elapsed)}"
         )
         print()
 
         model_dir = Path(config["model_dir"])
         target_model_dir = model_dir / model_repo.split("/")[-1]
-        print(f"Resolving model {model_repo}...")
+        print("RESOLVING MODEL...")
+        print(f"  {model_repo}")
         if not target_model_dir.exists() or not any(target_model_dir.iterdir()):
             print("  Downloading model (first run)...")
         model_path = resolve_model_path(model_repo, model_dir)
         print()
 
+        print("TRANSCRIBING TRACKS...")
         total_frames = sum(speech_frames(regions) for regions in track_regions.values())
         transcripts = {}
         total = len(matched)
+        total_segments = 0
 
         if args.test is None:
             if args.fresh and partial_dir.exists():
                 shutil.rmtree(partial_dir)
-                print("Ignoring saved partial output (--fresh).")
+                print("  Ignoring saved partial output (--fresh).")
             elif partial_dir.exists():
                 meta = load_partial_meta(partial_dir)
                 if not meta_matches(
@@ -1184,7 +1194,7 @@ def main() -> None:
                     best_of,
                 ):
                     print(
-                        "!! warning: saved partial output for this session doesn't match the "
+                        "  !! warning: saved partial output for this session doesn't match the "
                         "current model/VAD/vocabulary/language/compression-ratio/best-of config, "
                         "discarding and retranscribing all tracks"
                     )
@@ -1199,6 +1209,7 @@ def main() -> None:
                 best_of,
             )
 
+        transcribe_start = time.monotonic()
         with tqdm.tqdm(
             total=total_frames,
             unit="frames",
@@ -1207,6 +1218,7 @@ def main() -> None:
             leave=False,
         ) as progress:
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
+                track_start = time.monotonic()
                 partial = (
                     None
                     if args.test is not None
@@ -1215,11 +1227,11 @@ def main() -> None:
                 if partial is not None:
                     segments, detected_language = partial
                     progress.write(
-                        f"Resuming track {i}/{total}: {username} (from saved partial)..."
+                        f"  Resuming track {i}/{total} ({username}) (from saved partial)..."
                     )
                     progress.update(speech_frames(track_regions[username]))
                 else:
-                    progress.write(f"Transcribing track {i}/{total}: {username}...")
+                    progress.write(f"  Transcribing track {i}/{total} ({username})...")
                     segments, detected_language = transcribe_track(
                         audio_path,
                         model_path,
@@ -1234,12 +1246,16 @@ def main() -> None:
                         write_track_partial(
                             partial_dir, username, audio_path, segments, detected_language
                         )
+                track_elapsed = time.monotonic() - track_start
                 if detected_language:
                     progress.write(
-                        f"  Detected language: "
+                        f"    Detected language: "
                         f"{LANGUAGES.get(detected_language, detected_language).title()}"
                     )
-                progress.write(f"  -> {len(segments)} segments")
+                progress.write(
+                    f"    -> {len(segments)} segments in {_format_duration(track_elapsed)}"
+                )
+                total_segments += len(segments)
                 transcripts[username] = [
                     (
                         offset + window_start,
@@ -1249,9 +1265,14 @@ def main() -> None:
                     )
                     for offset, end, text, compression_ratio in segments
                 ]
+        transcribe_elapsed = time.monotonic() - transcribe_start
+        print(
+            f"Transcription completed: {total_segments} segments "
+            f"in {_format_duration(transcribe_elapsed)}"
+        )
         print()
 
-        print("Merging tracks...")
+        print("MERGING TRACKS...")
         merged, merge_stats = merge_tracks(
             session_start,
             transcripts,
@@ -1259,14 +1280,13 @@ def main() -> None:
             filler_words,
             compression_ratio_threshold,
         )
-        print(
-            f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed, "
-            f"{merge_stats['filler_dropped']} filler word(s) dropped, "
-            f"{merge_stats['repeat_deduped']} repeat(s) deduped, "
-            f"{merge_stats['empty_dropped']} empty segment(s) dropped, "
-            f"{merge_stats['flagged_for_review']} line(s) flagged for review "
-            f"({merge_stats['segments_total']} segments in)"
-        )
+        print(f"  {merge_stats['segments_total']} segments")
+        print(f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed")
+        print(f"  {merge_stats['filler_dropped']} filler word(s) dropped")
+        print(f"  {merge_stats['repeat_deduped']} repeat(s) deduped")
+        print(f"  {merge_stats['empty_dropped']} empty segment(s) dropped")
+        print(f"  {merge_stats['flagged_for_review']} line(s) flagged for review")
+        print("Merging completed")
         warned_speakers: set[str] = set()
         resolved = [
             (timestamp, resolve_speaker(username, config["speaker_map"], warned_speakers), text)
@@ -1274,7 +1294,7 @@ def main() -> None:
         ]
         print()
 
-        print("Writing transcript...")
+        print("WRITING TRANSCRIPT...")
         output_path = write_transcript(
             resolved,
             session_title,
