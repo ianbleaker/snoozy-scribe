@@ -75,6 +75,10 @@ Config keys:
   into separate regions before transcription. Defaults to `800`.
 - `timestamp_format` — `strftime()` format for each line's timestamp.
   Defaults to `"%H:%M:%S"`.
+- `timestamp_mode` — `"elapsed"` stamps each line with time since the start
+  of the recording, so the first segment reads `00:00:00`; `"clock"` stamps
+  it with the real wall-clock time it was recorded. Defaults to `"elapsed"`.
+  Overridden by `--elapsed-timestamps` / `--clock-timestamps`.
 - `line_format` — `str.format()` template for each transcript line, with
   `{timestamp}`, `{speaker}`, and `{text}` placeholders. Use Markdown here to
   style the output, e.g. `"[{timestamp}] **{speaker}**: {text}"` to bold

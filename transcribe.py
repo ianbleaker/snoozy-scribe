@@ -36,6 +36,11 @@ VAD_SAMPLE_RATE = 16000
 
 AUDIO_EXTENSIONS = {".flac", ".wav", ".mp3", ".m4a", ".ogg", ".aac"}
 
+# Arbitrary fixed epoch used as merge_tracks()'s timestamp base in "elapsed"
+# timestamp mode, so the first segment lands at 00:00:00 instead of the real
+# session wall-clock time. Sessions run well under 24h, so this never wraps.
+_ELAPSED_TIMESTAMP_EPOCH = datetime(2000, 1, 1)
+
 # Bump when a change alters what a .partial/ directory's saved segments mean
 # (e.g. #20: per-region transcription calls instead of one batched call per
 # track) so stale partials from before the change are discarded rather than
@@ -860,7 +865,7 @@ def looks_garbled(text: str) -> bool:
 
 
 def merge_tracks(
-    session_start: datetime,
+    timestamp_base: datetime,
     transcripts: dict[str, list[tuple[float, float, str, float, float]]],
     merge_gap_seconds: float,
     filler_words: list[str],
@@ -988,10 +993,10 @@ def merge_tracks(
             if flagged:
                 stats["flagged_for_review"] += 1
                 if buffer_text is not None:
-                    timestamp = session_start + timedelta(seconds=buffer_start)
+                    timestamp = timestamp_base + timedelta(seconds=buffer_start)
                     merged.append((timestamp, username, buffer_text))
                     buffer_start = buffer_end = buffer_text = None
-                timestamp = session_start + timedelta(seconds=start)
+                timestamp = timestamp_base + timedelta(seconds=start)
                 flagged_lines.append((timestamp, username, stripped))
                 if include_inaudible_placeholders:
                     merged.append((timestamp, username, "!! [inaudible]"))
@@ -1002,12 +1007,12 @@ def merge_tracks(
                 buffer_end = end
             else:
                 if buffer_text is not None:
-                    timestamp = session_start + timedelta(seconds=buffer_start)
+                    timestamp = timestamp_base + timedelta(seconds=buffer_start)
                     merged.append((timestamp, username, buffer_text))
                 buffer_start, buffer_end, buffer_text = start, end, stripped
 
         if buffer_text is not None:
-            timestamp = session_start + timedelta(seconds=buffer_start)
+            timestamp = timestamp_base + timedelta(seconds=buffer_start)
             merged.append((timestamp, username, buffer_text))
 
     merged.sort(key=lambda entry: entry[0])
@@ -1202,6 +1207,27 @@ def main() -> None:
         "file either way). Overrides the config `show_inaudible_placeholders` "
         "key, which defaults to false.",
     )
+    timestamp_mode_group = parser.add_mutually_exclusive_group()
+    timestamp_mode_group.add_argument(
+        "--elapsed-timestamps",
+        dest="elapsed_timestamps",
+        action="store_true",
+        default=None,
+        help="Stamp each line with time elapsed since the start of the "
+        "recording (00:00:00 at the first segment) instead of the real "
+        "wall-clock time it was spoken. Overrides the config `timestamp_mode` "
+        "key, which defaults to 'elapsed'. This is the default, so the flag "
+        "only matters to override a config set to 'clock'.",
+    )
+    timestamp_mode_group.add_argument(
+        "--clock-timestamps",
+        dest="elapsed_timestamps",
+        action="store_false",
+        default=None,
+        help="Stamp each line with the real wall-clock time it was spoken, "
+        "instead of time elapsed since the start of the recording. Overrides "
+        "the config `timestamp_mode` key, which defaults to 'elapsed'.",
+    )
     parser.add_argument(
         "--fresh",
         action="store_true",
@@ -1267,6 +1293,11 @@ def main() -> None:
         if args.show_inaudible is not None
         else config.get("show_inaudible_placeholders", False)
     )
+    timestamp_mode = config.get("timestamp_mode", "elapsed")
+    if timestamp_mode not in ("clock", "elapsed"):
+        sys.exit(f"error: config `timestamp_mode` must be 'clock' or 'elapsed', got {timestamp_mode!r}")
+    if args.elapsed_timestamps is not None:
+        timestamp_mode = "elapsed" if args.elapsed_timestamps else "clock"
 
     default_vocab_path = Path("./vocabulary.md")
     if args.vocabulary is not None:
@@ -1531,8 +1562,9 @@ def main() -> None:
         print()
 
         print("MERGING TRACKS...")
+        timestamp_base = _ELAPSED_TIMESTAMP_EPOCH if timestamp_mode == "elapsed" else session_start
         merged, flagged_lines, merge_stats = merge_tracks(
-            session_start,
+            timestamp_base,
             transcripts,
             merge_gap_ms / 1000,
             filler_words,

@@ -122,6 +122,12 @@ filler_words: ["so", "you", "um", "uh", "hm", "hmm"]
 # omitted.
 timestamp_format: "%H:%M:%S"
 
+# "elapsed" stamps each line with time since the start of the recording, so
+# the first segment reads 00:00:00; "clock" stamps it with the real
+# wall-clock time it was recorded. Defaults to "elapsed" if omitted.
+# Overridden by --elapsed-timestamps / --clock-timestamps.
+timestamp_mode: "elapsed"
+
 # str.format() template for each transcript line. Supports {timestamp},
 # {speaker}, and {text} placeholders — use Markdown here to control the
 # output styling, e.g. bold speaker names with "**{speaker}**". Defaults to
