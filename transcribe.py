@@ -577,7 +577,7 @@ def parse_vocabulary(path: Path) -> dict[str, dict]:
             value = value.strip()
             if label.lower() == "misheard as":
                 vocabulary[current_term]["misheard_as"] = [
-                    v.strip() for v in value.split(",")
+                    v.strip() for v in value.split(",") if v.strip()
                 ]
             else:
                 vocabulary[current_term]["fields"][label] = value
