@@ -596,10 +596,13 @@ def apply_vocabulary(text: str, vocabulary: dict) -> str:
     Capitalizes only the replacement's first letter, regardless of the
     term's own casing, when the match starts `text` or follows `.`/`!`/`?`
     plus whitespace; otherwise uses the term's exact canonical casing.
+
+    Matches are anchored to word boundaries so a variant like "Oste" doesn't
+    fire inside an unrelated word such as "hosted".
     """
     for term, data in vocabulary.items():
         for variant in data["misheard_as"]:
-            pattern = re.compile(re.escape(variant), re.IGNORECASE)
+            pattern = re.compile(r"\b" + re.escape(variant) + r"\b", re.IGNORECASE)
 
             def _replace(match: re.Match, term: str = term) -> str:
                 prefix = text[: match.start()]
