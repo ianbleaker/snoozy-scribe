@@ -74,6 +74,14 @@ logprob_threshold: -1.0
 # 2-3.5x the decode time. See docs/analysis/best-of-decoding-analysis.md.
 # best_of: 5
 
+# Whether a flagged/low-confidence line keeps an inline "!! [inaudible]"
+# placeholder in the main transcript. The line's original garbled text is
+# always written to the companion <slug>.errors.md file either way. Defaults
+# to false (flagged lines are omitted from the main transcript entirely, so
+# it reads as continuous speech). Overridable per-run with
+# `transcribe.py --show-inaudible`.
+show_inaudible_placeholders: false
+
 # Directory the transcript Markdown files are written to.
 output_dir: ./transcripts
 

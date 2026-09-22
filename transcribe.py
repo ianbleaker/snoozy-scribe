@@ -866,6 +866,7 @@ def merge_tracks(
     filler_words: list[str],
     compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
     logprob_threshold: float = LOGPROB_THRESHOLD,
+    include_inaudible_placeholders: bool = False,
 ) -> tuple[list[tuple[datetime, str, str]], list[tuple[datetime, str, str]], dict[str, int]]:
     """Interleave per-track segments into one chronological transcript.
 
@@ -921,12 +922,17 @@ def merge_tracks(
     even with identical text, so a distinct flagged line is never silently
     absorbed into unrelated surrounding speech.
 
-    A flagged line's displayed text in `merged` is replaced with the fixed
-    placeholder `!! [inaudible]` — the original garbled text is returned
-    separately as `flagged_lines` (same shape as `merged`) for the caller to
-    write to a companion errors file. Repeat dedup against an adjacent
-    flagged segment (above) still compares the original text, not the
-    placeholder.
+    A flagged line's original garbled text is always returned in
+    `flagged_lines` (same shape as `merged`) for the caller to write to a
+    companion errors file. Whether it also gets a `!! [inaudible]`
+    placeholder line in `merged` is controlled by
+    `include_inaudible_placeholders`: by default (False) a flagged line is
+    dropped from `merged` entirely, so the final transcript reads as
+    continuous speech with review-worthy gaps only visible in the errors
+    file; set True to keep an inline marker at each flagged line's position.
+    Either way, flagged text never merges into a neighboring buffered line,
+    and repeat dedup against an adjacent flagged segment (above) always
+    compares the original text, not the placeholder.
 
     Also returns a stats dict counting what was pruned along the way
     (`segments_total`, `empty_dropped`, `repetition_collapsed`,
@@ -987,7 +993,8 @@ def merge_tracks(
                     buffer_start = buffer_end = buffer_text = None
                 timestamp = session_start + timedelta(seconds=start)
                 flagged_lines.append((timestamp, username, stripped))
-                merged.append((timestamp, username, "!! [inaudible]"))
+                if include_inaudible_placeholders:
+                    merged.append((timestamp, username, "!! [inaudible]"))
                 continue
 
             if buffer_text is not None and start - buffer_end <= merge_gap_seconds:
@@ -1186,6 +1193,16 @@ def main() -> None:
         "a comma-separated list (e.g. Tagline,Description) includes only those.",
     )
     parser.add_argument(
+        "--show-inaudible",
+        action="store_true",
+        default=None,
+        help="Keep an inline '!! [inaudible]' placeholder in the main transcript "
+        "for each flagged/low-confidence line, instead of omitting it (the "
+        "original garbled text is always written to the companion .errors.md "
+        "file either way). Overrides the config `show_inaudible_placeholders` "
+        "key, which defaults to false.",
+    )
+    parser.add_argument(
         "--fresh",
         action="store_true",
         help="Ignore any saved partial output for this session and retranscribe "
@@ -1245,6 +1262,11 @@ def main() -> None:
     timestamp_format = config.get("timestamp_format", "%H:%M:%S")
     line_format = config.get("line_format", "[{timestamp}] {speaker}: {text}")
     filler_words = config.get("filler_words", ["so", "you", "um", "uh", "hm", "hmm"])
+    show_inaudible_placeholders = (
+        args.show_inaudible
+        if args.show_inaudible is not None
+        else config.get("show_inaudible_placeholders", False)
+    )
 
     default_vocab_path = Path("./vocabulary.md")
     if args.vocabulary is not None:
@@ -1516,6 +1538,7 @@ def main() -> None:
             filler_words,
             compression_ratio_threshold,
             logprob_threshold,
+            show_inaudible_placeholders,
         )
         print(f"  {merge_stats['segments_total']} segments")
         print(f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed")
