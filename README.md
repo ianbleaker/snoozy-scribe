@@ -44,7 +44,10 @@ arguments. After a successful run, a zip that was extracted (whether passed
 explicitly or auto-picked) is moved into `<input_dir>/processed/`.
 
 The transcript is written to `output_dir` (from `config.yaml`) as
-`<session-title>.md`.
+`<session-title>.md`. Lines Whisper's decode couldn't be trusted for show
+`!! [inaudible]` in the transcript; if the run had any, the original
+garbled text is written alongside it to `<session-title>.errors.md` for
+manual review against the audio.
 
 Options:
 

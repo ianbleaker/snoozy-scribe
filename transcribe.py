@@ -781,7 +781,7 @@ def merge_tracks(
     merge_gap_seconds: float,
     filler_words: list[str],
     compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
-) -> tuple[list[tuple[datetime, str, str]], dict[str, int]]:
+) -> tuple[list[tuple[datetime, str, str]], list[tuple[datetime, str, str]], dict[str, int]]:
     """Interleave per-track segments into one chronological transcript.
 
     Consecutive segments from the same speaker (per-track, ignoring what
@@ -828,12 +828,20 @@ def merge_tracks(
     even with identical text, so a distinct flagged line is never silently
     absorbed into unrelated surrounding speech.
 
+    A flagged line's displayed text in `merged` is replaced with the fixed
+    placeholder `!! [inaudible]` — the original garbled text is returned
+    separately as `flagged_lines` (same shape as `merged`) for the caller to
+    write to a companion errors file. Repeat dedup against an adjacent
+    flagged segment (above) still compares the original text, not the
+    placeholder.
+
     Also returns a stats dict counting what was pruned along the way
     (`segments_total`, `empty_dropped`, `repetition_collapsed`,
     `filler_dropped`, `repeat_deduped`, `flagged_for_review`), for the
     caller to report and to record in the transcript's frontmatter.
     """
     merged: list[tuple[datetime, str, str]] = []
+    flagged_lines: list[tuple[datetime, str, str]] = []
     normalized_filler_words = {_normalize(word) for word in filler_words}
     stats = {
         "segments_total": 0,
@@ -880,7 +888,8 @@ def merge_tracks(
                     merged.append((timestamp, username, buffer_text))
                     buffer_start = buffer_end = buffer_text = None
                 timestamp = session_start + timedelta(seconds=start)
-                merged.append((timestamp, username, f"!! {stripped}"))
+                flagged_lines.append((timestamp, username, stripped))
+                merged.append((timestamp, username, "!! [inaudible]"))
                 continue
 
             if buffer_text is not None and start - buffer_end <= merge_gap_seconds:
@@ -897,11 +906,28 @@ def merge_tracks(
             merged.append((timestamp, username, buffer_text))
 
     merged.sort(key=lambda entry: entry[0])
-    return merged, stats
+    flagged_lines.sort(key=lambda entry: entry[0])
+    return merged, flagged_lines, stats
+
+
+def _format_lines(
+    entries: list[tuple[datetime, str, str]], timestamp_format: str, line_format: str
+) -> list[str]:
+    try:
+        return [
+            line_format.format(timestamp=timestamp.strftime(timestamp_format), speaker=name, text=text)
+            for timestamp, name, text in entries
+        ]
+    except KeyError as e:
+        raise ValueError(
+            f"config `line_format` uses unknown placeholder {e}; "
+            "only {timestamp}, {speaker}, {text} are supported"
+        ) from e
 
 
 def write_transcript(
     merged: list[tuple[datetime, str, str]],
+    flagged_lines: list[tuple[datetime, str, str]],
     session_title: str,
     output_dir: Path,
     timestamp_format: str,
@@ -918,11 +944,19 @@ def write_transcript(
     `merge_stats` (as returned by `merge_tracks()`) is recorded in the
     frontmatter under `pruning`, so what was dropped/collapsed/flagged stays
     attached to the transcript file itself, not just the console output.
+
+    `flagged_lines` holds the original (pre-placeholder) text of each
+    flagged line in `merged`. When non-empty, it's written to a companion
+    `<slug>{filename_suffix}.errors.md` file next to the main transcript,
+    using the same `timestamp_format`/`line_format`, with no YAML
+    frontmatter — a disposable side file, not a document. When empty, any
+    stale `.errors.md` from a previous run of the same slug is removed.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     slug = _slugify(session_title)
     output_path = output_dir / f"{slug}{filename_suffix}.md"
+    errors_path = output_dir / f"{slug}{filename_suffix}.errors.md"
 
     speakers = list(dict.fromkeys(name for _, name, _ in merged))
     date = merged[0][0].date().isoformat() if merged else ""
@@ -932,18 +966,15 @@ def write_transcript(
         sort_keys=False,
     )
 
-    try:
-        lines = [
-            line_format.format(timestamp=timestamp.strftime(timestamp_format), speaker=name, text=text)
-            for timestamp, name, text in merged
-        ]
-    except KeyError as e:
-        raise ValueError(
-            f"config `line_format` uses unknown placeholder {e}; "
-            "only {timestamp}, {speaker}, {text} are supported"
-        ) from e
-
+    lines = _format_lines(merged, timestamp_format, line_format)
     output_path.write_text(f"---\n{frontmatter}---\n\n" + "\n".join(lines) + "\n")
+
+    if flagged_lines:
+        error_lines = _format_lines(flagged_lines, timestamp_format, line_format)
+        errors_path.write_text("\n".join(error_lines) + "\n")
+    elif errors_path.exists():
+        errors_path.unlink()
+
     return output_path
 
 
@@ -1348,7 +1379,7 @@ def main() -> None:
         print()
 
         print("MERGING TRACKS...")
-        merged, merge_stats = merge_tracks(
+        merged, flagged_lines, merge_stats = merge_tracks(
             session_start,
             transcripts,
             merge_gap_ms / 1000,
@@ -1367,11 +1398,16 @@ def main() -> None:
             (timestamp, resolve_speaker(username, config["speaker_map"], warned_speakers), text)
             for timestamp, username, text in merged
         ]
+        resolved_flagged = [
+            (timestamp, resolve_speaker(username, config["speaker_map"], warned_speakers), text)
+            for timestamp, username, text in flagged_lines
+        ]
         print()
 
         print("WRITING TRANSCRIPT...")
         output_path = write_transcript(
             resolved,
+            resolved_flagged,
             session_title,
             Path(config["output_dir"]),
             timestamp_format,
