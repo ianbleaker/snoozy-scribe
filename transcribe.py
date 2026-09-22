@@ -623,13 +623,113 @@ def _normalize(text: str) -> str:
     return _TRAILING_PUNCTUATION.sub("", text.lower())
 
 
+# Genuine emphasis ("no no no") repeats a handful of times at most; a
+# repetition-hallucination loop runs for dozens or hundreds of words (see
+# docs/analysis/best-of-decoding-analysis.md and
+# docs/analysis/model-weight-analysis.md for real examples). Set well above
+# normal speech's repeat count so collapse_repetition() only fires on loops.
+REPETITION_MIN_REPEATS = 6
+REPETITION_MAX_PHRASE_WORDS = 6
+
+# A hallucination loop can also come out as one run-on token with no spaces
+# (e.g. a single character repeated hundreds of times, tokenized as one
+# "word"). Only worth checking on words far longer than any real one, so
+# ordinary long words/interjections are never touched.
+REPETITION_MIN_WORD_LENGTH_FOR_CHAR_COLLAPSE = 20
+REPETITION_MAX_CHAR_PERIOD = 4
+
+
+def _collapse_runs(tokens: list[str], keys: list[str], min_repeats: int, max_period: int) -> list[str]:
+    """Collapse a run of `min_repeats`+ immediately-repeated `keys` down to one.
+
+    Generic over what a "token" is (a word or a single character) — the
+    caller picks `tokens` (kept verbatim in the output) and `keys` (used for
+    comparison, e.g. normalized/lowercased). At each position, tries period
+    lengths from 1 up to `max_period`, smallest first, so a 1-token period
+    ("H H H H") is preferred over a spuriously-matching longer one.
+    """
+    n = len(tokens)
+    collapsed: list[str] = []
+    i = 0
+    while i < n:
+        for period in range(1, max_period + 1):
+            if i + period > n:
+                continue
+            phrase = keys[i : i + period]
+            if any(key == "" for key in phrase):
+                continue
+            repeats = 1
+            j = i + period
+            while j + period <= n and keys[j : j + period] == phrase:
+                repeats += 1
+                j += period
+            if repeats >= min_repeats:
+                collapsed.extend(tokens[i : i + period])
+                i = j
+                break
+        else:
+            collapsed.append(tokens[i])
+            i += 1
+    return collapsed
+
+
+def collapse_char_repetition(
+    word: str,
+    min_repeats: int = REPETITION_MIN_REPEATS,
+    max_period: int = REPETITION_MAX_CHAR_PERIOD,
+    min_word_length: int = REPETITION_MIN_WORD_LENGTH_FOR_CHAR_COLLAPSE,
+) -> str:
+    """Collapse a run-on repeated-character/substring hallucination in one word.
+
+    Whisper occasionally hallucinates a single character (or short substring)
+    repeated hundreds of times with no whitespace at all — e.g. "řřřřř...ř" —
+    which `collapse_repetition()`'s word-splitting can't see since it's one
+    token. Only applies to words at least `min_word_length` long, since no
+    real word or interjection gets anywhere close to that; short ones (e.g.
+    "hahaha") are left alone. Returns `word` unchanged if nothing collapses.
+    """
+    if len(word) < min_word_length:
+        return word
+    chars = list(word)
+    collapsed = "".join(_collapse_runs(chars, [c.lower() for c in chars], min_repeats, max_period))
+    return collapsed if len(collapsed) < len(word) else word
+
+
+def collapse_repetition(
+    text: str,
+    min_repeats: int = REPETITION_MIN_REPEATS,
+    max_phrase_words: int = REPETITION_MAX_PHRASE_WORDS,
+) -> str:
+    """Collapse an immediately-repeated word/phrase run down to one occurrence.
+
+    A repetition-hallucination loop repeats the same short (1-6 word) phrase
+    dozens or hundreds of times in a row — e.g. "H H H H...", "listen listen
+    listen...", "they all work there they all work there...". Collapses a
+    run to its first occurrence once it repeats at least `min_repeats` times
+    immediately in a row; see `_collapse_runs()`. Comparison is done on
+    `_normalize()`d words so trailing punctuation ("Sh," vs "Sh") and case
+    don't block a match; the original word tokens (with punctuation/case)
+    are kept in the output.
+
+    Each resulting word is then also passed through
+    `collapse_char_repetition()`, to catch a hallucination that came out as
+    one long run-on token instead of repeated whitespace-separated words.
+
+    Returns the text unchanged if no qualifying run is found.
+    """
+    words = text.split()
+    normalized = [_normalize(word) for word in words]
+    collapsed_words = _collapse_runs(words, normalized, min_repeats, max_phrase_words)
+    return " ".join(collapse_char_repetition(word) for word in collapsed_words)
+
+
 def merge_tracks(
     session_start: datetime,
     transcripts: dict[str, list[tuple[float, float, str, float]]],
     merge_gap_seconds: float,
     filler_words: list[str],
     compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
-) -> list[tuple[datetime, str, str]]:
+) -> tuple[list[tuple[datetime, str, str]], dict[str, int]]:
     """Interleave per-track segments into one chronological transcript.
 
     Consecutive segments from the same speaker (per-track, ignoring what
@@ -651,13 +751,36 @@ def merge_tracks(
     failure and had nothing better to fall back to. This must be the same
     threshold passed to `transcribe_track`'s `compression_ratio_threshold`,
     since a segment's compression ratio is only meaningful relative to the
-    threshold that drove its own retries. A flagged segment is exempt from
-    filler-word dropping and repeat dedup, and is never merged with a
-    neighbor in either direction — it's always emitted as its own line,
-    unchanged, for human review.
+    threshold that drove its own retries.
+
+    Every segment's text is also passed through `collapse_repetition()`
+    before anything else, regardless of its compression ratio — a
+    repetition-hallucination loop can be diluted below the ratio threshold
+    if it's only part of a longer segment. A segment collapse_repetition()
+    actually changes is flagged too, using the collapsed text, since a
+    changed segment means a real hallucination loop was caught: unedited
+    repeated-word walls made the exact case compression_ratio_threshold is
+    meant to catch unreadable even after flagging.
+
+    A flagged segment (either way) is exempt from filler-word dropping and
+    repeat dedup, and is never merged with a neighbor in either direction —
+    it's always emitted as its own line for human review.
+
+    Also returns a stats dict counting what was pruned along the way
+    (`segments_total`, `empty_dropped`, `repetition_collapsed`,
+    `filler_dropped`, `repeat_deduped`, `flagged_for_review`), for the
+    caller to report and to record in the transcript's frontmatter.
     """
     merged: list[tuple[datetime, str, str]] = []
     normalized_filler_words = {_normalize(word) for word in filler_words}
+    stats = {
+        "segments_total": 0,
+        "empty_dropped": 0,
+        "repetition_collapsed": 0,
+        "filler_dropped": 0,
+        "repeat_deduped": 0,
+        "flagged_for_review": 0,
+    }
 
     for username, segments in transcripts.items():
         previous_normalized: str | None = None
@@ -666,18 +789,28 @@ def merge_tracks(
         buffer_text: str | None = None
 
         for start, end, text, compression_ratio in segments:
+            stats["segments_total"] += 1
             stripped = text.strip()
             if stripped in ("", "..."):
+                stats["empty_dropped"] += 1
                 continue
-            flagged = compression_ratio > compression_ratio_threshold
+            collapsed_text = collapse_repetition(stripped)
+            repetition_collapsed = collapsed_text != stripped
+            if repetition_collapsed:
+                stats["repetition_collapsed"] += 1
+            stripped = collapsed_text
+            flagged = compression_ratio > compression_ratio_threshold or repetition_collapsed
             normalized = _normalize(stripped)
             if not flagged and normalized in normalized_filler_words:
+                stats["filler_dropped"] += 1
                 continue
             if not flagged and normalized == previous_normalized:
+                stats["repeat_deduped"] += 1
                 continue
             previous_normalized = normalized
 
             if flagged:
+                stats["flagged_for_review"] += 1
                 if buffer_text is not None:
                     timestamp = session_start + timedelta(seconds=buffer_start)
                     merged.append((timestamp, username, buffer_text))
@@ -700,7 +833,7 @@ def merge_tracks(
             merged.append((timestamp, username, buffer_text))
 
     merged.sort(key=lambda entry: entry[0])
-    return merged
+    return merged, stats
 
 
 def write_transcript(
@@ -709,6 +842,7 @@ def write_transcript(
     output_dir: Path,
     timestamp_format: str,
     line_format: str,
+    merge_stats: dict[str, int],
     filename_suffix: str = "",
 ) -> Path:
     """Write the merged transcript as a Markdown file with YAML frontmatter.
@@ -716,6 +850,10 @@ def write_transcript(
     `line_format` is a str.format() template with `{timestamp}`, `{speaker}`,
     and `{text}` placeholders, letting the config control per-line Markdown
     (e.g. `**{speaker}**` to bold speaker names).
+
+    `merge_stats` (as returned by `merge_tracks()`) is recorded in the
+    frontmatter under `pruning`, so what was dropped/collapsed/flagged stays
+    attached to the transcript file itself, not just the console output.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -726,7 +864,7 @@ def write_transcript(
     date = merged[0][0].date().isoformat() if merged else ""
 
     frontmatter = yaml.safe_dump(
-        {"date": date, "title": session_title, "speakers": speakers},
+        {"date": date, "title": session_title, "speakers": speakers, "pruning": merge_stats},
         sort_keys=False,
     )
 
@@ -1114,12 +1252,20 @@ def main() -> None:
         print()
 
         print("Merging tracks...")
-        merged = merge_tracks(
+        merged, merge_stats = merge_tracks(
             session_start,
             transcripts,
             merge_gap_ms / 1000,
             filler_words,
             compression_ratio_threshold,
+        )
+        print(
+            f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed, "
+            f"{merge_stats['filler_dropped']} filler word(s) dropped, "
+            f"{merge_stats['repeat_deduped']} repeat(s) deduped, "
+            f"{merge_stats['empty_dropped']} empty segment(s) dropped, "
+            f"{merge_stats['flagged_for_review']} line(s) flagged for review "
+            f"({merge_stats['segments_total']} segments in)"
         )
         warned_speakers: set[str] = set()
         resolved = [
@@ -1135,6 +1281,7 @@ def main() -> None:
             Path(config["output_dir"]),
             timestamp_format,
             line_format,
+            merge_stats,
             filename_suffix="-test" if args.test is not None else "",
         )
         if args.test is None:
