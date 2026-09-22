@@ -45,6 +45,19 @@ language: en
 # `transcribe.py --compression-ratio-threshold <value>`.
 compression_ratio_threshold: 2.4
 
+# Average per-token log-probability below which mlx_whisper retries a
+# region's decode at a higher temperature, treating it as a low-confidence
+# failure. A segment still below this threshold after retrying is flagged
+# with a "!! " prefix in the transcript for human review. Catches garbled/
+# wrong-language decodes that compression_ratio_threshold misses — made-up
+# words are high-entropy text, so they don't trip the ratio check even
+# though the model had low confidence in them. Raising it (closer to 0)
+# triggers more retries/flags; lowering it lets more low-confidence text
+# through unflagged. Defaults to -1.0 if omitted, matching mlx-whisper's own
+# default. Overridable per-run with `transcribe.py --logprob-threshold
+# <value>`.
+logprob_threshold: -1.0
+
 # When a segment is retried at a higher temperature (see
 # compression_ratio_threshold above), sample this many independent decodes
 # at that temperature and keep the best-ranked one instead of just one

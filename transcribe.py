@@ -39,7 +39,7 @@ AUDIO_EXTENSIONS = {".flac", ".wav", ".mp3", ".m4a", ".ogg", ".aac"}
 # (e.g. #20: per-region transcription calls instead of one batched call per
 # track) so stale partials from before the change are discarded rather than
 # resumed as-is.
-PARTIAL_SCHEMA_VERSION = 2
+PARTIAL_SCHEMA_VERSION = 3
 
 # Matches mlx_whisper.transcribe's own default: a segment above this gzip
 # compression ratio is repetitive enough that mlx_whisper already retried it
@@ -47,6 +47,16 @@ PARTIAL_SCHEMA_VERSION = 2
 # every retry failed and mlx_whisper fell back to the last (still bad)
 # decode rather than dropping it — see docs/design/transcription-pipeline.md.
 COMPRESSION_RATIO_THRESHOLD = 2.4
+
+# Matches mlx_whisper.transcribe's own default: a segment whose average
+# per-token log-probability falls below this is a low-confidence decode —
+# mlx_whisper already retried it at higher temperatures internally, so a
+# segment still below threshold here means every retry failed. Catches
+# garbled/wrong-language hallucinations that compression_ratio_threshold
+# misses, since made-up words are high-entropy (they don't compress well)
+# even though the model had no real signal for them — see
+# docs/design/transcription-pipeline.md.
+LOGPROB_THRESHOLD = -1.0
 
 _vad_model = None
 
@@ -74,6 +84,7 @@ def write_partial_meta(
     initial_prompt: str,
     language: str | None,
     compression_ratio_threshold: float,
+    logprob_threshold: float,
     best_of: int | None,
 ) -> None:
     partial_dir.mkdir(parents=True, exist_ok=True)
@@ -84,6 +95,7 @@ def write_partial_meta(
         "initial_prompt_hash": hashlib.sha256(initial_prompt.encode()).hexdigest(),
         "language": language,
         "compression_ratio_threshold": compression_ratio_threshold,
+        "logprob_threshold": logprob_threshold,
         "best_of": best_of,
     }
     (partial_dir / "_meta.json").write_text(json.dumps(meta))
@@ -103,6 +115,7 @@ def meta_matches(
     initial_prompt: str,
     language: str | None,
     compression_ratio_threshold: float,
+    logprob_threshold: float,
     best_of: int | None,
 ) -> bool:
     if meta is None:
@@ -115,6 +128,7 @@ def meta_matches(
         == hashlib.sha256(initial_prompt.encode()).hexdigest()
         and meta.get("language") == language
         and meta.get("compression_ratio_threshold") == compression_ratio_threshold
+        and meta.get("logprob_threshold") == logprob_threshold
         and meta.get("best_of") == best_of
     )
 
@@ -123,7 +137,7 @@ def write_track_partial(
     partial_dir: Path,
     username: str,
     audio_path: Path,
-    segments: list[tuple[float, float, str, float]],
+    segments: list[tuple[float, float, str, float, float]],
     language: str | None,
 ) -> None:
     stat = audio_path.stat()
@@ -139,7 +153,7 @@ def write_track_partial(
 
 def load_track_partial(
     partial_dir: Path, username: str, audio_path: Path, progress: tqdm.tqdm | None = None
-) -> tuple[list[tuple[float, float, str, float]], str | None] | None:
+) -> tuple[list[tuple[float, float, str, float, float]], str | None] | None:
     partial_path = partial_dir / f"{_safe_track_filename(username)}.json"
     try:
         data = json.loads(partial_path.read_text())
@@ -153,8 +167,8 @@ def load_track_partial(
         return None
 
     segments = [
-        (start, end, text, compression_ratio)
-        for start, end, text, compression_ratio in data["segments"]
+        (start, end, text, compression_ratio, avg_logprob)
+        for start, end, text, compression_ratio, avg_logprob in data["segments"]
     ]
     return segments, data["language"]
 
@@ -424,10 +438,11 @@ def transcribe_track(
     initial_prompt: str | None = None,
     language: str | None = None,
     compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
+    logprob_threshold: float = LOGPROB_THRESHOLD,
     best_of: int | None = None,
-) -> tuple[list[tuple[float, float, str, float]], str | None]:
+) -> tuple[list[tuple[float, float, str, float, float]], str | None]:
     """Transcribe one audio track into ((segment_start_offset, segment_end_offset,
-    text, compression_ratio) tuples, detected language).
+    text, compression_ratio, avg_logprob) tuples, detected language).
 
     Issues one mlx_whisper.transcribe() call per VAD speech region (not one
     batched call for the whole track): mlx_whisper's own `clip_timestamps`
@@ -454,6 +469,17 @@ def transcribe_track(
     after retrying means every retry failed. See
     docs/design/transcription-pipeline.md.
 
+    `logprob_threshold` is the same idea for a different failure mode: a
+    segment whose average per-token log-probability falls below it is a
+    low-confidence decode and mlx_whisper retries it the same way. This
+    catches garbled/wrong-language hallucinations that a high compression
+    ratio misses — made-up words are high-entropy text, so they don't trip
+    the ratio check even though the model had no real signal for them (e.g.
+    forcing `language="en"` sets the decode's language token but doesn't
+    constrain which tokens can come out, so a low-confidence region can
+    still decode as other-script gibberish). `merge_tracks` flags on this
+    the same way, for the same reason. See docs/design/transcription-pipeline.md.
+
     `best_of` only affects those same retries: mlx_whisper's first decode
     attempt is always greedy (temperature 0), and `best_of` is silently
     disabled at temperature 0, so it has no effect unless a segment already
@@ -477,7 +503,7 @@ def transcribe_track(
 
     audio = _decode_audio_mono16k(audio_path).numpy()
 
-    segments: list[tuple[float, float, str, float]] = []
+    segments: list[tuple[float, float, str, float, float]] = []
     prompt = initial_prompt
     with _redirect_mlx_whisper_progress(progress):
         for start, end in zip(speech_regions[::2], speech_regions[1::2]):
@@ -489,6 +515,7 @@ def transcribe_track(
                 initial_prompt=prompt,
                 language=language,
                 compression_ratio_threshold=compression_ratio_threshold,
+                logprob_threshold=logprob_threshold,
                 best_of=best_of,
             )
             if language is None:
@@ -502,6 +529,7 @@ def transcribe_track(
                     segment["end"] + start,
                     segment["text"],
                     segment["compression_ratio"],
+                    segment["avg_logprob"],
                 )
                 for segment in region_segments
             )
@@ -777,10 +805,11 @@ def collapse_repetition(
 
 def merge_tracks(
     session_start: datetime,
-    transcripts: dict[str, list[tuple[float, float, str, float]]],
+    transcripts: dict[str, list[tuple[float, float, str, float, float]]],
     merge_gap_seconds: float,
     filler_words: list[str],
     compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
+    logprob_threshold: float = LOGPROB_THRESHOLD,
 ) -> tuple[list[tuple[datetime, str, str]], list[tuple[datetime, str, str]], dict[str, int]]:
     """Interleave per-track segments into one chronological transcript.
 
@@ -790,21 +819,25 @@ def merge_tracks(
     `merge_gap_seconds`; see docs/design/transcription-pipeline.md.
 
     A segment is dropped entirely if its text, normalized (lowercased,
-    trailing punctuation stripped), exactly matches an entry in
-    `filler_words` (whole-line match only) or matches the previous surviving
+    trailing punctuation stripped), is empty — this catches not just a
+    literal empty string but punctuation-only noise like "." or "..." that
+    Whisper emits for near-silence — or exactly matches an entry in
+    `filler_words` (whole-line match only), or matches the previous surviving
     segment from the same speaker with the same flagged/unflagged status
     (repeat dedup, also normalized so "Okay."/"okay"/"Okay," collapse). The
     original, non-normalized text is kept for whichever occurrence is
     emitted.
 
     Segments whose compression ratio is still above
-    `compression_ratio_threshold` after mlx_whisper's own temperature
-    fallback are flagged with a "!! " prefix rather than silently emitted —
-    that ratio means mlx_whisper itself treated the decode as a repetition
-    failure and had nothing better to fall back to. This must be the same
-    threshold passed to `transcribe_track`'s `compression_ratio_threshold`,
-    since a segment's compression ratio is only meaningful relative to the
-    threshold that drove its own retries.
+    `compression_ratio_threshold`, or whose average log-probability is still
+    below `logprob_threshold`, after mlx_whisper's own temperature fallback
+    are flagged with a "!! " prefix rather than silently emitted — either
+    means mlx_whisper itself treated the decode as a failure (repetition or
+    low-confidence, respectively) and had nothing better to fall back to.
+    These must be the same thresholds passed to `transcribe_track`'s
+    `compression_ratio_threshold`/`logprob_threshold`, since a segment's
+    ratio and log-probability are only meaningful relative to the thresholds
+    that drove its own retries.
 
     Every segment's text is also passed through `collapse_repetition()`
     before anything else, regardless of its compression ratio — a
@@ -859,10 +892,10 @@ def merge_tracks(
         buffer_end: float | None = None
         buffer_text: str | None = None
 
-        for start, end, text, compression_ratio in segments:
+        for start, end, text, compression_ratio, avg_logprob in segments:
             stats["segments_total"] += 1
             stripped = text.strip()
-            if stripped in ("", "..."):
+            if _normalize(stripped) == "":
                 stats["empty_dropped"] += 1
                 continue
             collapsed_text = collapse_repetition(stripped)
@@ -870,7 +903,11 @@ def merge_tracks(
             if repetition_collapsed:
                 stats["repetition_collapsed"] += 1
             stripped = collapsed_text
-            flagged = compression_ratio > compression_ratio_threshold or repetition_collapsed
+            flagged = (
+                compression_ratio > compression_ratio_threshold
+                or avg_logprob < logprob_threshold
+                or repetition_collapsed
+            )
             normalized = _normalize(stripped)
             if not flagged and normalized in normalized_filler_words:
                 stats["filler_dropped"] += 1
@@ -1038,6 +1075,17 @@ def main() -> None:
         "omitted. Overrides the config `compression_ratio_threshold` key.",
     )
     parser.add_argument(
+        "--logprob-threshold",
+        type=float,
+        default=None,
+        help="Average per-token log-probability below which mlx_whisper retries a "
+        "decode at a higher temperature, and below which a segment still failing "
+        "after retries is flagged for review. Catches low-confidence garbled/"
+        "wrong-language decodes that compression-ratio-threshold misses. Higher "
+        "(closer to 0) catches more. Defaults to -1.0 if omitted. Overrides the "
+        "config `logprob_threshold` key.",
+    )
+    parser.add_argument(
         "--best-of",
         type=int,
         default=None,
@@ -1110,6 +1158,11 @@ def main() -> None:
         args.compression_ratio_threshold
         if args.compression_ratio_threshold is not None
         else config.get("compression_ratio_threshold", COMPRESSION_RATIO_THRESHOLD)
+    )
+    logprob_threshold = (
+        args.logprob_threshold
+        if args.logprob_threshold is not None
+        else config.get("logprob_threshold", LOGPROB_THRESHOLD)
     )
     best_of = args.best_of if args.best_of is not None else config.get("best_of")
     input_dir = Path(config.get("input_dir", "./input"))
@@ -1297,12 +1350,13 @@ def main() -> None:
                     initial_prompt,
                     language,
                     compression_ratio_threshold,
+                    logprob_threshold,
                     best_of,
                 ):
                     print(
                         "  !! warning: saved partial output for this session doesn't match the "
-                        "current model/VAD/vocabulary/language/compression-ratio/best-of config, "
-                        "discarding and retranscribing all tracks"
+                        "current model/VAD/vocabulary/language/compression-ratio/logprob/best-of "
+                        "config, discarding and retranscribing all tracks"
                     )
                     shutil.rmtree(partial_dir)
             write_partial_meta(
@@ -1312,6 +1366,7 @@ def main() -> None:
                 initial_prompt,
                 language,
                 compression_ratio_threshold,
+                logprob_threshold,
                 best_of,
             )
 
@@ -1346,6 +1401,7 @@ def main() -> None:
                         initial_prompt,
                         language,
                         compression_ratio_threshold,
+                        logprob_threshold,
                         best_of,
                     )
                     if args.test is None:
@@ -1368,8 +1424,9 @@ def main() -> None:
                         end + window_start,
                         apply_vocabulary(text, vocabulary),
                         compression_ratio,
+                        avg_logprob,
                     )
-                    for offset, end, text, compression_ratio in segments
+                    for offset, end, text, compression_ratio, avg_logprob in segments
                 ]
         transcribe_elapsed = time.monotonic() - transcribe_start
         print(
@@ -1385,6 +1442,7 @@ def main() -> None:
             merge_gap_ms / 1000,
             filler_words,
             compression_ratio_threshold,
+            logprob_threshold,
         )
         print(f"  {merge_stats['segments_total']} segments")
         print(f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed")
