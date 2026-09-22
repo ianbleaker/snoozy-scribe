@@ -142,7 +142,6 @@ def write_track_partial(
 ) -> None:
     stat = audio_path.stat()
     data = {
-        "audio_mtime": stat.st_mtime,
         "audio_size": stat.st_size,
         "language": language,
         "segments": segments,
@@ -161,7 +160,7 @@ def load_track_partial(
         return None
 
     stat = audio_path.stat()
-    if data["audio_mtime"] != stat.st_mtime or data["audio_size"] != stat.st_size:
+    if data["audio_size"] != stat.st_size:
         message = f"!! warning: partial for {username} is stale (audio file changed), retranscribing"
         progress.write(message) if progress is not None else print(message)
         return None
