@@ -20,6 +20,7 @@ from pathlib import Path
 
 import subprocess
 
+import mlx.core as mx
 import mlx_whisper
 import numpy as np
 import silero_vad
@@ -958,6 +959,17 @@ def _rule(char: str = "=") -> str:
 
 def main() -> None:
     start_time = time.monotonic()
+
+    # mlx_whisper's temperature-retry decodes (anything above the initial
+    # greedy temperature-0 attempt) sample via mx.random.categorical, and
+    # mlx_whisper never seeds MLX's global RNG itself — left alone, every
+    # run draws different retry tokens, so a segment that needed a retry
+    # (often the exact segments worth scrutinizing) reads differently from
+    # one run to the next on identical audio. Seeding here doesn't make
+    # decoding fully bit-identical across runs (GPU float reduction order
+    # can still vary), but it removes this specific, confirmed source of
+    # run-to-run variance.
+    mx.random.seed(0)
 
     print(_rule())
     print("rpg-scribe".center(len(_rule())))
