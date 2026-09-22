@@ -461,6 +461,12 @@ def transcribe_track(
     keeps the one it ranks highest, instead of a single resample — mlx_whisper
     doesn't implement beam search (`beam_size` raises `NotImplementedError`),
     so this is the available way to spend extra compute on a hard segment.
+
+    Each region's raw result is passed through `collapse_duplicate_segments()`
+    before it's used for anything, since mlx_whisper can hallucinate a loop
+    as several whole segments with identical text rather than one segment
+    with repeated words inside it — the latter is what `collapse_repetition()`
+    (used downstream in `merge_tracks()`) catches; this catches the former.
     """
     # verbose=None (not mlx_whisper's default False) suppresses its own prints,
     # which would otherwise corrupt the live progress bar; see
@@ -486,7 +492,8 @@ def transcribe_track(
             )
             if language is None:
                 language = result.get("language")
-            region_text = "".join(segment["text"] for segment in result["segments"])
+            region_segments = collapse_duplicate_segments(result["segments"])
+            region_text = "".join(segment["text"] for segment in region_segments)
             prompt = ((initial_prompt or "") + " " + _tail_words(region_text)).strip()
             segments.extend(
                 (
@@ -495,7 +502,7 @@ def transcribe_track(
                     segment["text"],
                     segment["compression_ratio"],
                 )
-                for segment in result["segments"]
+                for segment in region_segments
             )
     return segments, language
 
@@ -638,6 +645,16 @@ REPETITION_MAX_PHRASE_WORDS = 6
 REPETITION_MIN_WORD_LENGTH_FOR_CHAR_COLLAPSE = 20
 REPETITION_MAX_CHAR_PERIOD = 4
 
+# A hallucination loop can also come out as several whole mlx_whisper
+# segments in a row with identical text, from one region's decode call
+# (e.g. eight separate "! I have." segments) — collapse_repetition() can't
+# see this since it only looks within one segment's own text. Unlike
+# REPETITION_MIN_REPEATS (6, tuned above normal speech's within-segment
+# repeat count), there's no legitimate reason for mlx_whisper to emit two
+# whole segments with verbatim-identical text back to back in one call, so
+# this threshold is much lower.
+SEGMENT_REPETITION_MIN_REPEATS = 2
+
 
 def _collapse_runs(tokens: list[str], keys: list[str], min_repeats: int, max_period: int) -> list[str]:
     """Collapse a run of `min_repeats`+ immediately-repeated `keys` down to one.
@@ -695,6 +712,40 @@ def collapse_char_repetition(
     return collapsed if len(collapsed) < len(word) else word
 
 
+def collapse_duplicate_segments(
+    segments: list[dict], min_repeats: int = SEGMENT_REPETITION_MIN_REPEATS
+) -> list[dict]:
+    """Collapse immediately-adjacent mlx_whisper segments with identical text.
+
+    Unlike `_collapse_runs()` (used elsewhere for words/chars), this keeps
+    the *run's* end time, not just its first segment's — `merge_tracks()`
+    merges on `next.start - prev.end`, so a collapsed segment reporting only
+    its first duplicate's (earlier, shorter) end would understate the run's
+    true duration and could wrongly suppress a legitimate merge with
+    whatever comes after. Comparison key is `_normalize()`d text. Called
+    once per VAD region's `mlx_whisper.transcribe()` result, before that
+    result's segments are used for anything else (the rolling
+    `initial_prompt` or the caller's segment list) — see `transcribe_track()`.
+    """
+    collapsed: list[dict] = []
+    i = 0
+    n = len(segments)
+    while i < n:
+        key = _normalize(segments[i]["text"])
+        j = i + 1
+        while j < n and _normalize(segments[j]["text"]) == key:
+            j += 1
+        run = segments[i:j]
+        if len(run) >= min_repeats:
+            kept = dict(run[0])
+            kept["end"] = run[-1]["end"]
+            collapsed.append(kept)
+        else:
+            collapsed.extend(run)
+        i = j
+    return collapsed
+
+
 def collapse_repetition(
     text: str,
     min_repeats: int = REPETITION_MIN_REPEATS,
@@ -740,9 +791,10 @@ def merge_tracks(
     A segment is dropped entirely if its text, normalized (lowercased,
     trailing punctuation stripped), exactly matches an entry in
     `filler_words` (whole-line match only) or matches the previous surviving
-    segment from the same speaker (repeat dedup, also normalized so
-    "Okay."/"okay"/"Okay," collapse). The original, non-normalized text is
-    kept for whichever occurrence is emitted.
+    segment from the same speaker with the same flagged/unflagged status
+    (repeat dedup, also normalized so "Okay."/"okay"/"Okay," collapse). The
+    original, non-normalized text is kept for whichever occurrence is
+    emitted.
 
     Segments whose compression ratio is still above
     `compression_ratio_threshold` after mlx_whisper's own temperature
@@ -762,9 +814,18 @@ def merge_tracks(
     repeated-word walls made the exact case compression_ratio_threshold is
     meant to catch unreadable even after flagging.
 
-    A flagged segment (either way) is exempt from filler-word dropping and
-    repeat dedup, and is never merged with a neighbor in either direction —
-    it's always emitted as its own line for human review.
+    A flagged segment (either way) is exempt from filler-word dropping, and
+    is never merged with a neighbor in either direction — it's always
+    emitted as its own line for human review. It's still subject to repeat
+    dedup against an immediately preceding *also-flagged* segment with the
+    same text, though: `transcribe_track()`'s `collapse_duplicate_segments()`
+    already collapses this within a single region's decode call, but a
+    hallucination loop split across region or track-merge boundaries could
+    still produce several adjacent identical flagged segments here, and
+    there's no legitimate reason to review the same flagged line twice. An
+    unflagged segment never dedups against a flagged one (or vice versa)
+    even with identical text, so a distinct flagged line is never silently
+    absorbed into unrelated surrounding speech.
 
     Also returns a stats dict counting what was pruned along the way
     (`segments_total`, `empty_dropped`, `repetition_collapsed`,
@@ -784,6 +845,7 @@ def merge_tracks(
 
     for username, segments in transcripts.items():
         previous_normalized: str | None = None
+        previous_flagged = False
         buffer_start: float | None = None
         buffer_end: float | None = None
         buffer_text: str | None = None
@@ -804,10 +866,11 @@ def merge_tracks(
             if not flagged and normalized in normalized_filler_words:
                 stats["filler_dropped"] += 1
                 continue
-            if not flagged and normalized == previous_normalized:
+            if normalized == previous_normalized and flagged == previous_flagged:
                 stats["repeat_deduped"] += 1
                 continue
             previous_normalized = normalized
+            previous_flagged = flagged
 
             if flagged:
                 stats["flagged_for_review"] += 1
