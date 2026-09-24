@@ -38,9 +38,10 @@ PHASE_LABELS = {"vad": "Analyzing speech", "transcribe": "Transcribing"}
 def _load_config() -> dict:
     config_path = REPO_DIR / "config.yaml"
     try:
-        return yaml.safe_load(config_path.read_text()) or {}
-    except OSError:
+        config = yaml.safe_load(config_path.read_text())
+    except (OSError, yaml.YAMLError):
         return {}
+    return config if isinstance(config, dict) else {}
 
 
 class App(ctk.CTk):

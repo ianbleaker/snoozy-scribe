@@ -12,19 +12,18 @@ import re
 import select
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import termios
 import threading
 import time
 import tty
+import unicodedata
 import zipfile
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
-
-import subprocess
-import unicodedata
 
 import mlx.core as mx
 import mlx_whisper
@@ -283,16 +282,21 @@ def load_track_partial(
         return None
 
     stat = audio_path.stat()
-    if data["audio_size"] != stat.st_size:
-        message = f"!! warning: partial for {username} is stale (audio file changed), retranscribing"
+    try:
+        if data["audio_size"] != stat.st_size:
+            message = f"!! warning: partial for {username} is stale (audio file changed), retranscribing"
+            progress.write(message) if progress is not None else print(message)
+            return None
+
+        segments = [
+            (start, end, text, compression_ratio, avg_logprob)
+            for start, end, text, compression_ratio, avg_logprob in data["segments"]
+        ]
+        return segments, data["language"]
+    except (KeyError, TypeError, ValueError):
+        message = f"!! warning: partial for {username} is malformed, retranscribing"
         progress.write(message) if progress is not None else print(message)
         return None
-
-    segments = [
-        (start, end, text, compression_ratio, avg_logprob)
-        for start, end, text, compression_ratio, avg_logprob in data["segments"]
-    ]
-    return segments, data["language"]
 
 
 def parse_manifest(craig_folder: Path) -> tuple[datetime, list[str]]:
@@ -332,7 +336,7 @@ def match_tracks(craig_folder: Path, usernames: list[str]) -> dict[str, Path]:
     matched: dict[str, Path] = {}
     for username in usernames:
         for path in audio_files:
-            if username in path.name:
+            if re.fullmatch(rf"\d+-{re.escape(username)}", path.stem):
                 matched[username] = path
                 break
         else:
@@ -341,10 +345,18 @@ def match_tracks(craig_folder: Path, usernames: list[str]) -> dict[str, Path]:
     return matched
 
 
-def resolve_model_path(model_repo: str, model_dir: Path) -> Path:
-    """Resolve (downloading if needed) the local directory for a model repo."""
+def resolve_model_path(
+    model_repo: str, model_dir: Path, on_download: Callable[[], None] | None = None
+) -> Path:
+    """Resolve (downloading if needed) the local directory for a model repo.
+
+    `on_download` is called just before a download starts, so callers can
+    announce it.
+    """
     target_dir = model_dir / model_repo.split("/")[-1]
     if not target_dir.exists() or not any(target_dir.iterdir()):
+        if on_download is not None:
+            on_download()
         snapshot_download(repo_id=model_repo, local_dir=str(target_dir))
     return target_dir
 
@@ -1435,9 +1447,25 @@ def main() -> None:
             f"error: config file not found at {args.config}. "
             "Run `cp config.example.yaml config.yaml` and fill in your values."
         )
-    config = yaml.safe_load(args.config.read_text())
+    try:
+        config = yaml.safe_load(args.config.read_text())
+    except yaml.YAMLError as e:
+        sys.exit(f"error: {args.config} is not valid YAML: {e}")
+    if not isinstance(config, dict):
+        sys.exit(
+            f"error: {args.config} must be a mapping of config keys. "
+            "Copy config.example.yaml to see the expected layout."
+        )
+    if config.get("speaker_map") is not None and not isinstance(config["speaker_map"], dict):
+        sys.exit(f"error: speaker_map in {args.config} must be a mapping of Discord name to speaker name")
+    if not args.model and "whisper_model" not in config:
+        sys.exit(f"error: whisper_model is missing from {args.config} and --model wasn't passed")
 
-    model_repo = args.model or config["whisper_model"]
+    for tool in ("ffmpeg", "ffprobe"):
+        if shutil.which(tool) is None:
+            sys.exit(f"error: {tool} not found on PATH. Install it with `brew install ffmpeg`.")
+
+    model_repo = args.model or config.get("whisper_model")
     language = args.language or config.get("language")
     if language is not None and language not in LANGUAGES:
         sys.exit(f"error: unknown language code '{language}'")
@@ -1453,6 +1481,9 @@ def main() -> None:
     )
     best_of = args.best_of if args.best_of is not None else config.get("best_of")
     input_dir = Path(config.get("input_dir", "./input"))
+    output_dir = Path(config.get("output_dir", "./transcripts"))
+    model_dir = Path(config.get("model_dir", "./models"))
+    speaker_map = config.get("speaker_map") or {}
     vad_min_silence_ms = config.get("vad_min_silence_ms", 800)
     vad_min_speech_ms = config.get("vad_min_speech_ms", 250)
     merge_gap_ms = config.get("merge_gap_ms", 2000)
@@ -1530,7 +1561,7 @@ def main() -> None:
     )
 
     slug = _slugify(session_title)
-    partial_dir = partial_dir_for(Path(config["output_dir"]), slug)
+    partial_dir = partial_dir_for(output_dir, slug)
 
     extraction_ctx = tempfile.TemporaryDirectory() if is_zip else contextlib.nullcontext()
     with (
@@ -1553,6 +1584,9 @@ def main() -> None:
         session_start, usernames = parse_manifest(craig_folder)
         print(f"  Parsed manifest: {len(usernames)} speakers, session started {session_start}")
         matched = match_tracks(craig_folder, usernames)
+        warned_speakers: set[str] = set()
+        for username in matched:
+            resolve_speaker(username, speaker_map, warned_speakers)
         print()
 
         window_start = 0.0
@@ -1662,14 +1696,14 @@ def main() -> None:
         )
         print()
 
-        model_dir = Path(config["model_dir"])
-        target_model_dir = model_dir / model_repo.split("/")[-1]
         print("RESOLVING MODEL...")
         print(f"  {model_repo}")
-        if not target_model_dir.exists() or not any(target_model_dir.iterdir()):
+
+        def announce_download() -> None:
             print("  Downloading model (first run)...")
             _progress_events.step("Downloading Whisper model (first run)")
-        model_path = resolve_model_path(model_repo, model_dir)
+
+        model_path = resolve_model_path(model_repo, model_dir, on_download=announce_download)
         print()
 
         print("TRANSCRIBING TRACKS...")
@@ -1811,13 +1845,12 @@ def main() -> None:
         print(f"  {merge_stats['empty_dropped']} empty segment(s) dropped")
         print(f"  {merge_stats['flagged_for_review']} line(s) flagged for review")
         print("Merging completed")
-        warned_speakers: set[str] = set()
         resolved = [
-            (timestamp, resolve_speaker(username, config["speaker_map"], warned_speakers), text)
+            (timestamp, resolve_speaker(username, speaker_map, warned_speakers), text)
             for timestamp, username, text in merged
         ]
         resolved_flagged = [
-            (timestamp, resolve_speaker(username, config["speaker_map"], warned_speakers), text)
+            (timestamp, resolve_speaker(username, speaker_map, warned_speakers), text)
             for timestamp, username, text in flagged_lines
         ]
         print()
@@ -1827,7 +1860,7 @@ def main() -> None:
             resolved,
             resolved_flagged,
             session_title,
-            Path(config["output_dir"]),
+            output_dir,
             timestamp_format,
             line_format,
             merge_stats,

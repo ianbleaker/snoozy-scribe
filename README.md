@@ -10,6 +10,14 @@ on Apple Silicon's Metal GPU — no cloud API calls.
 
 ## Setup
 
+The pipeline decodes audio with ffmpeg, so install it first:
+
+```sh
+brew install ffmpeg
+```
+
+Then set up the Python environment:
+
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate

@@ -11,11 +11,13 @@ whisper_model: mlx-community/whisper-large-v3-turbo
 
 # Local directory model weights are downloaded into (and read from). Created
 # automatically on first run if missing. Gitignored — weights are large and
-# environment-specific.
+# environment-specific. Defaults to ./models if omitted.
 model_dir: ./models
 
 # Maps Craig's Discord usernames (discriminator stripped, e.g. "alice42#0"
 # becomes "alice42") to the name that should appear in the transcript.
+# Defaults to an empty map if omitted. Unmapped users appear under their raw
+# Discord name, with a warning at startup.
 speaker_map:
   alice42: Alice
   someplayer: Some Player
@@ -87,7 +89,8 @@ show_inaudible_placeholders: false
 # checkbox starts from this value. The CLI ignores it.
 save_gui_log: true
 
-# Directory the transcript Markdown files are written to.
+# Directory the transcript Markdown files are written to. Defaults to
+# ./transcripts if omitted.
 output_dir: ./transcripts
 
 # Directory to drop Craig .zip exports into for automatic pickup. Processed
