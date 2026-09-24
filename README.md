@@ -13,9 +13,14 @@ on Apple Silicon's Metal GPU — no cloud API calls.
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock
 cp config.example.yaml config.yaml
 ```
+
+`requirements.lock` pins the exact tested set. `requirements.txt` lists the
+direct dependencies with version ranges. If you change it, rebuild the venv
+from scratch, install from `requirements.txt`, and regenerate the lock with
+`pip freeze > requirements.lock`.
 
 Edit `config.yaml` with your Discord usernames → display name mapping
 (`speaker_map`). `config.yaml` is gitignored — it's local to your machine.
