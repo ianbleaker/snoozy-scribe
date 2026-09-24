@@ -98,6 +98,10 @@ class _CancelWatcher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
     def __enter__(self) -> "_CancelWatcher":
         if self._enabled:
             self._old_settings = termios.tcgetattr(sys.stdin)
@@ -1570,8 +1574,9 @@ def main() -> None:
         contextlib.ExitStack() as exit_stack,
         _CancelWatcher() as cancel_watcher,
     ):
-        print("(press Escape, then y, to cancel — progress on completed tracks is saved)")
-        print()
+        if cancel_watcher.enabled:
+            print("(press Escape, then y, to cancel — progress on completed tracks is saved)")
+            print()
         if is_zip:
             print("Extracting zip...")
             _progress_events.step("Extracting zip")
