@@ -62,6 +62,16 @@ Options:
   every field found on any term; a comma-separated list (e.g.
   `--enrich-vocabulary Tagline,Description`) includes only those fields.
   Omit the flag entirely to seed only term names, with no enrichment.
+- `--start HH:MM:SS` / `--end HH:MM:SS` — transcribe only part of the
+  session. Either bound can be omitted to mean the start or end of the
+  recording. Timestamps stay relative to the whole session. The transcript
+  is written as `<session-title>-<start>-<end>.md` (e.g.
+  `my-session-01h30m-02h15m.md`) unless `--output-name` is given. A windowed
+  run doesn't save resumable progress and doesn't move the zip into
+  `processed/`, so you can come back for other windows or a full run later.
+- `--test [SECONDS]` — a quick windowed run of SECONDS (default 120),
+  starting at `--start` if given or at a random point otherwise, written to
+  `<session-title>-test.md`.
 
 On first run, the configured Whisper model is downloaded into `model_dir`
 (from `config.yaml`) and reused on subsequent runs.
@@ -86,6 +96,48 @@ Config keys:
 - `vocabulary_file` — path to a `vocabulary.md` file. Defaults to
   `./vocabulary.md` if it exists; otherwise transcription runs without a
   vocabulary.
+
+## GUI
+
+```sh
+python3 gui.py
+```
+
+A basic desktop window you can use instead of the CLI. It runs
+`transcribe.py` for you and shows a progress bar, the elapsed time, and its
+log output (collapsed by default; it opens by itself if a run fails). It exposes only a subset of the CLI's options:
+
+- Craig export — a `.zip` or an export folder. Leave it blank to pick up the
+  oldest `.zip` in `input_dir`, as the CLI does.
+- Output name (`--output-name`)
+- Time window — start and end as `HH:MM:SS` (`--start` / `--end`). Leave
+  both blank to transcribe the whole session.
+- Model — q4 / turbo / large-v3 (`--model`)
+- Timestamp mode — elapsed or wall-clock (`--elapsed-timestamps` /
+  `--clock-timestamps`)
+- Show `[inaudible]` placeholders (`--show-inaudible` / `--hide-inaudible`)
+
+Everything else still comes from `config.yaml`. Advanced flags (`--language`,
+`--test`, `--fresh`, `--vocabulary`, thresholds, etc.) need the CLI. Cancel
+stops the run after a confirmation, and progress on completed tracks is
+saved (except in windowed runs), just like the CLI's Escape-then-y. When a
+run finishes, the window offers buttons to open the transcript or reveal it
+in Finder, and its log is saved next to the transcript as
+`<session-title>.log` (uncheck "Save log next to the transcript", or set
+`save_gui_log: false` in `config.yaml`, to skip it).
+
+To launch it with a double-click instead of from a terminal, build a macOS
+app once:
+
+```sh
+./make-app.sh
+```
+
+That creates `rpg-scribe.app` (gitignored) in the repo. Drag it to the Dock
+or Applications. It runs `gui.py` with this repo's `.venv`, so there's no need
+to activate anything. The repo's path is baked in, so rerun `./make-app.sh` if
+you move the repo. If the window doesn't appear, check
+`~/Library/Logs/rpg-scribe.log`.
 
 ## Vocabulary file
 

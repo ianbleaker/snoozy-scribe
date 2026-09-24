@@ -11,6 +11,7 @@ import random
 import re
 import select
 import shutil
+import signal
 import sys
 import tempfile
 import termios
@@ -133,6 +134,54 @@ class _CancelWatcher:
             if confirm.lower() == "y":
                 self.cancelled.set()
                 return
+
+
+PROGRESS_EVENT_PREFIX = "@@PROGRESS@@ "
+
+
+class _ProgressEvents:
+    """Emits single-line, prefixed JSON progress events on stdout for a GUI
+    driving this script as a subprocess (`--progress-events`). A no-op unless
+    `enabled`, so default CLI output is unchanged. Per-phase progress is
+    throttled to one event per whole-percent change, since the VAD callback
+    and the transcription bar both tick far more often than that.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self._last_pct: dict[str, int] = {}
+
+    def emit(self, **event: object) -> None:
+        if self.enabled:
+            print(PROGRESS_EVENT_PREFIX + json.dumps(event), flush=True)
+
+    def progress(self, phase: str, n: float, total: float, track: str | None) -> None:
+        if not self.enabled or not total:
+            return
+        pct = min(n / total * 100, 100.0)
+        if self._last_pct.get(phase) == int(pct):
+            return
+        self._last_pct[phase] = int(pct)
+        self.emit(phase=phase, pct=round(pct, 1), track=track)
+
+    def step(self, label: str) -> None:
+        """Announce a stretch of work that has no percentage of its own, so the
+        GUI's status line doesn't sit on its last label while it runs. Resets
+        the throttle so the next progress event replaces the step label at once."""
+        self._last_pct.clear()
+        self.emit(phase="step", label=label)
+
+
+_progress_events = _ProgressEvents()
+
+# Whether a cancelled run leaves resumable partial output behind. main() clears
+# it for windowed runs (--start/--end/--test), which never write partials, so the cancel message in the
+# __main__ block doesn't promise a resume that won't happen.
+_saves_partials = True
+
+
+def _raise_cancelled(signum: int, frame: object) -> None:
+    raise TranscriptionCancelled()
 
 
 def _strip_discriminator(username: str) -> str:
@@ -380,6 +429,14 @@ def _parse_hms(value: str) -> float:
     except ValueError as e:
         raise ValueError(f"expected HH:MM:SS, got {value!r}") from e
     return hours * 3600 + minutes * 60 + seconds
+
+
+def _window_stamp(seconds: float) -> str:
+    """Format a window bound for a filename, e.g. `01h30m` or `01h30m15s`."""
+    total = round(seconds)
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}h{minutes:02d}m" + (f"{secs:02d}s" if secs else "")
 
 
 def crop_track(audio_path: Path, start: float, length: float, dest_dir: Path, username: str) -> Path:
@@ -1268,8 +1325,10 @@ def main() -> None:
         "in addition to term names. Bare flag includes every field found; "
         "a comma-separated list (e.g. Tagline,Description) includes only those.",
     )
-    parser.add_argument(
+    inaudible_group = parser.add_mutually_exclusive_group()
+    inaudible_group.add_argument(
         "--show-inaudible",
+        dest="show_inaudible",
         action="store_true",
         default=None,
         help="Keep an inline '!! [inaudible]' placeholder in the main transcript "
@@ -1277,6 +1336,15 @@ def main() -> None:
         "original garbled text is always written to the companion .errors.md "
         "file either way). Overrides the config `show_inaudible_placeholders` "
         "key, which defaults to false.",
+    )
+    inaudible_group.add_argument(
+        "--hide-inaudible",
+        dest="show_inaudible",
+        action="store_false",
+        default=None,
+        help="Omit flagged/low-confidence lines from the main transcript (they "
+        "still go to the companion .errors.md file). Overrides the config "
+        "`show_inaudible_placeholders` key; only needed when that is set to true.",
     )
     timestamp_mode_group = parser.add_mutually_exclusive_group()
     timestamp_mode_group.add_argument(
@@ -1306,29 +1374,61 @@ def main() -> None:
         "every track from scratch.",
     )
     parser.add_argument(
+        "--start",
+        type=str,
+        default=None,
+        metavar="HH:MM:SS",
+        help="Only transcribe from this point in the recording (default: the "
+        "beginning). A windowed run (--start and/or --end) writes to "
+        "<slug>-<start>-<end>.md, and never touches partial output or the "
+        "input zip.",
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        default=None,
+        metavar="HH:MM:SS",
+        help="Only transcribe up to this point in the recording (default: the "
+        "end of the longest track). See --start.",
+    )
+    parser.add_argument(
         "--test",
         nargs="?",
         type=int,
         const=120,
         default=None,
         metavar="SECONDS",
-        help="Rapid-iteration mode: only VAD and transcribe a shared window of "
-        "SECONDS (default 120) across all tracks, picked randomly unless "
-        "--test-start is given. Writes to <slug>-test.md and never touches "
-        "partial output or the input zip.",
+        help="Rapid-iteration mode: a windowed run of SECONDS (default 120), "
+        "starting at --start if given or at a random point otherwise. Writes "
+        "to <slug>-test.md.",
     )
     parser.add_argument(
-        "--test-start",
-        type=str,
-        default=None,
-        metavar="HH:MM:SS",
-        help="Pin the --test window's start instead of picking randomly. "
-        "Only meaningful alongside --test.",
+        "--progress-events",
+        action="store_true",
+        help="Also print machine-readable '@@PROGRESS@@ {json}' progress lines "
+        "to stdout. Used by gui.py; not meant for interactive use.",
     )
     args = parser.parse_args()
+    _progress_events.enabled = args.progress_events
+    if args.progress_events:
+        # gui.py cancels by terminating this process. Turning SIGTERM into the
+        # same exception the Escape-then-y cancel raises lets the `with` blocks
+        # below unwind, so temp dirs (zip extraction, --test crops) are cleaned
+        # up instead of leaking a whole extracted session per cancel.
+        signal.signal(signal.SIGTERM, _raise_cancelled)
 
-    if args.test_start is not None and args.test is None:
-        sys.exit("error: --test-start requires --test")
+    if args.test is not None and args.end is not None:
+        sys.exit("error: --end can't be combined with --test, which sets the window length")
+    try:
+        window_start_arg = _parse_hms(args.start) if args.start is not None else None
+        window_end_arg = _parse_hms(args.end) if args.end is not None else None
+    except ValueError as e:
+        sys.exit(f"error: invalid --start/--end: {e}")
+    windowed = args.test is not None or args.start is not None or args.end is not None
+    if windowed and args.fresh:
+        sys.exit("error: --fresh doesn't apply to windowed runs, which never use saved partial output")
+    global _saves_partials
+    _saves_partials = not windowed
 
     if not args.config.exists():
         sys.exit(
@@ -1442,46 +1542,68 @@ def main() -> None:
         print()
         if is_zip:
             print("Extracting zip...")
+            _progress_events.step("Extracting zip")
             craig_folder = extract_zip(resolved_input_path, Path(tmp_dir))
         else:
             craig_folder = resolved_input_path
         print()
 
         print("PARSING MANIFEST...")
+        _progress_events.step("Reading manifest")
         session_start, usernames = parse_manifest(craig_folder)
         print(f"  Parsed manifest: {len(usernames)} speakers, session started {session_start}")
         matched = match_tracks(craig_folder, usernames)
         print()
 
         window_start = 0.0
-        if args.test is not None:
+        filename_suffix = ""
+        if windowed:
+            # Craig tracks end when that speaker's recording stops, so they
+            # can differ by hours. The window may run to the end of the
+            # longest one; shorter tracks are cropped to whatever part of the
+            # window they cover, and dropped if they end before it starts.
             durations = {username: _probe_duration(path) for username, path in matched.items()}
-            shortest_username = min(durations, key=durations.get)
-            min_duration = durations[shortest_username]
-            if args.test_start is not None:
-                try:
-                    window_start = _parse_hms(args.test_start)
-                except ValueError as e:
-                    sys.exit(f"error: invalid --test-start: {e}")
+            session_duration = max(durations.values())
+            if args.test is not None:
+                if window_start_arg is not None:
+                    window_start = window_start_arg
+                else:
+                    # A random test window stays within the shortest track so
+                    # every speaker has audio in it.
+                    window_start = random.uniform(0, max(0.0, min(durations.values()) - args.test))
+                window_end = window_start + args.test
             else:
-                window_start = random.uniform(0, max(0.0, min_duration - args.test))
-            if window_start + args.test > min_duration:
-                sys.exit(
-                    f"error: requested --test window "
-                    f"({timedelta(seconds=round(window_start))}-"
-                    f"{timedelta(seconds=round(window_start + args.test))}) exceeds the "
-                    f"shortest matched track's duration ({shortest_username}: "
-                    f"{timedelta(seconds=round(min_duration))})"
-                )
-            crop_dir = Path(exit_stack.enter_context(tempfile.TemporaryDirectory()))
-            matched = {
-                username: crop_track(path, window_start, args.test, crop_dir, username)
-                for username, path in matched.items()
-            }
-            print(
-                f"Test mode: using window {timedelta(seconds=round(window_start))}-"
-                f"{timedelta(seconds=round(window_start + args.test))} ({args.test}s)"
+                window_start = window_start_arg if window_start_arg is not None else 0.0
+                window_end = window_end_arg if window_end_arg is not None else session_duration
+            window_label = (
+                f"{timedelta(seconds=round(window_start))}-{timedelta(seconds=round(window_end))}"
             )
+            if window_end <= window_start:
+                sys.exit(f"error: requested window ({window_label}) ends before it starts")
+            if window_end > session_duration:
+                sys.exit(
+                    f"error: requested window ({window_label}) runs past the end of the "
+                    f"recording ({timedelta(seconds=round(session_duration))})"
+                )
+            _progress_events.step("Cropping tracks to the window")
+            crop_dir = Path(exit_stack.enter_context(tempfile.TemporaryDirectory()))
+            dropped = [username for username in matched if durations[username] <= window_start]
+            matched = {
+                username: crop_track(path, window_start, window_end - window_start, crop_dir, username)
+                for username, path in matched.items()
+                if username not in dropped
+            }
+            for username in dropped:
+                print(
+                    f"  Skipping {username}: track ends at "
+                    f"{timedelta(seconds=round(durations[username]))}, before the window starts"
+                )
+            if args.test is not None:
+                filename_suffix = "-test"
+                print(f"Test mode: using window {window_label} ({args.test}s)")
+            else:
+                filename_suffix = f"-{_window_stamp(window_start)}-{_window_stamp(window_end)}"
+                print(f"Windowed run: transcribing {window_label} only")
             print()
 
         print("ANALYZING SPEECH (VAD)...")
@@ -1499,11 +1621,16 @@ def main() -> None:
                 if cancel_watcher.cancelled.is_set():
                     raise TranscriptionCancelled()
                 vad_progress.write(f"  VAD track {i}/{vad_total} ({username})...")
+                # Each track is decoded in full before VAD reports any progress.
+                _progress_events.step(f"Analyzing speech — decoding audio ({username})")
                 track_duration = track_durations[username]
 
-                def _on_vad_progress(pct: float, _base=completed_s, _dur=track_duration) -> None:
+                def _on_vad_progress(
+                    pct: float, _base=completed_s, _dur=track_duration, _track=username
+                ) -> None:
                     vad_progress.n = round(_base + _dur * pct / 100)
                     vad_progress.refresh()
+                    _progress_events.progress("vad", vad_progress.n, vad_progress.total, _track)
 
                 track_start = time.monotonic()
                 regions, duration = detect_speech_regions(
@@ -1520,6 +1647,7 @@ def main() -> None:
                 completed_s += track_duration
                 vad_progress.n = round(completed_s)
                 vad_progress.refresh()
+                _progress_events.progress("vad", vad_progress.n, vad_progress.total, username)
                 vad_progress.write(
                     f"    -> {_format_duration(track_speech_s)} speech / "
                     f"{_format_duration(duration)} raw ({track_speech_s / duration * 100:.0f}%) "
@@ -1540,6 +1668,7 @@ def main() -> None:
         print(f"  {model_repo}")
         if not target_model_dir.exists() or not any(target_model_dir.iterdir()):
             print("  Downloading model (first run)...")
+            _progress_events.step("Downloading Whisper model (first run)")
         model_path = resolve_model_path(model_repo, model_dir)
         print()
 
@@ -1549,7 +1678,7 @@ def main() -> None:
         total = len(matched)
         total_segments = 0
 
-        if args.test is None:
+        if not windowed:
             if args.fresh and partial_dir.exists():
                 shutil.rmtree(partial_dir)
                 print("  Ignoring saved partial output (--fresh).")
@@ -1590,13 +1719,26 @@ def main() -> None:
             disable=total_frames == 0,
             leave=False,
         ) as progress:
+            if _progress_events.enabled:
+                # Every transcription progress tick (mlx_whisper's own, via
+                # _ForwardingPbar, and the resume path's) lands in
+                # progress.update(), so hooking it here covers them all.
+                # `username` is read at call time, i.e. the loop's current track.
+                _tqdm_update = progress.update
+
+                def _update_and_emit(n: float = 1) -> bool | None:
+                    result = _tqdm_update(n)
+                    _progress_events.progress("transcribe", progress.n, progress.total, username)
+                    return result
+
+                progress.update = _update_and_emit
             for i, (username, audio_path) in enumerate(matched.items(), start=1):
                 if cancel_watcher.cancelled.is_set():
                     raise TranscriptionCancelled()
                 track_start = time.monotonic()
                 partial = (
                     None
-                    if args.test is not None
+                    if windowed
                     else load_track_partial(partial_dir, username, audio_path, progress)
                 )
                 if partial is not None:
@@ -1607,6 +1749,7 @@ def main() -> None:
                     progress.update(speech_frames(track_regions[username]))
                 else:
                     progress.write(f"  Transcribing track {i}/{total} ({username})...")
+                    _progress_events.step(f"Transcribing — decoding audio ({username})")
                     segments, detected_language = transcribe_track(
                         audio_path,
                         model_path,
@@ -1619,7 +1762,7 @@ def main() -> None:
                         best_of,
                         cancel_watcher.cancelled,
                     )
-                    if args.test is None:
+                    if not windowed:
                         write_track_partial(
                             partial_dir, username, audio_path, segments, detected_language
                         )
@@ -1688,18 +1831,19 @@ def main() -> None:
             timestamp_format,
             line_format,
             merge_stats,
-            filename_suffix="-test" if args.test is not None else "",
+            filename_suffix=filename_suffix,
             output_name=args.output_name,
         )
-        if args.test is None:
+        if not windowed:
             shutil.rmtree(partial_dir, ignore_errors=True)
 
-        if is_zip and args.test is None:
+        if is_zip and not windowed:
             mark_zip_processed(resolved_input_path, input_dir)
 
     elapsed = time.monotonic() - start_time
     print(f"Wrote transcript to {output_path} ({_format_duration(elapsed)})")
     print()
+    _progress_events.emit(phase="done", output_path=str(output_path.resolve()))
     print(_rule())
 
 
@@ -1707,5 +1851,20 @@ if __name__ == "__main__":
     try:
         main()
     except TranscriptionCancelled:
-        print("Cancelled. Progress on completed tracks was saved; rerun to resume.")
+        message = (
+            "Cancelled. Progress on completed tracks was saved; rerun to resume."
+            if _saves_partials
+            else "Cancelled."
+        )
+        print(message)
+        _progress_events.emit(phase="error", message=message)
         sys.exit(130)
+    except SystemExit as e:
+        # sys.exit("error: ...") messages go to stderr, which a GUI parent
+        # doesn't read — surface them as an error event too.
+        if isinstance(e.code, str):
+            _progress_events.emit(phase="error", message=e.code)
+        raise
+    except Exception as e:
+        _progress_events.emit(phase="error", message=f"{type(e).__name__}: {e}")
+        raise

@@ -79,8 +79,13 @@ logprob_threshold: -1.0
 # always written to the companion <slug>.errors.md file either way. Defaults
 # to false (flagged lines are omitted from the main transcript entirely, so
 # it reads as continuous speech). Overridable per-run with
-# `transcribe.py --show-inaudible`.
+# `transcribe.py --show-inaudible` / `--hide-inaudible`.
 show_inaudible_placeholders: false
+
+# Whether gui.py saves its log panel next to the transcript as
+# `<session-title>.log` after a successful run. The GUI's "Save log"
+# checkbox starts from this value. The CLI ignores it.
+save_gui_log: true
 
 # Directory the transcript Markdown files are written to.
 output_dir: ./transcripts
