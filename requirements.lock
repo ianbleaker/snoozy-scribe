@@ -13,15 +13,11 @@ httpcore==1.0.9
 httpx==0.28.1
 huggingface_hub==1.32.0
 idna==3.20
-Jinja2==3.1.6
 llvmlite==0.49.0
-MarkupSafe==3.0.3
 mlx==0.32.2
 mlx-metal==0.32.2
 mlx-whisper==0.4.3
 more-itertools==11.1.0
-mpmath==1.3.0
-networkx==3.7
 numba==0.67.0
 numpy==2.5.3
 onnxruntime==1.30.0
@@ -31,11 +27,7 @@ PyYAML==6.0.3
 regex==2026.9.10
 requests==2.34.2
 scipy==1.18.1
-setuptools==84.0.0
-silero-vad==6.2.3
-sympy==1.14.0
 tiktoken==0.14.0
-torch==2.14.0
 tqdm==4.70.1
 typing_extensions==4.16.0
 urllib3==2.8.0

@@ -21,14 +21,31 @@ Then set up the Python environment:
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.lock
+pip install --no-deps -r requirements.lock
 cp config.example.yaml config.yaml
 ```
 
+`--no-deps` matters: mlx-whisper declares torch but doesn't need it for
+transcription, and a normal install would pull in ~700MB of torch.
+
+Upgrading an existing install from before torch was dropped: delete `.venv`
+and rerun the steps above to reclaim about 700MB.
+
 `requirements.lock` pins the exact tested set. `requirements.txt` lists the
-direct dependencies with version ranges. If you change it, rebuild the venv
-from scratch, install from `requirements.txt`, and regenerate the lock with
-`pip freeze > requirements.lock`.
+direct dependencies with version ranges. If you change it, regenerate the
+lock in a throwaway venv, removing torch and the packages only it pulls in:
+
+```sh
+python3 -m venv /tmp/lockvenv
+/tmp/lockvenv/bin/pip install -r requirements.txt
+/tmp/lockvenv/bin/pip uninstall -y torch sympy mpmath networkx Jinja2 MarkupSafe setuptools
+/tmp/lockvenv/bin/pip freeze > requirements.lock
+```
+
+Then rebuild `.venv` from the lock:
+`rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install --no-deps -r requirements.lock`.
+`pip check` will report
+`mlx-whisper ... requires torch, which is not installed` — that's expected.
 
 Edit `config.yaml` with your Discord usernames → display name mapping
 (`speaker_map`). `config.yaml` is gitignored — it's local to your machine.

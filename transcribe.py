@@ -28,8 +28,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx_whisper
 import numpy as np
-import silero_vad
-import torch
+import silero_onnx
 import tqdm
 import yaml
 from huggingface_hub import snapshot_download
@@ -203,6 +202,7 @@ def write_partial_meta(
     partial_dir: Path,
     model_repo: str,
     vad_min_silence_ms: int,
+    vad_min_speech_ms: int,
     initial_prompt: str,
     language: str | None,
     compression_ratio_threshold: float,
@@ -214,6 +214,7 @@ def write_partial_meta(
         "schema_version": PARTIAL_SCHEMA_VERSION,
         "model_repo": model_repo,
         "vad_min_silence_ms": vad_min_silence_ms,
+        "vad_min_speech_ms": vad_min_speech_ms,
         "initial_prompt_hash": hashlib.sha256(initial_prompt.encode()).hexdigest(),
         "language": language,
         "compression_ratio_threshold": compression_ratio_threshold,
@@ -234,6 +235,7 @@ def meta_matches(
     meta: dict | None,
     model_repo: str,
     vad_min_silence_ms: int,
+    vad_min_speech_ms: int,
     initial_prompt: str,
     language: str | None,
     compression_ratio_threshold: float,
@@ -246,6 +248,7 @@ def meta_matches(
         meta.get("schema_version") == PARTIAL_SCHEMA_VERSION
         and meta.get("model_repo") == model_repo
         and meta.get("vad_min_silence_ms") == vad_min_silence_ms
+        and meta.get("vad_min_speech_ms") == vad_min_speech_ms
         and meta.get("initial_prompt_hash")
         == hashlib.sha256(initial_prompt.encode()).hexdigest()
         and meta.get("language") == language
@@ -391,8 +394,8 @@ def mark_zip_processed(zip_path: Path, input_dir: Path) -> Path:
     return new_path
 
 
-def _decode_audio_mono16k(audio_path: Path) -> torch.Tensor:
-    """Load audio as a mono float32 tensor resampled to `VAD_SAMPLE_RATE`.
+def _decode_audio_mono16k(audio_path: Path) -> np.ndarray:
+    """Load audio as a mono float32 array resampled to `VAD_SAMPLE_RATE`.
 
     Shared decode helper for both VAD and transcription (Whisper itself
     expects 16kHz mono input, same as VAD)."""
@@ -413,7 +416,7 @@ def _decode_audio_mono16k(audio_path: Path) -> torch.Tensor:
         raise RuntimeError(f"failed to decode {audio_path}: {e.stderr.decode()}") from e
 
     samples = np.frombuffer(out, np.int16).astype(np.float32) / 32768.0
-    return torch.from_numpy(samples)
+    return samples
 
 
 def _probe_duration(audio_path: Path) -> float:
@@ -487,17 +490,15 @@ def detect_speech_regions(
     """
     global _vad_model
     if _vad_model is None:
-        _vad_model = silero_vad.load_silero_vad()
+        _vad_model = silero_onnx.SileroVADSequence()
 
     wav = _decode_audio_mono16k(audio_path)
-    timestamps = silero_vad.get_speech_timestamps(
+    timestamps = silero_onnx.get_speech_timestamps(
         wav,
         _vad_model,
-        sampling_rate=VAD_SAMPLE_RATE,
-        return_seconds=True,
         min_silence_duration_ms=min_silence_ms,
         min_speech_duration_ms=min_speech_ms,
-        progress_tracking_callback=progress_callback,
+        progress_callback=progress_callback,
     )
 
     regions: list[float] = []
@@ -644,7 +645,7 @@ def transcribe_track(
     if not speech_regions:
         return [], None
 
-    audio = _decode_audio_mono16k(audio_path).numpy()
+    audio = _decode_audio_mono16k(audio_path)
 
     segments: list[tuple[float, float, str, float, float]] = []
     prompt = initial_prompt
@@ -1722,6 +1723,7 @@ def main() -> None:
                     meta,
                     model_repo,
                     vad_min_silence_ms,
+                    vad_min_speech_ms,
                     initial_prompt,
                     language,
                     compression_ratio_threshold,
@@ -1738,6 +1740,7 @@ def main() -> None:
                 partial_dir,
                 model_repo,
                 vad_min_silence_ms,
+                vad_min_speech_ms,
                 initial_prompt,
                 language,
                 compression_ratio_threshold,
