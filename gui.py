@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
 from datetime import timedelta
@@ -23,6 +24,9 @@ import yaml
 
 REPO_DIR = Path(__file__).resolve().parent
 PROGRESS_EVENT_PREFIX = "@@PROGRESS@@ "
+# Tail of the child's stderr kept for a failure dump; tqdm redraws land
+# there too, so an uncapped buffer would grow for the whole run.
+STDERR_TAIL_LINES = 500
 
 # (label, --model repo); see docs/analysis/model-weight-analysis.md.
 MODELS = [
@@ -269,7 +273,7 @@ class App(ctk.CTk):
             cwd=REPO_DIR,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
@@ -280,10 +284,21 @@ class App(ctk.CTk):
 
     def _read_output(self, proc: subprocess.Popen) -> None:
         # Runs on a worker thread; everything reaches the UI via the queue.
-        assert proc.stdout is not None
+        assert proc.stdout is not None and proc.stderr is not None
+        # stderr is drained on its own thread so a chatty tqdm can't fill the
+        # pipe and stall the child. Text mode splits tqdm's `\r` redraws into
+        # separate lines, which the bounded tail then ages out.
+        stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
+        stderr_reader = threading.Thread(
+            target=lambda: stderr_tail.extend(line.rstrip("\n") for line in proc.stderr),
+            daemon=True,
+        )
+        stderr_reader.start()
         for line in proc.stdout:
             self._events.put(("line", line.rstrip("\n")))
-        self._events.put(("exit", proc.wait()))
+        returncode = proc.wait()
+        stderr_reader.join()
+        self._events.put(("exit", (returncode, list(stderr_tail))))
 
     def _poll(self) -> None:
         while True:
@@ -292,7 +307,7 @@ class App(ctk.CTk):
             except queue.Empty:
                 break
             if kind == "exit":
-                self._on_exit(value)
+                self._on_exit(*value)
                 return
             if value.startswith(PROGRESS_EVENT_PREFIX):
                 self._on_event(json.loads(value[len(PROGRESS_EVENT_PREFIX):]))
@@ -318,7 +333,7 @@ class App(ctk.CTk):
             if not self._cancelling:
                 self._log_append(event["message"], "error")
 
-    def _on_exit(self, returncode: int) -> None:
+    def _on_exit(self, returncode: int, stderr_tail: list[str]) -> None:
         self._proc = None
         if self._cancelling:
             self._log_append("Cancelled")
@@ -331,8 +346,23 @@ class App(ctk.CTk):
         else:
             if self._result is None:
                 self._log_append(f"transcribe.py exited with code {returncode}", "error")
+            self._log_traceback(stderr_tail)
             self.status_label.configure(text="Failed")
             self._set_idle()
+
+    def _log_traceback(self, stderr_tail: list[str]) -> None:
+        # The error event only carries `Type: message`; the traceback itself
+        # is on stderr, after any tqdm noise. sys.exit("error: ...") failures
+        # have no traceback and are already explained by their error event.
+        # The header can share a line with an unterminated bar redraw, so it's
+        # matched mid-line rather than with startswith.
+        header = "Traceback (most recent call last):"
+        for i, line in enumerate(stderr_tail):
+            start = line.find(header)
+            if start != -1:
+                lines = [line[start:], *stderr_tail[i + 1:]]
+                self._log_append("\n".join(lines).rstrip(), "error")
+                return
 
     def _tick_elapsed(self) -> None:
         elapsed = timedelta(seconds=round(time.monotonic() - self._run_start))
