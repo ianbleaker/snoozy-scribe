@@ -1417,7 +1417,7 @@ def main() -> None:
         metavar="SECONDS",
         help="Rapid-iteration mode: a windowed run of SECONDS (default 120), "
         "starting at --start if given or at a random point otherwise. Writes "
-        "to <slug>-test.md.",
+        "to <slug>-<start>-<end>.md like --start/--end.",
     )
     parser.add_argument(
         "--progress-events",
@@ -1638,11 +1638,10 @@ def main() -> None:
                     f"  Skipping {username}: track ends at "
                     f"{timedelta(seconds=round(durations[username]))}, before the window starts"
                 )
+            filename_suffix = f"-{_window_stamp(window_start)}-{_window_stamp(window_end)}"
             if args.test is not None:
-                filename_suffix = "-test"
                 print(f"Test mode: using window {window_label} ({args.test}s)")
             else:
-                filename_suffix = f"-{_window_stamp(window_start)}-{_window_stamp(window_end)}"
                 print(f"Windowed run: transcribing {window_label} only")
             print()
 

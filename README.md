@@ -101,7 +101,7 @@ Options:
   `processed/`, so you can come back for other windows or a full run later.
 - `--test [SECONDS]` — a quick windowed run of SECONDS (default 120),
   starting at `--start` if given or at a random point otherwise, written to
-  `<session-title>-test.md`.
+  `<session-title>-<start>-<end>.md` like `--start`/`--end`.
 
 On first run, the configured Whisper model is downloaded into `model_dir`
 (from `config.yaml`) and reused on subsequent runs.
