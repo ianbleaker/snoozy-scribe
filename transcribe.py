@@ -1188,10 +1188,15 @@ def write_transcript(
     timestamp_format: str,
     line_format: str,
     merge_stats: dict[str, int],
+    session_start: datetime,
     filename_suffix: str = "",
     output_name: str | None = None,
 ) -> Path:
     """Write the merged transcript as a Markdown file with YAML frontmatter.
+
+    The frontmatter `date` comes from `session_start` (the Craig manifest's
+    start time), not from the line timestamps: in elapsed mode those are
+    offsets from a placeholder epoch, so their date is meaningless.
 
     `line_format` is a str.format() template with `{timestamp}`, `{speaker}`,
     and `{text}` placeholders, letting the config control per-line Markdown
@@ -1219,7 +1224,7 @@ def write_transcript(
     errors_path = output_dir / f"{slug}{filename_suffix}.errors.md"
 
     speakers = list(dict.fromkeys(name for _, name, _ in merged))
-    date = merged[0][0].date().isoformat() if merged else ""
+    date = session_start.date().isoformat()
 
     frontmatter = yaml.safe_dump(
         {"date": date, "title": session_title, "speakers": speakers, "pruning": merge_stats},
@@ -1871,6 +1876,7 @@ def main() -> None:
             timestamp_format,
             line_format,
             merge_stats,
+            session_start,
             filename_suffix=filename_suffix,
             output_name=args.output_name,
         )
