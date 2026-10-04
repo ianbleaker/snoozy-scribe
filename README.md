@@ -183,7 +183,10 @@ Format: `#`/`##` headings are free-form organizational grouping (e.g.
 comma-separated list of Whisper's known wrong transcriptions of the term,
 used for post-fix replacement only (never seeded into the prompt). Any
 other label (`Tagline`, `Description`, etc.) is a free-form enrichment
-field. A term may have zero bullets.
+field. A term may have zero bullets. By convention, `Player: <speaker>`
+marks a term as a player character and names who plays it (using the
+`speaker_map` name) — `/analyze-narrative` uses this to map players to
+characters.
 
 ```markdown
 # Campaign Vocabulary

@@ -8,6 +8,11 @@
 ### The Silver Company
 - Tagline: Mercenary company the party has clashed with twice.
 
+## Characters
+### Brannoc
+- Player: Sam
+- Tagline: Dwarven cleric, party healer.
+
 ## Locations
 ### Millhaven
 - Misheard as: Mill Haven, Mil Haven
