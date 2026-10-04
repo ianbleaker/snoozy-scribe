@@ -181,7 +181,11 @@ Format: `#`/`##` headings are free-form organizational grouping (e.g.
 — term names must be unique across the whole file. Bullets under a term are
 `Label: value` pairs. `Misheard as` is the one reserved label — a
 comma-separated list of Whisper's known wrong transcriptions of the term,
-used for post-fix replacement only (never seeded into the prompt). Any
+used for post-fix replacement only (never seeded into the prompt). A bare
+variant is replaced with the term name; `variant -> replacement` (or `→`)
+replaces it with that spoken form instead, so a nickname or a short form
+doesn't get expanded to the full heading (`Mir -> Mira` under
+`### Captain Mira Holt`). Any
 other label (`Tagline`, `Description`, etc.) is a free-form enrichment
 field. A term may have zero bullets. By convention, `Player: <speaker>`
 marks a term as a player character and names who plays it (using the
@@ -195,6 +199,9 @@ characters.
 ### Aldric
 - Misheard as: Aldrick, All Drick
 - Tagline: Captain of the town guard.
+
+### Captain Bertrand Vell
+- Misheard as: Bertram -> Bertrand, Captain Bell -> Captain Vell
 
 ## Locations
 ### Millhaven
@@ -210,4 +217,7 @@ available for `--enrich-vocabulary` without opening the file. A malformed
 Every term name is seeded into Whisper's `initial_prompt` to improve
 first-pass transcription accuracy for unfamiliar words. `Misheard as`
 variants are additionally corrected post-transcription via case-insensitive
-find/replace, regardless of whether `--enrich-vocabulary` is used.
+find/replace, regardless of whether `--enrich-vocabulary` is used. All
+variants are matched in one longest-first pass, and text already in a
+replacement's correct form is left alone — so a short variant like `Ward`
+won't fire inside a correct `sky-ward`.

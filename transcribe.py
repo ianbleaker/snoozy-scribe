@@ -690,10 +690,17 @@ class VocabularyParseError(Exception):
     """Raised for a structural or content error in a vocabulary.md file."""
 
 
+_VARIANT_ARROW = re.compile(r"\s*(?:→|->)\s*")
+
+
 def parse_vocabulary(path: Path) -> dict[str, dict]:
     """Parse a `vocabulary.md` file into `{term: {misheard_as, fields}}`.
 
-    See docs/plans/completed/9-add-campaign-vocabulary-file.md for the format.
+    `misheard_as` is a list of `(variant, replacement)` pairs. A variant
+    written `variant -> replacement` (or `→`) maps to that spoken form;
+    a bare variant maps to the term name itself.
+
+    See README.md ("Vocabulary") for the format.
     """
     vocabulary: dict[str, dict] = {}
     current_term: str | None = None
@@ -727,9 +734,19 @@ def parse_vocabulary(path: Path) -> dict[str, dict]:
             label = label.strip()
             value = value.strip()
             if label.lower() == "misheard as":
-                vocabulary[current_term]["misheard_as"] = [
-                    v.strip() for v in value.split(",") if v.strip()
-                ]
+                pairs = []
+                for item in value.split(","):
+                    item = item.strip()
+                    if not item:
+                        continue
+                    parts = [p.strip() for p in _VARIANT_ARROW.split(item, maxsplit=1)]
+                    if len(parts) == 2 and not all(parts):
+                        raise VocabularyParseError(
+                            f"{path}:{lineno}: malformed variant (expected "
+                            f"'variant -> replacement'): {item!r}"
+                        )
+                    pairs.append((parts[0], parts[1] if len(parts) == 2 else current_term))
+                vocabulary[current_term]["misheard_as"] = pairs
             else:
                 vocabulary[current_term]["fields"][label] = value
             continue
@@ -742,27 +759,43 @@ _SENTENCE_START = re.compile(r"^\s*$|[.!?]\s*$")
 
 
 def apply_vocabulary(text: str, vocabulary: dict) -> str:
-    """Case-insensitively replace known `misheard_as` variants with the canonical term.
+    """Case-insensitively replace known `misheard_as` variants with their replacements.
 
-    Capitalizes only the replacement's first letter, regardless of the
-    term's own casing, when the match starts `text` or follows `.`/`!`/`?`
-    plus whitespace; otherwise uses the term's exact canonical casing.
+    Capitalizes only the replacement's first letter, regardless of its own
+    casing, when the match starts `text` or follows `.`/`!`/`?` plus
+    whitespace; otherwise uses the replacement's exact casing.
 
-    Matches are anchored to word boundaries so a variant like "Oste" doesn't
-    fire inside an unrelated word such as "hosted".
+    All variants are matched in a single longest-first pass, so a
+    replacement is never re-scanned (no "sky-sky-ward"). Replacement forms
+    are also matched (and left untouched), so a short variant like "Ward"
+    can't fire inside an already-correct "sky-ward". Matches are anchored to word
+    boundaries so a variant like "Oste" doesn't fire inside "hosted".
     """
-    for term, data in vocabulary.items():
-        for variant in data["misheard_as"]:
-            pattern = re.compile(r"\b" + re.escape(variant) + r"\b", re.IGNORECASE)
+    replacements: dict[str, str] = {}
+    for data in vocabulary.values():
+        for variant, replacement in data["misheard_as"]:
+            replacements.setdefault(variant.lower(), replacement)
+    if not replacements:
+        return text
+    # Already-correct forms map to None: matched (to shield them) but left as-is.
+    targets: dict[str, str | None] = dict(replacements)
+    for replacement in replacements.values():
+        targets.setdefault(replacement.lower(), None)
 
-            def _replace(match: re.Match, term: str = term) -> str:
-                prefix = text[: match.start()]
-                if _SENTENCE_START.search(prefix):
-                    return term[:1].upper() + term[1:]
-                return term
+    alternation = "|".join(
+        re.escape(v) for v in sorted(targets, key=len, reverse=True)
+    )
+    pattern = re.compile(r"\b(?:" + alternation + r")\b", re.IGNORECASE)
 
-            text = pattern.sub(_replace, text)
-    return text
+    def _replace(match: re.Match) -> str:
+        replacement = targets[match.group(0).lower()]
+        if replacement is None:
+            return match.group(0)
+        if _SENTENCE_START.search(text[: match.start()]):
+            return replacement[:1].upper() + replacement[1:]
+        return replacement
+
+    return pattern.sub(_replace, text)
 
 
 def build_initial_prompt(vocabulary: dict, enrich_fields: set[str] | None) -> str:

@@ -9,6 +9,10 @@
 - Tagline: Mercenary company the party has clashed with twice.
 
 ## Characters
+### Captain Bertrand Vell
+- Misheard as: Bertram -> Bertrand, Captain Bell -> Captain Vell
+- Tagline: Harbourmaster, goes by Bertrand.
+
 ### Brannoc
 - Player: Sam
 - Tagline: Dwarven cleric, party healer.
