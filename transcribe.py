@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import difflib
 import hashlib
 import importlib
 import json
@@ -390,8 +391,13 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> Path:
 
 
 def mark_zip_processed(zip_path: Path, input_dir: Path) -> Path:
-    """Move `zip_path` into `<input_dir>/processed/`, creating it if needed."""
+    """Move `zip_path` into `<input_dir>/processed/`, creating it if needed.
+
+    No-op when the zip is already there (a rerun of a processed zip, which
+    reuses the kept segment cache)."""
     processed_dir = input_dir / "processed"
+    if zip_path.resolve().parent == processed_dir.resolve():
+        return zip_path
     processed_dir.mkdir(parents=True, exist_ok=True)
     new_path = processed_dir / zip_path.name
     shutil.move(str(zip_path), str(new_path))
@@ -476,13 +482,31 @@ def crop_track(audio_path: Path, start: float, length: float, dest_dir: Path, us
     return dest_path
 
 
+# 10ms frames at VAD_SAMPLE_RATE; dedup_bleed() converts seconds to frame
+# indices as `int(seconds * 100)`.
+ENVELOPE_FRAME_SAMPLES = 160
+
+
+def compute_envelope(wav: np.ndarray) -> np.ndarray:
+    """Linear RMS per 10ms frame of `wav`, as float32; trailing partial frame dropped."""
+    frame_count = len(wav) // ENVELOPE_FRAME_SAMPLES
+    frames = wav[: frame_count * ENVELOPE_FRAME_SAMPLES].reshape(frame_count, ENVELOPE_FRAME_SAMPLES)
+    # einsum avoids materialising frames**2, which would double peak memory
+    # on a multi-hour track.
+    mean_square = np.einsum("ij,ij->i", frames, frames) / ENVELOPE_FRAME_SAMPLES
+    return np.sqrt(mean_square).astype(np.float32)
+
+
 def detect_speech_regions(
     audio_path: Path,
     min_silence_ms: int,
     min_speech_ms: int = 250,
     progress_callback: Callable[[float], None] | None = None,
-) -> tuple[list[float], float]:
-    """Return (flat [start1, end1, start2, end2, ...] speech regions, raw duration), in seconds.
+) -> tuple[list[float], float, np.ndarray]:
+    """Return (flat [start1, end1, start2, end2, ...] speech regions, raw duration, envelope).
+
+    Regions and duration are in seconds; `envelope` is `compute_envelope()`
+    of the same decoded audio, used by `dedup_bleed()`.
 
     `min_silence_ms` sets how long a pause must be before it splits speech
     into separate regions; see docs/design/transcription-pipeline.md for why
@@ -510,7 +534,7 @@ def detect_speech_regions(
         regions.append(entry["start"])
         regions.append(entry["end"])
     duration = len(wav) / VAD_SAMPLE_RATE
-    return regions, duration
+    return regions, duration, compute_envelope(wav)
 
 
 def speech_seconds(regions: list[float]) -> float:
@@ -1042,6 +1066,174 @@ def looks_garbled(text: str) -> bool:
     return len(scripts) > 1
 
 
+# 10ms envelope frames per second, see ENVELOPE_FRAME_SAMPLES.
+_ENVELOPE_FRAMES_PER_SECOND = 100
+# A pair's span is widened to at least this long so the level/correlation
+# checks have enough frames to mean anything on a one-word segment.
+BLEED_MIN_SPAN_S = 1.0
+# The quieter track counts as "active" (carrying sound, not silence) over a
+# span if at least this fraction of its frames are above BLEED_ACTIVE_DB.
+BLEED_ACTIVE_DB = -60.0
+BLEED_ACTIVE_FRACTION = 0.2
+# Envelope correlation is the max over lags of +/- this many frames
+# (150ms), covering the 50-110ms network offset measured between tracks.
+BLEED_MAX_LAG_FRAMES = 15
+# The shorter text needs this many words before word containment counts
+# towards text similarity, so "Okay." never "contains" a longer line.
+BLEED_MIN_CONTAINMENT_WORDS = 3
+
+
+def _bleed_text_similarity(text_a: str, text_b: str) -> float:
+    """Max of SequenceMatcher ratio and word containment of the normalized texts.
+
+    Returns 0 when either text normalizes to empty."""
+    normalized_a, normalized_b = _normalize(text_a), _normalize(text_b)
+    if not normalized_a or not normalized_b:
+        return 0.0
+    score = difflib.SequenceMatcher(None, normalized_a, normalized_b).ratio()
+    words_a = {_normalize(word) for word in text_a.split()} - {""}
+    words_b = {_normalize(word) for word in text_b.split()} - {""}
+    shorter = min(len(words_a), len(words_b))
+    if shorter >= BLEED_MIN_CONTAINMENT_WORDS:
+        score = max(score, len(words_a & words_b) / shorter)
+    return score
+
+
+def _envelope_db(rms: np.ndarray) -> np.ndarray:
+    return 20 * np.log10(rms.astype(np.float64) + 1e-10)
+
+
+def _max_lagged_correlation(x: np.ndarray, y: np.ndarray, max_lag: int) -> float:
+    """Max Pearson correlation of `x` and `y` over lags -max_lag..+max_lag.
+
+    A lag whose overlap is under half the span, or where either slice has
+    zero variance, contributes 0."""
+    n = len(x)
+    best = 0.0
+    for lag in range(-max_lag, max_lag + 1):
+        if lag >= 0:
+            a, b = x[lag:], y[: n - lag]
+        else:
+            a, b = x[: n + lag], y[-lag:]
+        if len(a) < max(2, n // 2):
+            continue
+        if a.std() == 0 or b.std() == 0:
+            continue
+        best = max(best, float(np.corrcoef(a, b)[0, 1]))
+    return best
+
+
+def dedup_bleed(
+    transcripts: dict[str, list[tuple[float, float, str, float, float]]],
+    envelopes: dict[str, np.ndarray],
+    window_start: float,
+    speaker_names: dict[str, str],
+    level_gap_db: float,
+    min_correlation: float,
+    text_similarity: float,
+    max_offset_s: float,
+    show_markers: bool,
+    verbose: bool,
+) -> tuple[dict[str, list[tuple[float, float, str, float, float]]], dict[str, int]]:
+    """Drop cross-track duplicate segments caused by co-located mic bleed.
+
+    A pair of segments on different tracks, starting within `max_offset_s`
+    with matching text, is bleed only if the audio agrees: the quieter
+    track is active over the span (not silent — a silent quieter track
+    means someone repeated the line), its loudness envelope correlates with
+    the louder track's, and the level gap is large enough. Bleed drops the
+    quieter segment; a matching pair with an active quieter track that
+    misses the gap/correlation thresholds is kept and counted as ambiguous,
+    optionally marked. See docs/design/transcription-pipeline.md.
+
+    `envelopes` are `compute_envelope()` output per track, with index 0 at
+    `window_start`. Runs before `merge_tracks()`, while segments still carry
+    their own start/end times.
+    """
+    stats = {"bleed_deduped": 0, "bleed_ambiguous": 0}
+    flat = sorted(
+        (segment[0], username, index)
+        for username, segments in transcripts.items()
+        for index, segment in enumerate(segments)
+    )
+    dropped: set[tuple[str, int]] = set()
+    markers: dict[tuple[str, int], str] = {}
+
+    def frame(seconds: float) -> int:
+        return int((seconds - window_start) * _ENVELOPE_FRAMES_PER_SECOND)
+
+    for i, (start_a, user_a, index_a) in enumerate(flat):
+        for start_b, user_b, index_b in flat[i + 1 :]:
+            if start_b - start_a > max_offset_s:
+                break
+            if (user_a, index_a) in dropped:
+                break
+            if user_b == user_a or (user_b, index_b) in dropped:
+                continue
+            segment_a = transcripts[user_a][index_a]
+            segment_b = transcripts[user_b][index_b]
+            if _bleed_text_similarity(segment_a[2], segment_b[2]) < text_similarity:
+                continue
+
+            span_start = min(segment_a[0], segment_b[0])
+            span_end = max(segment_a[1], segment_b[1], span_start + BLEED_MIN_SPAN_S)
+            first, last = max(0, frame(span_start)), frame(span_end)
+            if user_a not in envelopes or user_b not in envelopes:
+                continue
+            rms_a = envelopes[user_a][first:last]
+            rms_b = envelopes[user_b][first:last]
+            length = min(len(rms_a), len(rms_b))
+            if length == 0:
+                continue
+            rms_a, rms_b = rms_a[:length], rms_b[:length]
+
+            level_a = 20 * np.log10(np.sqrt(np.mean(rms_a.astype(np.float64) ** 2)) + 1e-10)
+            level_b = 20 * np.log10(np.sqrt(np.mean(rms_b.astype(np.float64) ** 2)) + 1e-10)
+            if level_a >= level_b:
+                louder, quieter, quieter_index, quieter_rms = user_a, user_b, index_b, rms_b
+            else:
+                louder, quieter, quieter_index, quieter_rms = user_b, user_a, index_a, rms_a
+            gap = abs(level_a - level_b)
+
+            if np.mean(_envelope_db(quieter_rms) > BLEED_ACTIVE_DB) < BLEED_ACTIVE_FRACTION:
+                continue
+
+            correlation = _max_lagged_correlation(
+                _envelope_db(rms_a), _envelope_db(rms_b), BLEED_MAX_LAG_FRAMES
+            )
+            if gap >= level_gap_db and correlation >= min_correlation:
+                dropped.add((quieter, quieter_index))
+                markers.pop((quieter, quieter_index), None)
+                stats["bleed_deduped"] += 1
+                decision = f"dropped {quieter}"
+            else:
+                markers.setdefault((quieter, quieter_index), speaker_names.get(louder, louder))
+                stats["bleed_ambiguous"] += 1
+                decision = "ambiguous"
+            if verbose:
+                hours, rest = divmod(int(span_start), 3600)
+                print(
+                    f"  bleed? {hours:02d}:{rest // 60:02d}:{rest % 60:02d} "
+                    f"{user_a}/{user_b} gap={gap:.1f}dB corr={correlation:.2f} -> {decision}"
+                )
+
+    deduped: dict[str, list[tuple[float, float, str, float, float]]] = {}
+    for username, segments in transcripts.items():
+        kept = []
+        for index, segment in enumerate(segments):
+            if (username, index) in dropped:
+                continue
+            louder_name = markers.get((username, index))
+            if show_markers and louder_name is not None:
+                start, end, text, compression_ratio, avg_logprob = segment
+                segment = (
+                    start, end, f"[possible bleed: {louder_name}] {text}", compression_ratio, avg_logprob
+                )
+            kept.append(segment)
+        deduped[username] = kept
+    return deduped, stats
+
+
 def merge_tracks(
     timestamp_base: datetime,
     transcripts: dict[str, list[tuple[float, float, str, float, float]]],
@@ -1286,6 +1478,15 @@ def _rule(char: str = "=") -> str:
     return char * width
 
 
+def _config_number(config: dict, key: str, default: float) -> float:
+    """Read a numeric config key, exiting with a clear error if it isn't a number."""
+    value = config.get(key, default)
+    # bool is an int subclass, but `merge_gap_ms: true` is a typo, not 1.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        sys.exit(f"error: config `{key}` must be a number, got {value!r}")
+    return value
+
+
 def main() -> None:
     start_time = time.monotonic()
 
@@ -1401,6 +1602,25 @@ def main() -> None:
         "still go to the companion .errors.md file). Overrides the config "
         "`show_inaudible_placeholders` key; only needed when that is set to true.",
     )
+    bleed_marker_group = parser.add_mutually_exclusive_group()
+    bleed_marker_group.add_argument(
+        "--show-bleed-markers",
+        dest="show_bleed_markers",
+        action="store_true",
+        default=None,
+        help="Prefix the quieter copy of an ambiguous possible mic-bleed pair "
+        "with '[possible bleed: <louder speaker>]' for manual review (both "
+        "copies are kept either way). Overrides the config `show_bleed_markers` "
+        "key, which defaults to false.",
+    )
+    bleed_marker_group.add_argument(
+        "--hide-bleed-markers",
+        dest="show_bleed_markers",
+        action="store_false",
+        default=None,
+        help="Don't mark ambiguous possible mic-bleed pairs. Overrides the config "
+        "`show_bleed_markers` key; only needed when that is set to true.",
+    )
     timestamp_mode_group = parser.add_mutually_exclusive_group()
     timestamp_mode_group.add_argument(
         "--elapsed-timestamps",
@@ -1421,6 +1641,13 @@ def main() -> None:
         help="Stamp each line with the real wall-clock time it was spoken, "
         "instead of time elapsed since the start of the recording. Overrides "
         "the config `timestamp_mode` key, which defaults to 'elapsed'.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print one line per possible mic-bleed pair (time, tracks, level "
+        "gap, envelope correlation, decision), for tuning the `bleed_*` config "
+        "thresholds.",
     )
     parser.add_argument(
         "--fresh",
@@ -1527,9 +1754,9 @@ def main() -> None:
     output_dir = Path(config.get("output_dir", "./transcripts"))
     model_dir = Path(config.get("model_dir", "./models"))
     speaker_map = config.get("speaker_map") or {}
-    vad_min_silence_ms = config.get("vad_min_silence_ms", 800)
-    vad_min_speech_ms = config.get("vad_min_speech_ms", 250)
-    merge_gap_ms = config.get("merge_gap_ms", 2000)
+    vad_min_silence_ms = _config_number(config, "vad_min_silence_ms", 800)
+    vad_min_speech_ms = _config_number(config, "vad_min_speech_ms", 250)
+    merge_gap_ms = _config_number(config, "merge_gap_ms", 2000)
     timestamp_format = config.get("timestamp_format", "%H:%M:%S")
     line_format = config.get("line_format", "[{timestamp}] {speaker}: {text}")
     filler_words = config.get("filler_words", ["so", "you", "um", "uh", "hm", "hmm"])
@@ -1538,6 +1765,20 @@ def main() -> None:
         if args.show_inaudible is not None
         else config.get("show_inaudible_placeholders", False)
     )
+    show_bleed_markers = (
+        args.show_bleed_markers
+        if args.show_bleed_markers is not None
+        else config.get("show_bleed_markers", False)
+    )
+    bleed_thresholds = {
+        key: _config_number(config, key, default)
+        for key, default in (
+            ("bleed_level_gap_db", 4),
+            ("bleed_min_correlation", 0.3),
+            ("bleed_text_similarity", 0.6),
+            ("bleed_max_offset_s", 2),
+        )
+    }
     timestamp_mode = config.get("timestamp_mode", "elapsed")
     if timestamp_mode not in ("clock", "elapsed"):
         sys.exit(f"error: config `timestamp_mode` must be 'clock' or 'elapsed', got {timestamp_mode!r}")
@@ -1685,6 +1926,8 @@ def main() -> None:
 
         print("ANALYZING SPEECH (VAD)...")
         track_regions: dict[str, list[float]] = {}
+        # Index 0 is window_start in windowed runs (tracks are cropped), else 0.
+        track_envelopes: dict[str, np.ndarray] = {}
         total_raw_s = 0.0
         total_speech_s = 0.0
         vad_total = len(matched)
@@ -1710,7 +1953,7 @@ def main() -> None:
                     _progress_events.progress("vad", vad_progress.n, vad_progress.total, _track)
 
                 track_start = time.monotonic()
-                regions, duration = detect_speech_regions(
+                regions, duration, envelope = detect_speech_regions(
                     audio_path,
                     vad_min_silence_ms,
                     vad_min_speech_ms,
@@ -1718,6 +1961,7 @@ def main() -> None:
                 )
                 track_elapsed = time.monotonic() - track_start
                 track_regions[username] = regions
+                track_envelopes[username] = envelope
                 track_speech_s = speech_seconds(regions)
                 total_raw_s += duration
                 total_speech_s += track_speech_s
@@ -1873,6 +2117,18 @@ def main() -> None:
         print()
 
         print("MERGING TRACKS...")
+        transcripts, bleed_stats = dedup_bleed(
+            transcripts,
+            track_envelopes,
+            window_start,
+            {u: resolve_speaker(u, speaker_map, warned_speakers) for u in transcripts},
+            bleed_thresholds["bleed_level_gap_db"],
+            bleed_thresholds["bleed_min_correlation"],
+            bleed_thresholds["bleed_text_similarity"],
+            bleed_thresholds["bleed_max_offset_s"],
+            show_bleed_markers,
+            args.verbose,
+        )
         timestamp_base = _ELAPSED_TIMESTAMP_EPOCH if timestamp_mode == "elapsed" else session_start
         merged, flagged_lines, merge_stats = merge_tracks(
             timestamp_base,
@@ -1883,7 +2139,10 @@ def main() -> None:
             logprob_threshold,
             show_inaudible_placeholders,
         )
+        merge_stats.update(bleed_stats)
         print(f"  {merge_stats['segments_total']} segments")
+        print(f"  {merge_stats['bleed_deduped']} bleed duplicate(s) dropped")
+        print(f"  {merge_stats['bleed_ambiguous']} possible bleed pair(s) kept")
         print(f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed")
         print(f"  {merge_stats['filler_dropped']} filler word(s) dropped")
         print(f"  {merge_stats['repeat_deduped']} repeat(s) deduped")
@@ -1913,9 +2172,6 @@ def main() -> None:
             filename_suffix=filename_suffix,
             output_name=args.output_name,
         )
-        if not windowed:
-            shutil.rmtree(partial_dir, ignore_errors=True)
-
         if is_zip and not windowed:
             mark_zip_processed(resolved_input_path, input_dir)
 

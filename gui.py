@@ -75,6 +75,7 @@ class App(ctk.CTk):
         )
         self.elapsed_var = ctk.BooleanVar(value=config.get("timestamp_mode", "elapsed") == "elapsed")
         self.inaudible_var = ctk.BooleanVar(value=bool(config.get("show_inaudible_placeholders", False)))
+        self.bleed_var = ctk.BooleanVar(value=bool(config.get("show_bleed_markers", False)))
         self.save_log_var = ctk.BooleanVar(value=bool(config.get("save_gui_log", True)))
 
         self.grid_columnconfigure(0, weight=1)
@@ -124,10 +125,14 @@ class App(ctk.CTk):
             form, text="Show [inaudible] placeholders", variable=self.inaudible_var
         )
         self.inaudible_check.grid(row=5, column=1, columnspan=3, sticky="w", pady=6)
+        self.bleed_check = ctk.CTkCheckBox(
+            form, text="Mark possible mic bleed", variable=self.bleed_var
+        )
+        self.bleed_check.grid(row=6, column=1, columnspan=3, sticky="w", pady=6)
         self.save_log_check = ctk.CTkCheckBox(
             form, text="Save log next to the transcript", variable=self.save_log_var
         )
-        self.save_log_check.grid(row=6, column=1, columnspan=3, sticky="w", pady=(6, 12))
+        self.save_log_check.grid(row=7, column=1, columnspan=3, sticky="w", pady=(6, 12))
 
         controls = ctk.CTkFrame(self, fg_color="transparent")
         controls.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
@@ -187,6 +192,7 @@ class App(ctk.CTk):
             self.end_entry,
             self.elapsed_check,
             self.inaudible_check,
+            self.bleed_check,
             self.save_log_check,
             self.start_button,
             *self.model_radios,
@@ -255,6 +261,7 @@ class App(ctk.CTk):
         argv += ["--model", self.model_var.get()]
         argv.append("--elapsed-timestamps" if self.elapsed_var.get() else "--clock-timestamps")
         argv.append("--show-inaudible" if self.inaudible_var.get() else "--hide-inaudible")
+        argv.append("--show-bleed-markers" if self.bleed_var.get() else "--hide-bleed-markers")
         return argv
 
     def _start(self) -> None:

@@ -84,6 +84,24 @@ logprob_threshold: -1.0
 # `transcribe.py --show-inaudible` / `--hide-inaudible`.
 show_inaudible_placeholders: false
 
+# Co-located mic bleed dedup: when two players share a room, each mic picks
+# up the other and Whisper transcribes the bleed as a duplicate line. A
+# matching cross-track pair is dropped only if the audio shows a correlated,
+# attenuated copy; see docs/design/transcription-pipeline.md. Tune these from
+# `transcribe.py --verbose` output.
+# Minimum dB gap between the louder and quieter track over the pair's span.
+bleed_level_gap_db: 4
+# Minimum envelope correlation (max over +/-150ms lag) between the two tracks.
+bleed_min_correlation: 0.3
+# Minimum text similarity (0-1) for two segments to count as the same line.
+bleed_text_similarity: 0.6
+# Maximum difference, in seconds, between the two segments' start times.
+bleed_max_offset_s: 2
+# Prefix the kept quieter copy of an ambiguous pair with
+# "[possible bleed: <louder speaker>]" for manual review. Overridable per-run
+# with `transcribe.py --show-bleed-markers` / `--hide-bleed-markers`.
+show_bleed_markers: false
+
 # Whether gui.py saves its log panel next to the transcript as
 # `<session-title>.log` after a successful run. The GUI's "Save log"
 # checkbox starts from this value. The CLI ignores it.

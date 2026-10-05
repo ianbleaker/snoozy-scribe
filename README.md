@@ -72,6 +72,10 @@ If omitted, the oldest `.zip` file in `input_dir` (from `config.yaml`) is
 picked up automatically — drop Craig `.zip` exports there and run without
 arguments. After a successful run, a zip that was extracted (whether passed
 explicitly or auto-picked) is moved into `<input_dir>/processed/`.
+Each track's transcribed segments are cached under
+`<output_dir>/.partial/<slug>/` and kept after the run. Rerunning the same
+zip, including one already in `input/processed/`, reuses them and only
+re-runs VAD and merging. Pass `--fresh` to retranscribe from scratch.
 
 The transcript is written to `output_dir` (from `config.yaml`) as
 `<session-title>.md`. Lines Whisper's decode couldn't be trusted for show
@@ -102,6 +106,19 @@ Options:
 - `--test [SECONDS]` — a quick windowed run of SECONDS (default 120),
   starting at `--start` if given or at a random point otherwise, written to
   `<session-title>-<start>-<end>.md` like `--start`/`--end`.
+
+When two players share a room on separate headsets, each mic picks up the
+other, and the transcript can show the same line under both speakers.
+Matching cross-track lines are deduplicated before merging, but only when
+the audio confirms bleed. The quieter track has to carry an attenuated,
+correlated copy of the louder one, so a player echoing someone else is
+never removed. The thresholds are config keys (`bleed_level_gap_db`,
+`bleed_min_correlation`, `bleed_text_similarity`, `bleed_max_offset_s`;
+see `config.example.yaml`). Pairs that match on text but miss the audio
+thresholds are kept. `show_bleed_markers: true` (or `--show-bleed-markers`)
+prefixes the quieter copy with `[possible bleed: <speaker>]` for review.
+`--verbose` prints the level gap and correlation of each pair, so you can
+tune the thresholds and rerun the cached zip cheaply.
 
 On first run, the configured Whisper model is downloaded into `model_dir`
 (from `config.yaml`) and reused on subsequent runs.
@@ -146,6 +163,7 @@ log output (collapsed by default; it opens by itself if a run fails). It exposes
 - Timestamp mode — elapsed or wall-clock (`--elapsed-timestamps` /
   `--clock-timestamps`)
 - Show `[inaudible]` placeholders (`--show-inaudible` / `--hide-inaudible`)
+- Mark possible mic bleed (`--show-bleed-markers` / `--hide-bleed-markers`)
 
 Everything else still comes from `config.yaml`. Advanced flags (`--language`,
 `--test`, `--fresh`, `--vocabulary`, thresholds, etc.) need the CLI. Cancel
