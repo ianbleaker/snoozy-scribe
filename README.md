@@ -76,6 +76,10 @@ Each track's transcribed segments are cached under
 `<output_dir>/.partial/<slug>/` and kept after the run. Rerunning the same
 zip, including one already in `input/processed/`, reuses them and only
 re-runs VAD and merging. Pass `--fresh` to retranscribe from scratch.
+Caches unused for `partial_max_age_days` (default 30; `0` turns it off)
+are deleted at the start of each full run. `--prune-cache` deletes every
+cache and exits, and `--prune-cache DAYS` deletes only the ones unused for
+DAYS or more.
 
 The transcript is written to `output_dir` (from `config.yaml`) as
 `<session-title>.md`. Lines Whisper's decode couldn't be trusted for show
@@ -106,6 +110,12 @@ Options:
 - `--test [SECONDS]` — a quick windowed run of SECONDS (default 120),
   starting at `--start` if given or at a random point otherwise, written to
   `<session-title>-<start>-<end>.md` like `--start`/`--end`.
+- `--shared-mic USERNAME@START[-END]=NAME1,NAME2` — label one track's lines
+  in a span with several players' names; see
+  [Players sharing a mic](#players-sharing-a-mic).
+- `--prune-cache [DAYS]` — delete cached segments under
+  `<output_dir>/.partial/` (all of them, or only those unused for DAYS) and
+  exit.
 
 When two players share a room on separate headsets, each mic picks up the
 other, and the transcript can show the same line under both speakers.
@@ -119,6 +129,29 @@ thresholds are kept. `show_bleed_markers: true` (or `--show-bleed-markers`)
 prefixes the quieter copy with `[possible bleed: <speaker>]` for review.
 `--verbose` prints the level gap and correlation of each pair, so you can
 tune the thresholds and rerun the cached zip cheaply.
+
+### Players sharing a mic
+
+If players switch to one mic mid-session (say a headset dies), declare the
+span for that run:
+
+```sh
+.venv/bin/python transcribe.py session.zip --shared-mic bob42@01:44:00=Bob,Carol
+```
+
+The syntax is `--shared-mic USERNAME@START[-END]=NAME1,NAME2[,...]`, with times
+in recording time (`HH:MM:SS`, the same clock as `--start`/`--end`). Without
+`-END` the span runs to the end of the recording. Repeat the flag for more
+spans. Every line from that track in the span is labelled `Bob/Carol`, and
+each Whisper segment stays its own line, so you can attribute lines by hand
+afterwards. The label is used as-is and bypasses `speaker_map`. Because the
+segment cache is kept, adding an override after a run only re-runs VAD and
+merging. In the GUI, use the "Shared mic" field, with several entries
+separated by `;`.
+
+Whisper's stock silence phrases ("Thanks for watching!", "Subtitles by the
+Amara.org community", `www.` URLs) are stripped from each segment before
+merging; edit the list with `hallucination_phrases` in `config.yaml`.
 
 On first run, the configured Whisper model is downloaded into `model_dir`
 (from `config.yaml`) and reused on subsequent runs.
@@ -164,6 +197,7 @@ log output (collapsed by default; it opens by itself if a run fails). It exposes
   `--clock-timestamps`)
 - Show `[inaudible]` placeholders (`--show-inaudible` / `--hide-inaudible`)
 - Mark possible mic bleed (`--show-bleed-markers` / `--hide-bleed-markers`)
+- Shared mic (`--shared-mic`) — several entries separated by `;`
 
 Everything else still comes from `config.yaml`. Advanced flags (`--language`,
 `--test`, `--fresh`, `--vocabulary`, thresholds, etc.) need the CLI. Cancel

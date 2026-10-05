@@ -68,6 +68,18 @@ COMPRESSION_RATIO_THRESHOLD = 2.4
 # docs/design/transcription-pipeline.md.
 LOGPROB_THRESHOLD = -1.0
 
+# Stock phrases Whisper emits from its training data on near-silent or noisy
+# audio, removed as case-insensitive substrings from each segment before
+# merging. Kept narrow on purpose: only phrases nobody says at a game table
+# (so not "See you next time!" — that belongs in `filler_words`). The
+# `hallucination_phrases` config key replaces this list rather than extending
+# it — see docs/design/transcription-pipeline.md.
+DEFAULT_HALLUCINATION_PHRASES = [
+    r"Subtitles by the Amara\.org community",
+    r"Thanks? (you )?for watching[.!]?",
+    r"www\.\S+",
+]
+
 _vad_model = None
 
 
@@ -227,6 +239,30 @@ def write_partial_meta(
         "best_of": best_of,
     }
     (partial_dir / "_meta.json").write_text(json.dumps(meta))
+
+
+def prune_partials(output_dir: Path, max_age_days: float, keep: str | None = None) -> list[str]:
+    """Delete `.partial/<slug>/` dirs unused for at least `max_age_days`.
+
+    Age comes from `_meta.json`'s mtime, since every full run rewrites it
+    (falling back to the directory's own mtime if it's missing).
+    `max_age_days=0` removes every dir. `keep` names a slug never to remove
+    (the current run's). Returns the removed slugs.
+    """
+    root = output_dir / ".partial"
+    if not root.is_dir():
+        return []
+    cutoff = time.time() - max_age_days * 86400
+    removed = []
+    for slug_dir in sorted(root.iterdir()):
+        if not slug_dir.is_dir() or slug_dir.name == keep:
+            continue
+        meta_path = slug_dir / "_meta.json"
+        last_used = (meta_path if meta_path.exists() else slug_dir).stat().st_mtime
+        if max_age_days == 0 or last_used < cutoff:
+            shutil.rmtree(slug_dir)
+            removed.append(slug_dir.name)
+    return removed
 
 
 def load_partial_meta(partial_dir: Path) -> dict | None:
@@ -454,6 +490,30 @@ def _parse_hms(value: str) -> float:
     except ValueError as e:
         raise ValueError(f"expected HH:MM:SS, got {value!r}") from e
     return hours * 3600 + minutes * 60 + seconds
+
+
+def parse_shared_mic(value: str) -> tuple[str, float, float, str]:
+    """Parse `USERNAME@START[-END]=NAME1,NAME2[,...]` from `--shared-mic`.
+
+    Returns `(username, start_s, end_s, label)`, where `end_s` is infinite
+    when END is omitted and `label` is the names joined with `/`.
+    """
+    if "@" not in value or "=" not in value:
+        sys.exit(f"error: --shared-mic {value!r} must look like USERNAME@START[-END]=NAME1,NAME2")
+    username, _, rest = value.partition("@")
+    span, _, names_part = rest.partition("=")
+    names = [name.strip() for name in names_part.split(",")]
+    if not username.strip() or len(names) < 2 or not all(names):
+        sys.exit(f"error: --shared-mic {value!r} needs a track name and at least two non-empty names")
+    start_text, _, end_text = span.partition("-")
+    try:
+        start_s = _parse_hms(start_text)
+        end_s = _parse_hms(end_text) if end_text else float("inf")
+    except ValueError as e:
+        sys.exit(f"error: invalid --shared-mic time in {value!r}: {e}")
+    if end_s <= start_s:
+        sys.exit(f"error: --shared-mic {value!r} ends before it starts")
+    return username.strip(), start_s, end_s, "/".join(names)
 
 
 def _window_stamp(seconds: float) -> str:
@@ -856,7 +916,9 @@ def resolve_speaker(username: str, speaker_map: dict[str, str], warned: set[str]
     if username in speaker_map:
         return speaker_map[username]
     if username not in warned:
-        print(f"!! warning: no speaker_map entry for {username}, using raw Discord name")
+        close = difflib.get_close_matches(username, speaker_map.keys(), n=1, cutoff=0.6)
+        hint = f" (did you mean '{close[0]}'?)" if close else ""
+        print(f"!! warning: no speaker_map entry for {username}, using raw Discord name{hint}")
         warned.add(username)
     return username
 
@@ -1242,7 +1304,11 @@ def merge_tracks(
     compression_ratio_threshold: float = COMPRESSION_RATIO_THRESHOLD,
     logprob_threshold: float = LOGPROB_THRESHOLD,
     include_inaudible_placeholders: bool = False,
-) -> tuple[list[tuple[datetime, str, str]], list[tuple[datetime, str, str]], dict[str, int]]:
+    hallucination_patterns: list[re.Pattern] | None = None,
+    shared_spans: dict[str, list[tuple[float, float, str]]] | None = None,
+) -> tuple[
+    list[tuple[datetime, str, str]], list[tuple[datetime, str, str]], dict[str, int], set[str]
+]:
     """Interleave per-track segments into one chronological transcript.
 
     Consecutive segments from the same speaker (per-track, ignoring what
@@ -1275,8 +1341,15 @@ def merge_tracks(
     wrong-language decodes that stay short/varied enough to read as
     high-confidence to mlx_whisper itself.
 
-    Every segment's text is also passed through `collapse_repetition()`
-    before anything else, regardless of its compression ratio — a
+    Before anything else, every `hallucination_patterns` match (Whisper's
+    stock silence phrases, e.g. "Thanks for watching!") is removed from the
+    segment's text as a substring, so a phrase never gets glued onto real
+    speech by the same-speaker merge. A segment left with nothing word-like
+    is dropped; either way it counts toward `hallucination_stripped`, and
+    the removed text is not reported in `flagged_lines` — it's known junk.
+
+    Every segment's text is then passed through `collapse_repetition()`
+    ahead of flagging and merging, regardless of its compression ratio — a
     repetition-hallucination loop can be diluted below the ratio threshold
     if it's only part of a longer segment. A segment collapse_repetition()
     actually changes is flagged too, using the collapsed text, since a
@@ -1309,17 +1382,27 @@ def merge_tracks(
     and repeat dedup against an adjacent flagged segment (above) always
     compares the original text, not the placeholder.
 
+    `shared_spans` maps a username to `(start, end, label)` spans where that
+    track carries several players (`--shared-mic`). A segment whose start
+    falls in `[start, end)` is emitted under `label` instead of the
+    username, flagged or not, and always as its own line: it never merges
+    with a neighbor in either direction, so each line can still be
+    attributed to one player by hand. Every label used is returned in
+    `shared_labels`, so the caller can skip `speaker_map` for it.
+
     Also returns a stats dict counting what was pruned along the way
-    (`segments_total`, `empty_dropped`, `repetition_collapsed`,
-    `filler_dropped`, `repeat_deduped`, `flagged_for_review`), for the
+    (`segments_total`, `empty_dropped`, `hallucination_stripped`,
+    `repetition_collapsed`, `filler_dropped`, `repeat_deduped`, `flagged_for_review`), for the
     caller to report and to record in the transcript's frontmatter.
     """
     merged: list[tuple[datetime, str, str]] = []
     flagged_lines: list[tuple[datetime, str, str]] = []
+    shared_labels: set[str] = set()
     normalized_filler_words = {_normalize(word) for word in filler_words}
     stats = {
         "segments_total": 0,
         "empty_dropped": 0,
+        "hallucination_stripped": 0,
         "repetition_collapsed": 0,
         "filler_dropped": 0,
         "repeat_deduped": 0,
@@ -1327,6 +1410,7 @@ def merge_tracks(
     }
 
     for username, segments in transcripts.items():
+        spans = (shared_spans or {}).get(username, [])
         previous_normalized: str | None = None
         previous_flagged = False
         buffer_start: float | None = None
@@ -1336,11 +1420,26 @@ def merge_tracks(
         for start, end, text, compression_ratio, avg_logprob in segments:
             stats["segments_total"] += 1
             stripped = text.strip()
+            if hallucination_patterns:
+                cleaned = stripped
+                hits = 0
+                for pattern in hallucination_patterns:
+                    cleaned, count = pattern.subn("", cleaned)
+                    hits += count
+                if hits:
+                    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                    stats["hallucination_stripped"] += 1
+                    if _normalize(cleaned) == "":
+                        continue
+                    stripped = cleaned
             if _normalize(stripped) == "":
                 stats["empty_dropped"] += 1
                 continue
             collapsed_text = collapse_repetition(stripped)
-            repetition_collapsed = collapsed_text != stripped
+            # collapse_repetition() re-joins words with single spaces, so compare
+            # against the same whitespace-normalized text; otherwise a stray
+            # double space would count as a repetition collapse and get flagged.
+            repetition_collapsed = collapsed_text != " ".join(stripped.split())
             if repetition_collapsed:
                 stats["repetition_collapsed"] += 1
             stripped = collapsed_text
@@ -1359,17 +1458,27 @@ def merge_tracks(
                 continue
             previous_normalized = normalized
             previous_flagged = flagged
+            shared_label = next(
+                (label for span_start, span_end, label in spans if span_start <= start < span_end),
+                None,
+            )
+            speaker = shared_label or username
+            if shared_label is not None:
+                shared_labels.add(shared_label)
 
-            if flagged:
-                stats["flagged_for_review"] += 1
+            if flagged or shared_label is not None:
                 if buffer_text is not None:
                     timestamp = timestamp_base + timedelta(seconds=buffer_start)
                     merged.append((timestamp, username, buffer_text))
                     buffer_start = buffer_end = buffer_text = None
                 timestamp = timestamp_base + timedelta(seconds=start)
-                flagged_lines.append((timestamp, username, stripped))
+                if not flagged:
+                    merged.append((timestamp, speaker, stripped))
+                    continue
+                stats["flagged_for_review"] += 1
+                flagged_lines.append((timestamp, speaker, stripped))
                 if include_inaudible_placeholders:
-                    merged.append((timestamp, username, "!! [inaudible]"))
+                    merged.append((timestamp, speaker, "!! [inaudible]"))
                 continue
 
             if buffer_text is not None and start - buffer_end <= merge_gap_seconds:
@@ -1387,7 +1496,7 @@ def merge_tracks(
 
     merged.sort(key=lambda entry: entry[0])
     flagged_lines.sort(key=lambda entry: entry[0])
-    return merged, flagged_lines, stats
+    return merged, flagged_lines, stats, shared_labels
 
 
 def _format_lines(
@@ -1656,6 +1765,27 @@ def main() -> None:
         "every track from scratch.",
     )
     parser.add_argument(
+        "--shared-mic",
+        action="append",
+        default=None,
+        metavar="USER@START[-END]=NAME,NAME",
+        help="Declare that a track carries several players from START (to END, "
+        "or the end of the recording) in recording time, e.g. "
+        "bob42@01:44:00=Bob,Carol. Lines in the span are labelled "
+        "Bob/Carol and never merged. Repeatable.",
+    )
+    parser.add_argument(
+        "--prune-cache",
+        nargs="?",
+        type=float,
+        const=0,
+        default=None,
+        metavar="DAYS",
+        help="Delete cached per-track segments under <output_dir>/.partial/ "
+        "and exit without transcribing. With DAYS, only delete caches unused "
+        "for at least that many days; without it, delete all of them.",
+    )
+    parser.add_argument(
         "--start",
         type=str,
         default=None,
@@ -1707,6 +1837,12 @@ def main() -> None:
     except ValueError as e:
         sys.exit(f"error: invalid --start/--end: {e}")
     windowed = args.test is not None or args.start is not None or args.end is not None
+    shared_mic_specs = [parse_shared_mic(value) for value in args.shared_mic or []]
+    if args.prune_cache is not None:
+        if args.prune_cache < 0:
+            sys.exit("error: --prune-cache DAYS must be 0 or more")
+        if args.craig_folder is not None or windowed or args.fresh or args.shared_mic:
+            sys.exit("error: --prune-cache only prunes and exits; drop the other arguments")
     if windowed and args.fresh:
         sys.exit("error: --fresh doesn't apply to windowed runs, which never use saved partial output")
     global _saves_partials
@@ -1728,6 +1864,13 @@ def main() -> None:
         )
     if config.get("speaker_map") is not None and not isinstance(config["speaker_map"], dict):
         sys.exit(f"error: speaker_map in {args.config} must be a mapping of Discord name to speaker name")
+    if args.prune_cache is not None:
+        prune_root = Path(config.get("output_dir", "./transcripts"))
+        removed = prune_partials(prune_root, args.prune_cache)
+        for slug in removed:
+            print(f"  removed {prune_root / '.partial' / slug}")
+        print(f"Pruned {len(removed)} cached session(s).")
+        return
     if not args.model and "whisper_model" not in config:
         sys.exit(f"error: whisper_model is missing from {args.config} and --model wasn't passed")
 
@@ -1752,6 +1895,9 @@ def main() -> None:
     best_of = args.best_of if args.best_of is not None else config.get("best_of")
     input_dir = Path(config.get("input_dir", "./input"))
     output_dir = Path(config.get("output_dir", "./transcripts"))
+    partial_max_age_days = _config_number(config, "partial_max_age_days", 30)
+    if partial_max_age_days < 0:
+        sys.exit(f"error: config `partial_max_age_days` must be 0 or more, got {partial_max_age_days!r}")
     model_dir = Path(config.get("model_dir", "./models"))
     speaker_map = config.get("speaker_map") or {}
     vad_min_silence_ms = _config_number(config, "vad_min_silence_ms", 800)
@@ -1760,6 +1906,17 @@ def main() -> None:
     timestamp_format = config.get("timestamp_format", "%H:%M:%S")
     line_format = config.get("line_format", "[{timestamp}] {speaker}: {text}")
     filler_words = config.get("filler_words", ["so", "you", "um", "uh", "hm", "hmm"])
+    hallucination_phrases = config.get("hallucination_phrases", DEFAULT_HALLUCINATION_PHRASES)
+    if not isinstance(hallucination_phrases, list) or not all(
+        isinstance(phrase, str) for phrase in hallucination_phrases
+    ):
+        sys.exit(f"error: config `hallucination_phrases` must be a list of strings, got {hallucination_phrases!r}")
+    hallucination_patterns = []
+    for phrase in hallucination_phrases:
+        try:
+            hallucination_patterns.append(re.compile(phrase, re.IGNORECASE))
+        except re.error as err:
+            sys.exit(f"error: hallucination_phrases entry {phrase!r} is not a valid regex: {err}")
     show_inaudible_placeholders = (
         args.show_inaudible
         if args.show_inaudible is not None
@@ -1846,6 +2003,13 @@ def main() -> None:
 
     slug = _slugify(session_title)
     partial_dir = partial_dir_for(output_dir, slug)
+    if not windowed and partial_max_age_days > 0:
+        pruned = prune_partials(output_dir, partial_max_age_days, keep=slug)
+        if pruned:
+            print(
+                f"Pruned {len(pruned)} cached session(s) unused for "
+                f"{partial_max_age_days:g}+ days: {', '.join(pruned)}"
+            )
 
     extraction_ctx = tempfile.TemporaryDirectory() if is_zip else contextlib.nullcontext()
     with (
@@ -1868,6 +2032,17 @@ def main() -> None:
         _progress_events.step("Reading manifest")
         session_start, usernames = parse_manifest(craig_folder)
         print(f"  Parsed manifest: {len(usernames)} speakers, session started {session_start}")
+        shared_spans: dict[str, list[tuple[float, float, str]]] = {}
+        for username, span_start, span_end, label in shared_mic_specs:
+            if username not in usernames:
+                sys.exit(
+                    f"error: --shared-mic track {username!r} not in this recording "
+                    f"(tracks: {', '.join(usernames)})"
+                )
+            for other_start, other_end, _ in shared_spans.get(username, []):
+                if span_start < other_end and other_start < span_end:
+                    sys.exit(f"error: --shared-mic spans on track {username!r} overlap")
+            shared_spans.setdefault(username, []).append((span_start, span_end, label))
         matched = match_tracks(craig_folder, usernames)
         warned_speakers: set[str] = set()
         for username in matched:
@@ -2130,7 +2305,7 @@ def main() -> None:
             args.verbose,
         )
         timestamp_base = _ELAPSED_TIMESTAMP_EPOCH if timestamp_mode == "elapsed" else session_start
-        merged, flagged_lines, merge_stats = merge_tracks(
+        merged, flagged_lines, merge_stats, shared_labels = merge_tracks(
             timestamp_base,
             transcripts,
             merge_gap_ms / 1000,
@@ -2138,24 +2313,36 @@ def main() -> None:
             compression_ratio_threshold,
             logprob_threshold,
             show_inaudible_placeholders,
+            hallucination_patterns,
+            shared_spans,
         )
         merge_stats.update(bleed_stats)
         print(f"  {merge_stats['segments_total']} segments")
         print(f"  {merge_stats['bleed_deduped']} bleed duplicate(s) dropped")
         print(f"  {merge_stats['bleed_ambiguous']} possible bleed pair(s) kept")
+        print(f"  {merge_stats['hallucination_stripped']} hallucination phrase(s) stripped")
         print(f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed")
         print(f"  {merge_stats['filler_dropped']} filler word(s) dropped")
         print(f"  {merge_stats['repeat_deduped']} repeat(s) deduped")
         print(f"  {merge_stats['empty_dropped']} empty segment(s) dropped")
         print(f"  {merge_stats['flagged_for_review']} line(s) flagged for review")
         print("Merging completed")
+        # A --shared-mic label is already a display name, not a Discord username.
         resolved = [
-            (timestamp, resolve_speaker(username, speaker_map, warned_speakers), text)
-            for timestamp, username, text in merged
+            (
+                timestamp,
+                speaker if speaker in shared_labels else resolve_speaker(speaker, speaker_map, warned_speakers),
+                text,
+            )
+            for timestamp, speaker, text in merged
         ]
         resolved_flagged = [
-            (timestamp, resolve_speaker(username, speaker_map, warned_speakers), text)
-            for timestamp, username, text in flagged_lines
+            (
+                timestamp,
+                speaker if speaker in shared_labels else resolve_speaker(speaker, speaker_map, warned_speakers),
+                text,
+            )
+            for timestamp, speaker, text in flagged_lines
         ]
         print()
 

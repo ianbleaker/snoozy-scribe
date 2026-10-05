@@ -111,6 +111,12 @@ save_gui_log: true
 # ./transcripts if omitted.
 output_dir: ./transcripts
 
+# Each full run deletes cached per-track segments (<output_dir>/.partial/<slug>/)
+# that no run has used for this many days, never the current session's. 0
+# turns automatic pruning off; `--prune-cache [DAYS]` prunes on demand.
+# Defaults to 30 if omitted.
+partial_max_age_days: 30
+
 # Directory to drop Craig .zip exports into for automatic pickup. Processed
 # zips are moved into a `processed/` subfolder here.
 input_dir: ./input
@@ -143,6 +149,18 @@ merge_gap_ms: 2000
 # of a longer real sentence, and never applies to a "!! "-flagged line.
 # Defaults to the list below if omitted.
 filler_words: ["so", "you", "um", "uh", "hm", "hmm"]
+
+# Regexes (case-insensitive) for Whisper's stock silence hallucinations,
+# removed as substrings from every segment before same-speaker merging, so
+# they never get glued onto real speech. A segment left empty is dropped.
+# Setting this replaces the defaults below rather than extending them, so
+# keep any you still want. Keep it to phrases nobody says at the table:
+# whole-line phrases players do say (e.g. "See you next time!") belong in
+# filler_words instead. Defaults to the list below if omitted.
+hallucination_phrases:
+  - 'Subtitles by the Amara\.org community'
+  - 'Thanks? (you )?for watching[.!]?'
+  - 'www\.\S+'
 
 # strftime() format for each line's timestamp. Defaults to "%H:%M:%S" if
 # omitted.

@@ -108,9 +108,16 @@ class App(ctk.CTk):
             side="left", padx=(12, 0)
         )
 
-        ctk.CTkLabel(form, text="Model").grid(row=3, column=0, sticky="w", padx=12, pady=6)
+        ctk.CTkLabel(form, text="Shared mic").grid(row=3, column=0, sticky="w", padx=12, pady=6)
+        self.shared_mic_entry = ctk.CTkEntry(
+            form,
+            placeholder_text="e.g. bob42@01:44:00=Bob,Carol — separate several with ;",
+        )
+        self.shared_mic_entry.grid(row=3, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=6)
+
+        ctk.CTkLabel(form, text="Model").grid(row=4, column=0, sticky="w", padx=12, pady=6)
         model_row = ctk.CTkFrame(form, fg_color="transparent")
-        model_row.grid(row=3, column=1, columnspan=3, sticky="w", pady=6)
+        model_row.grid(row=4, column=1, columnspan=3, sticky="w", pady=6)
         self.model_radios = []
         for label, repo in MODELS:
             radio = ctk.CTkRadioButton(model_row, text=label, variable=self.model_var, value=repo)
@@ -120,19 +127,19 @@ class App(ctk.CTk):
         self.elapsed_check = ctk.CTkCheckBox(
             form, text="Elapsed timestamps (uncheck for wall-clock time)", variable=self.elapsed_var
         )
-        self.elapsed_check.grid(row=4, column=1, columnspan=3, sticky="w", pady=6)
+        self.elapsed_check.grid(row=5, column=1, columnspan=3, sticky="w", pady=6)
         self.inaudible_check = ctk.CTkCheckBox(
             form, text="Show [inaudible] placeholders", variable=self.inaudible_var
         )
-        self.inaudible_check.grid(row=5, column=1, columnspan=3, sticky="w", pady=6)
+        self.inaudible_check.grid(row=6, column=1, columnspan=3, sticky="w", pady=6)
         self.bleed_check = ctk.CTkCheckBox(
             form, text="Mark possible mic bleed", variable=self.bleed_var
         )
-        self.bleed_check.grid(row=6, column=1, columnspan=3, sticky="w", pady=6)
+        self.bleed_check.grid(row=7, column=1, columnspan=3, sticky="w", pady=6)
         self.save_log_check = ctk.CTkCheckBox(
             form, text="Save log next to the transcript", variable=self.save_log_var
         )
-        self.save_log_check.grid(row=7, column=1, columnspan=3, sticky="w", pady=(6, 12))
+        self.save_log_check.grid(row=8, column=1, columnspan=3, sticky="w", pady=(6, 12))
 
         controls = ctk.CTkFrame(self, fg_color="transparent")
         controls.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
@@ -190,6 +197,7 @@ class App(ctk.CTk):
             self.output_entry,
             self.start_entry,
             self.end_entry,
+            self.shared_mic_entry,
             self.elapsed_check,
             self.inaudible_check,
             self.bleed_check,
@@ -258,6 +266,9 @@ class App(ctk.CTk):
         window_end = self.end_entry.get().strip()
         if window_end:
             argv += ["--end", window_end]
+        for shared_mic in self.shared_mic_entry.get().split(";"):
+            if shared_mic.strip():
+                argv += ["--shared-mic", shared_mic.strip()]
         argv += ["--model", self.model_var.get()]
         argv.append("--elapsed-timestamps" if self.elapsed_var.get() else "--clock-timestamps")
         argv.append("--show-inaudible" if self.inaudible_var.get() else "--hide-inaudible")
