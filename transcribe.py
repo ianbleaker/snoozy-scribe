@@ -831,7 +831,7 @@ def parse_vocabulary(path: Path) -> dict[str, dict]:
                         )
                     pairs.append((parts[0], parts[1] if len(parts) == 2 else current_term))
                 vocabulary[current_term]["misheard_as"] = pairs
-            else:
+            elif value:
                 vocabulary[current_term]["fields"][label] = value
             continue
         raise VocabularyParseError(f"{path}:{lineno}: malformed line: {raw_line!r}")
