@@ -26,6 +26,8 @@ cd rpg-scribe
 
 `setup.sh` builds `.venv`, creates `settings/config.yaml` if it doesn't
 exist, and builds and installs the app to `~/Applications/rpg-scribe.app`.
+The first run also creates a self-signed code-signing certificate in your
+login keychain, so macOS asks for your password once.
 Open it from Spotlight; ✎ appears in the menu bar. Rerun `./setup.sh` any
 time (after `git pull`, say); it only rebuilds the app when it has to. Pass
 `--rebuild-app` to force a rebuild.
@@ -43,9 +45,10 @@ Settings → Privacy & Security):
 Input Monitoring and Accessibility are asked for at launch; Microphone is
 asked for on your first dictation, so that one records nothing.
 
-Each rebuild changes the app's signature, so grant the permissions again
-afterwards. If the hotkey does nothing after granting, quit from the ✎ menu
-and reopen.
+The app is signed with that certificate, so the grants survive rebuilds.
+If the certificate couldn't be created, the app is signed ad-hoc instead,
+and you have to grant the permissions again after every rebuild. If the
+hotkey does nothing after granting, quit from the ✎ menu and reopen.
 
 ## Using it
 
@@ -111,8 +114,7 @@ merged by time. Setup and usage:
 
 - **Logs**: the app writes to `~/Library/Logs/rpg-scribe.log`.
 - **App won't start after a Homebrew Python upgrade, or after moving the
-  repo**: rerun `./setup.sh --rebuild-app`, then grant the permissions
-  again.
+  repo**: rerun `./setup.sh --rebuild-app`.
 - **Old copy in `/Applications`**: earlier installs had you drag the app
   there, and that copy goes stale. Delete it and use
   `~/Applications/rpg-scribe.app`; if **Launch at login** is on, toggle it

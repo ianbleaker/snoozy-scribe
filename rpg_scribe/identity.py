@@ -1,4 +1,5 @@
-"""The app's name, bundle ID and log path: the one place to change them.
+"""The app's name, bundle ID, log path and signing identity: the one place
+to change them.
 
 make-app.sh and setup.sh read these through
 `.venv/bin/python -m rpg_scribe.identity --shell`, so this module imports
@@ -12,11 +13,20 @@ from pathlib import Path
 APP_NAME = "rpg-scribe"
 BUNDLE_ID = "local.rpg-scribe.gui"
 LAUNCH_AGENT_LABEL = "local.rpg-scribe.dictate"
+# Common name of the self-signed certificate setup.sh creates in the login
+# keychain; make-app.sh signs with it so permission grants survive rebuilds.
+SIGNING_IDENTITY = f"{APP_NAME} Code Signing"
 LOG_PATH = Path.home() / "Library/Logs" / f"{APP_NAME}.log"
 # The C launcher appends this to $HOME at runtime.
 LOG_PATH_SUFFIX = f"/Library/Logs/{APP_NAME}.log"
 
-_SHELL_VARS = ("APP_NAME", "BUNDLE_ID", "LAUNCH_AGENT_LABEL", "LOG_PATH_SUFFIX")
+_SHELL_VARS = (
+    "APP_NAME",
+    "BUNDLE_ID",
+    "LAUNCH_AGENT_LABEL",
+    "LOG_PATH_SUFFIX",
+    "SIGNING_IDENTITY",
+)
 
 
 if __name__ == "__main__":

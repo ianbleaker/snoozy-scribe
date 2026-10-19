@@ -4,9 +4,10 @@
 # ~/Applications. Safe to rerun, e.g. after `git pull` or a Homebrew Python
 # upgrade. See README.md ("Install") and docs/development.md.
 #
-# The app is rebuilt only when it has to be (installed copy missing, venv
-# recreated, or --rebuild-app), because every rebuild changes the ad-hoc
-# signature and macOS then asks for the permissions again.
+# The app is signed with a self-signed certificate this script creates in the
+# login keychain, so permission grants survive rebuilds. It is rebuilt only
+# when it has to be: installed copy missing or ad-hoc signed while the
+# certificate exists, venv recreated, or --rebuild-app.
 set -eu
 
 usage() {
@@ -70,33 +71,102 @@ fi
 eval "$(.venv/bin/python -m rpg_scribe.identity --shell)"
 INSTALLED="$HOME/Applications/$APP_NAME.app"
 
-# 10-11. Build and install the app when needed.
-if [ ! -d "$INSTALLED" ] || [ "$VENV_RECREATED" = 1 ] || [ "$REBUILD" = 1 ]; then
+# 10. The code-signing certificate. macOS keys permission grants to the
+# signature's designated requirement: for a certificate-signed app that names
+# the certificate, so grants survive rebuilds; for an ad-hoc one it's the
+# build's code hash. Created once; never regenerated, since a new certificate
+# would lose the grants again. Without it make-app.sh signs ad-hoc.
+have_signing_identity() {
+    security find-identity -v -p codesigning 2>/dev/null | grep -qF "\"$SIGNING_IDENTITY\""
+}
+
+create_signing_identity() {
+    keychain="$HOME/Library/Keychains/login.keychain-db"
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    if security find-certificate -c "$SIGNING_IDENTITY" "$keychain" >/dev/null 2>&1; then
+        # Imported by an earlier run whose trust step didn't finish.
+        security find-certificate -c "$SIGNING_IDENTITY" -p "$keychain" >"$tmp/cert.pem" || return 1
+    else
+        echo "Creating the \"$SIGNING_IDENTITY\" certificate in your login keychain"
+        # Apple's LibreSSL: Homebrew's OpenSSL 3 writes .p12 files that
+        # `security import` can't read.
+        /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -subj "/CN=$SIGNING_IDENTITY" -keyout "$tmp/key.pem" -out "$tmp/cert.pem" \
+            -addext "basicConstraints=critical,CA:false" \
+            -addext "keyUsage=critical,digitalSignature" \
+            -addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1 || return 1
+        /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+            -out "$tmp/identity.p12" -passout pass:rpg-scribe || return 1
+        # -T lets codesign use the key without a keychain prompt.
+        security import "$tmp/identity.p12" -k "$keychain" -P rpg-scribe \
+            -T /usr/bin/codesign >/dev/null || return 1
+    fi
+    echo "Trusting it for code signing; macOS asks for your password once"
+    security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$tmp/cert.pem" || return 1
+    have_signing_identity
+}
+
+if have_signing_identity || create_signing_identity; then
+    HAVE_CERT=1
+else
+    HAVE_CERT=0
+    echo "warning: couldn't set up the \"$SIGNING_IDENTITY\" certificate; the app will be signed ad-hoc," >&2
+    echo "so every rebuild means granting its permissions again. See docs/development.md." >&2
+fi
+
+is_adhoc() {
+    codesign -dv "$1" 2>&1 | grep -q '^Signature=adhoc'
+}
+
+designated_requirement() {
+    codesign -d -r- "$1" 2>/dev/null | grep 'designated =>' || true
+}
+
+# 11-12. Build and install the app when needed.
+if [ ! -d "$INSTALLED" ] || [ "$VENV_RECREATED" = 1 ] || [ "$REBUILD" = 1 ] \
+    || { [ "$HAVE_CERT" = 1 ] && is_adhoc "$INSTALLED"; }; then
     if [ "$(osascript -e "application id \"$BUNDLE_ID\" is running" 2>/dev/null)" = true ]; then
         die "$APP_NAME is running. Quit $APP_NAME from its menu first, then rerun ./setup.sh."
     fi
+    OLD_DR=""
+    [ -d "$INSTALLED" ] && OLD_DR=$(designated_requirement "$INSTALLED")
     ./make-app.sh
     mkdir -p "$HOME/Applications"
     rm -rf "$INSTALLED"
     ditto "$APP_NAME.app" "$INSTALLED"
-    # Ad-hoc grants are keyed to the old build's code hash. Left in place they
-    # still show as switched on in System Settings but no longer apply, so
-    # clear them and let macOS ask again.
-    for service in Microphone ListenEvent Accessibility PostEvent; do
-        tccutil reset "$service" "$BUNDLE_ID" >/dev/null 2>&1 || true
-    done
+    # Grants made for a different designated requirement (an ad-hoc build's
+    # code hash, or the first switch to the certificate) still show as
+    # switched on in System Settings but no longer apply, so clear them and
+    # let macOS ask again. Certificate rebuilds keep the same requirement.
+    if [ "$OLD_DR" != "$(designated_requirement "$INSTALLED")" ] || is_adhoc "$INSTALLED"; then
+        GRANTS_RESET=1
+        for service in Microphone ListenEvent Accessibility PostEvent; do
+            tccutil reset "$service" "$BUNDLE_ID" >/dev/null 2>&1 || true
+        done
+    else
+        GRANTS_RESET=0
+    fi
     echo
     echo "Installed $INSTALLED"
-    echo "On first launch, grant $APP_NAME these permissions (System Settings > Privacy & Security):"
-    echo "  - Microphone, to record"
-    echo "  - Input Monitoring, for the global hotkeys"
-    echo "  - Accessibility, to paste and read the focused window title"
-    echo "Every rebuild changes the app's signature, so the old grants were cleared; grant them again."
+    if [ "$GRANTS_RESET" = 1 ]; then
+        echo "On first launch, grant $APP_NAME these permissions (System Settings > Privacy & Security):"
+        echo "  - Microphone, to record"
+        echo "  - Input Monitoring, for the global hotkeys"
+        echo "  - Accessibility, to paste and read the focused window title"
+        if is_adhoc "$INSTALLED"; then
+            echo "It's signed ad-hoc, so every rebuild clears these grants."
+        else
+            echo "It's signed with \"$SIGNING_IDENTITY\", so later rebuilds keep them."
+        fi
+    else
+        echo "Same signing certificate as before, so the permission grants carry over."
+    fi
 else
     echo "App up to date (pass --rebuild-app to rebuild)."
 fi
 
-# 12. A copy dragged to /Applications by the old install goes stale.
+# 13. A copy dragged to /Applications by the old install goes stale.
 if [ -d "/Applications/$APP_NAME.app" ]; then
     echo
     echo "warning: an old copy is at /Applications/$APP_NAME.app. Delete it and use $INSTALLED." >&2
@@ -105,6 +175,6 @@ if [ -d "/Applications/$APP_NAME.app" ]; then
     fi
 fi
 
-# 13.
+# 14.
 echo
 echo "Open $APP_NAME from Spotlight, or run: open -a \"$INSTALLED\""

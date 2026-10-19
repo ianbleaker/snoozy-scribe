@@ -49,17 +49,28 @@ EOF
 # The executable embeds Python rather than exec'ing .venv/bin/python, so
 # macOS credits permissions to the app and not to Python. See
 # rpg_scribe/launcher/rpg-scribe.c. It links the venv's base Python, so
-# rerun ./setup.sh after a Homebrew Python upgrade (and re-grant the
-# permissions afterwards, since the ad-hoc signature changes).
+# rerun ./setup.sh after a Homebrew Python upgrade.
 PY_CONFIG="$("$REPO_DIR/.venv/bin/python" -c 'import sys; print(sys._base_executable)')-config"
 # shellcheck disable=SC2046
 clang -o "$APP/Contents/MacOS/$APP_NAME" "$REPO_DIR/rpg_scribe/launcher/rpg-scribe.c" \
     $("$PY_CONFIG" --cflags) $("$PY_CONFIG" --ldflags --embed) \
     -DREPO_DIR="\"$REPO_DIR\"" -DLOG_PATH_SUFFIX="\"$LOG_PATH_SUFFIX\""
 
-# Ad-hoc sign so macOS can attach Microphone, Input Monitoring and
-# Accessibility permissions to a stable identity.
-codesign --force --deep -s - "$APP"
+# macOS keys Microphone, Input Monitoring and Accessibility grants to the
+# signature's designated requirement. Signed with setup.sh's self-signed
+# certificate, that names the certificate, so grants survive rebuilds. An
+# ad-hoc signature names the build's code hash instead, so every rebuild
+# loses them. Sign by SHA-1 so a duplicate certificate can't make the name
+# ambiguous.
+CERT_HASH=$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep -F "\"$SIGNING_IDENTITY\"" | head -n 1 | awk '{print $2}')
+if [ -n "$CERT_HASH" ]; then
+    codesign --force --deep -s "$CERT_HASH" "$APP"
+    echo "Signed with \"$SIGNING_IDENTITY\""
+else
+    codesign --force --deep -s - "$APP"
+    echo "Signed ad-hoc (no \"$SIGNING_IDENTITY\" certificate; ./setup.sh creates one)"
+fi
 
 echo "Built $APP"
 echo "Run ./setup.sh to install it to ~/Applications, or drag it there to launch $APP_NAME with a click. It runs in the menu bar."
