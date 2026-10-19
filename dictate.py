@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""rpg-scribe menu-bar dictation app.
+
+Hold the hotkey, speak, release: the clip is transcribed with mlx-whisper,
+cleaned up by a small mlx-lm model, and pasted into the frontmost app. See
+README.md ("Using it") and docs/design/dictation.md.
+
+Threads: rumps owns the main thread. The hotkey tap runs on its own thread
+and only enqueues events. A control thread opens and closes the mic. One
+worker thread runs all MLX work (warm-up, Whisper, cleanup) so it's
+serialized. UI changes from other threads go through `callAfter`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import plistlib
+import queue
+import subprocess
+import sys
+import threading
+from collections import deque
+from pathlib import Path
+
+import rumps
+from PyObjCTools.AppHelper import callAfter
+
+from rpg_scribe import identity, paths
+from rpg_scribe.config import check_legacy_layout, load_config
+from rpg_scribe.dictation.context import context_line, frontmost_context
+from rpg_scribe.dictation.clipboard import copy_selection, paste_text, secure_input_active, set_clipboard_text
+from rpg_scribe.dictation.hotkeys import HotkeyTap, parse_chord
+from rpg_scribe.dictation.recorder import SAMPLE_RATE, Recorder
+from rpg_scribe.dictation.vocab_state import BASE_PATH, VocabState, get_active_campaign, set_active_campaign
+from rpg_scribe.vocabulary import VocabularyParseError, add_term, apply_vocabulary, campaign_path, list_campaigns
+
+log = logging.getLogger("dictate")
+
+DEFAULT_HOLD_KEY = "right_option"
+DEFAULT_TOGGLE_HOTKEY = "ctrl+option+d"
+LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{identity.LAUNCH_AGENT_LABEL}.plist"
+APP_BUNDLE_ID = identity.BUNDLE_ID
+# Shown in messages, with ~ for the home folder.
+LOG_PATH_DISPLAY = f"~/{identity.LOG_PATH.relative_to(Path.home())}"
+
+TITLES = {"loading": "✎…", "ready": "✎", "recording": "●", "transcribing": "✎⋯"}
+STATUS_LABELS = {
+    "loading": "Loading models…",
+    "ready": "Ready",
+    "recording": "Recording…",
+    "transcribing": "Transcribing…",
+}
+
+
+# Set by the app when the overlay is on: messages go to the overlay as a toast.
+_toast = None
+# Set by init_notifications() when the overlay is off and this is the .app.
+_center = None
+# Held strongly here: the notification center only keeps a weak reference.
+_center_delegate = None
+
+
+def init_notifications() -> None:
+    """Send messages to Notification Center, asking permission on first run.
+
+    rumps.notification (the deprecated NSUserNotificationCenter) is never shown
+    for this app. Only rpg-scribe.app uses UNUserNotificationCenter: a terminal
+    run is Homebrew's Python.app, which would ask permission as "Python", so it
+    keeps the rumps fallback.
+    """
+    global _center, _center_delegate
+    import AppKit
+
+    if AppKit.NSBundle.mainBundle().bundleIdentifier() != APP_BUNDLE_ID:
+        log.info("not running as %s.app; Notification Center messages are off", identity.APP_NAME)
+        return
+    import UserNotifications as UN
+
+    class _Delegate(AppKit.NSObject):
+        # Without this, banners are dropped while the app is frontmost, which
+        # it is right after an "Add term…" or "Fix last dictation…" dialog.
+        def userNotificationCenter_willPresentNotification_withCompletionHandler_(self, _c, _n, handler):
+            handler(UN.UNNotificationPresentationOptionBanner | UN.UNNotificationPresentationOptionList)
+
+    def authorized(granted, error):
+        # Called off the main thread; logging only.
+        log.info("notification authorization: granted=%s error=%s", bool(granted), error)
+
+    center = UN.UNUserNotificationCenter.currentNotificationCenter()
+    _center_delegate = _Delegate.alloc().init()
+    center.setDelegate_(_center_delegate)
+    center.requestAuthorizationWithOptions_completionHandler_(
+        UN.UNAuthorizationOptionAlert | UN.UNAuthorizationOptionSound, authorized
+    )
+    _center = center
+
+
+def _post_notification(title: str, message: str) -> None:
+    import uuid
+
+    import UserNotifications as UN
+
+    content = UN.UNMutableNotificationContent.alloc().init()
+    content.setTitle_(title)
+    content.setBody_(message)
+    request = UN.UNNotificationRequest.requestWithIdentifier_content_trigger_(str(uuid.uuid4()), content, None)
+
+    def done(error):
+        if error is not None:
+            log.warning("notification not shown: %s", error)
+
+    _center.addNotificationRequest_withCompletionHandler_(request, done)
+
+
+def notify(message: str, title: str = identity.APP_NAME) -> None:
+    """Show a short message. Main thread only."""
+    log.info("notify: %s", message)
+    if _toast is not None:
+        _toast(message)
+        return
+    try:
+        if _center is not None:
+            _post_notification(title, message)
+        else:
+            rumps.notification(title, "", message)
+    except Exception:
+        log.exception("notification failed")
+
+
+def app_bundle_path() -> Path:
+    """The running .app, or the repo's rpg-scribe.app when run from a terminal."""
+    import AppKit
+
+    bundle = Path(AppKit.NSBundle.mainBundle().bundlePath())
+    return bundle if bundle.suffix == ".app" else paths.REPO_DIR / f"{identity.APP_NAME}.app"
+
+
+class DictateApp(rumps.App):
+    def __init__(self, config: dict) -> None:
+        super().__init__(identity.APP_NAME, title=TITLES["loading"], quit_button="Quit")
+        self._config = config
+        dictation = config.get("dictation") or {}
+        self._recorder = Recorder()
+        self._vocab = VocabState(notify=lambda m: callAfter(notify, m))
+        self._ready = False
+        self._app_context = bool(dictation.get("app_context", True))
+        self._context: dict | None = None
+        # Newest first: dicts with raw, clean, used_fallback. Memory only.
+        self._history: deque[dict] = deque(maxlen=int(dictation.get("history_size", 20)))
+        self._history_serial = 0
+        # Control thread only: None, "hold" or "toggle".
+        self._mode: str | None = None
+        self._campaigns: list[str] | None = None
+
+        self._status_item = rumps.MenuItem(STATUS_LABELS["loading"])
+        self._campaign_menu = rumps.MenuItem("Campaign")
+        self._history_menu = rumps.MenuItem("History")
+        self._login_item = rumps.MenuItem("Launch at login", callback=self._toggle_login)
+        self._login_item.state = LAUNCH_AGENT_PATH.exists()
+        self.menu = [
+            self._status_item,
+            None,
+            self._campaign_menu,
+            self._history_menu,
+            None,
+            rumps.MenuItem("Fix last dictation…", callback=self._fix_last),
+            rumps.MenuItem("Add term…", callback=lambda _s: self._add_term_dialog("")),
+            # After the menu closes, so ⌘C reaches the app with the selection.
+            rumps.MenuItem("Add selected text", callback=lambda _s: self._after_menu(self._add_selection)),
+            None,
+            rumps.MenuItem("Transcribe session…", callback=self._open_gui),
+            rumps.MenuItem("Open settings folder", callback=self._open_settings),
+            self._login_item,
+            None,
+        ]
+        self._refresh_campaigns()
+        self._rebuild_history()
+        self._overlay = None
+        if dictation.get("overlay", True):
+            from rpg_scribe.dictation.overlay import Overlay
+
+            self._overlay = Overlay(level=lambda: self._recorder.level)
+            global _toast
+            _toast = self._overlay.show_message
+        else:
+            init_notifications()
+        # Picks up campaign files added or removed while running.
+        self._campaign_timer = rumps.Timer(lambda _t: self._refresh_campaigns(), 5)
+        self._campaign_timer.start()
+
+        chords = {
+            parse_chord(dictation.get("toggle_hotkey", DEFAULT_TOGGLE_HOTKEY)): lambda: self._control.put(
+                ("toggle", None)
+            ),
+        }
+        if dictation.get("add_selection_hotkey"):
+            chords[parse_chord(dictation["add_selection_hotkey"])] = lambda: callAfter(self._add_selection)
+
+        # Hotkey events -> control thread (mic); clips -> worker thread (MLX).
+        self._control: queue.Queue = queue.Queue()
+        self._clips: queue.Queue = queue.Queue()
+        threading.Thread(target=self._control_loop, name="dictate-control", daemon=True).start()
+        threading.Thread(target=self._worker_loop, name="dictate-worker", daemon=True).start()
+        self._tap = HotkeyTap(
+            dictation.get("hotkey", DEFAULT_HOLD_KEY),
+            on_hold_start=lambda: self._control.put(("start", None)),
+            on_hold_end=lambda valid: self._control.put(("stop", valid)),
+            chords=chords,
+        )
+        self._tap.start()
+
+    # --- UI (main thread) --------------------------------------------------
+
+    def _set_status(self, status: str) -> None:
+        self.title = TITLES[status]
+        self._status_item.title = STATUS_LABELS[status]
+        if self._overlay is not None:
+            if status == "recording":
+                self._overlay.show_recording()
+            elif status == "transcribing":
+                self._overlay.show_transcribing()
+            else:
+                self._overlay.hide_status()
+
+    def _refresh_campaigns(self) -> None:
+        campaigns = list_campaigns()
+        active = get_active_campaign()
+        if campaigns != self._campaigns:
+            if self._campaigns is not None:
+                self._campaign_menu.clear()
+            self._campaigns = campaigns
+            self._campaign_menu.add(rumps.MenuItem("Off", callback=self._choose_campaign))
+            for name in campaigns:
+                self._campaign_menu.add(rumps.MenuItem(name, callback=self._choose_campaign))
+        for item in self._campaign_menu.values():
+            item.state = item.title == (active or "Off")
+
+    def _choose_campaign(self, sender) -> None:
+        set_active_campaign(None if sender.title == "Off" else sender.title)
+        self._refresh_campaigns()
+
+    def _add_history(self, raw: str, clean: str, used_fallback: bool) -> None:
+        self._history.appendleft({"raw": raw, "clean": clean, "used_fallback": used_fallback})
+        self._rebuild_history()
+
+    def _rebuild_history(self) -> None:
+        # Before the first add the item has no submenu to clear.
+        if self._history_serial or self._history_menu.get("(empty)") is not None:
+            self._history_menu.clear()
+        if not self._history:
+            self._history_menu.add(rumps.MenuItem("(empty)"))
+            return
+        for entry in self._history:
+            label = entry["clean"] if len(entry["clean"]) <= 40 else entry["clean"][:40] + "…"
+            item = rumps.MenuItem(label)
+            item.add(rumps.MenuItem("Copy cleaned", callback=lambda _s, t=entry["clean"]: set_clipboard_text(t)))
+            item.add(rumps.MenuItem("Copy raw", callback=lambda _s, t=entry["raw"]: set_clipboard_text(t)))
+            if entry["used_fallback"]:
+                item.add(rumps.MenuItem("(fallback used)"))
+            # Keys must be unique; identical labels would otherwise collide.
+            self._history_serial += 1
+            self._history_menu[f"history-{self._history_serial}"] = item
+
+    # --- vocabulary capture (main thread) -------------------------------------
+
+    def _after_menu(self, action) -> None:
+        def fire(timer) -> None:
+            timer.stop()
+            action()
+
+        self._one_shot = rumps.Timer(fire, 0.2)
+        self._one_shot.start()
+
+    def _ask(self, title: str, message: str, default: str = "") -> tuple[str, Path] | None:
+        """Ask for text and a target file ("Base" or the active campaign)."""
+        import AppKit
+
+        campaign = get_active_campaign()
+        window = rumps.Window(
+            message=message, title=title, default_text=default, ok="Base", cancel="Cancel", dimensions=(320, 24)
+        )
+        if campaign:
+            window.add_button(campaign)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+        response = window.run()
+        if response.clicked == 0:
+            return None
+        if not response.text.strip():
+            notify("Nothing entered, so no changes were made.")
+            return None
+        target = BASE_PATH if response.clicked == 1 else campaign_path(campaign)
+        return response.text.strip(), target
+
+    def _write_term(self, target: Path, term: str, variants: list[str]) -> bool:
+        try:
+            add_term(target, term, variants)
+        except (ValueError, VocabularyParseError) as e:
+            rumps.alert(title="Couldn't add term", message=str(e))
+            return False
+        notify(f"Added {term} to {target.name}")
+        return True
+
+    def _fix_last(self, _sender) -> None:
+        if not self._history:
+            notify("Nothing dictated yet.")
+            return
+        last = self._history[0]
+        answer = self._ask(
+            "Fix last dictation",
+            f"Last dictation:\n{last['clean']}\n\nType the correction as  wrong -> right",
+        )
+        if answer is None:
+            return
+        text, target = answer
+        if "->" not in text:
+            rumps.alert(title="Couldn't add term", message="Expected  wrong -> right")
+            return
+        wrong, right = (part.strip() for part in text.split("->", 1))
+        if self._write_term(target, right, [wrong]):
+            self._clips.put(("fix", last["raw"], None))
+
+    def _add_term_dialog(self, default: str) -> None:
+        answer = self._ask("Add term", "Term, or  Term | misheard1, misheard2", default)
+        if answer is None:
+            return
+        text, target = answer
+        term, _, variants = text.partition("|")
+        self._write_term(target, term.strip(), [v.strip() for v in variants.split(",") if v.strip()])
+
+    def _add_selection(self) -> None:
+        selection = copy_selection()
+        if not selection or not selection.strip():
+            notify("No text selected.")
+            return
+        self._add_term_dialog(" ".join(selection.split()))
+
+    def _open_gui(self, _sender) -> None:
+        subprocess.Popen([sys.executable, str(paths.REPO_DIR / "gui.py")], cwd=paths.REPO_DIR)
+
+    def _open_settings(self, _sender) -> None:
+        subprocess.run(["open", str(paths.SETTINGS_DIR)], check=False)
+
+    def _toggle_login(self, sender) -> None:
+        if LAUNCH_AGENT_PATH.exists():
+            LAUNCH_AGENT_PATH.unlink()
+            sender.state = False
+            return
+        # Launched through LaunchServices like a Finder double-click, so the
+        # permissions granted to the bundle still apply.
+        LAUNCH_AGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LAUNCH_AGENT_PATH.open("wb") as f:
+            plistlib.dump(
+                {
+                    "Label": identity.LAUNCH_AGENT_LABEL,
+                    "ProgramArguments": ["/usr/bin/open", "-a", str(app_bundle_path())],
+                    "RunAtLoad": True,
+                },
+                f,
+            )
+        sender.state = True
+
+    # --- control thread: mic on/off ----------------------------------------
+
+    def _control_loop(self) -> None:
+        while True:
+            kind, valid = self._control.get()
+            try:
+                if kind == "start":
+                    # Pressing the hold key during a toggle recording does nothing.
+                    if self._ready and self._mode is None:
+                        self._start_recording()
+                        self._mode = "hold"
+                        callAfter(self._set_status, "recording")
+                elif kind == "stop":
+                    if self._mode == "hold":
+                        self._mode = None
+                        self._finish_recording(valid)
+                    elif self._mode is None and valid and not self._ready:
+                        callAfter(notify, "Models are still loading. Try again in a moment.")
+                elif kind == "toggle":
+                    if not self._ready:
+                        callAfter(notify, "Models are still loading. Try again in a moment.")
+                    elif self._mode == "toggle":
+                        self._mode = None
+                        self._finish_recording(True)
+                    else:
+                        # The chord can arrive mid-hold when it uses the hold key
+                        # (ctrl + right Option + d). Restart as a toggle recording.
+                        if self._mode == "hold":
+                            self._recorder.stop()
+                        self._start_recording()
+                        self._mode = "toggle"
+                        callAfter(self._set_status, "recording")
+            except Exception:
+                log.exception("recording %s failed", kind)
+                self._mode = None
+                callAfter(notify, f"Recording failed; see {LOG_PATH_DISPLAY}.")
+                callAfter(self._set_status, "ready")
+
+    def _start_recording(self) -> None:
+        self._recorder.start()
+        self._context = frontmost_context() if self._app_context else None
+
+    def _finish_recording(self, valid: bool) -> None:
+        audio = self._recorder.stop()
+        if not valid:
+            log.info("hold cancelled; discarded %.1fs", len(audio) / SAMPLE_RATE)
+            callAfter(self._set_status, "ready")
+            return
+        callAfter(self._set_status, "transcribing")
+        self._clips.put(("clip", audio, self._context))
+
+    # --- worker thread: all MLX work ---------------------------------------
+
+    def _worker_loop(self) -> None:
+        from rpg_scribe.dictation import pipeline
+
+        try:
+            self._settings = pipeline.load_settings(self._config)
+            pipeline.warm_up(self._settings)
+            self._cleaner = load_cleaner(self._config)
+            if self._cleaner is not None:
+                self._cleaner.warm_up()
+        except Exception:
+            log.exception("model loading failed")
+            callAfter(notify, f"Couldn't load the models; see {LOG_PATH_DISPLAY}.")
+            return
+        log.info("models ready")
+        self._ready = True
+        callAfter(self._set_status, "ready")
+
+        while True:
+            kind, payload, context = self._clips.get()
+            try:
+                if kind == "fix":
+                    self._refix(payload)
+                else:
+                    self._process(payload, context)
+            except Exception:
+                log.exception("dictation failed")
+                callAfter(notify, f"Dictation failed; see {LOG_PATH_DISPLAY}.")
+            finally:
+                if not self._recorder.recording:
+                    callAfter(self._set_status, "ready")
+
+    def _refix(self, raw: str) -> None:
+        """Re-apply the (just updated) vocabulary and cleanup to an earlier raw text."""
+        from rpg_scribe.dictation import pipeline
+
+        vocab = self._vocab.current_vocab()
+        raw = apply_vocabulary(raw, pipeline.merged_vocab(vocab))
+        clean = raw
+        if self._cleaner is not None and raw:
+            clean, _ = self._cleaner.clean(raw, list(pipeline.merged_vocab(vocab)))
+        set_clipboard_text(clean)
+        callAfter(notify, "Corrected text copied")
+
+    def _process(self, audio, context: dict | None) -> None:
+        from rpg_scribe.dictation import pipeline
+
+        vocab = self._vocab.current_vocab()
+        raw = pipeline.transcribe_clip(audio, vocab, self._settings)
+        clean, used_fallback = raw, False
+        if self._cleaner is not None and raw:
+            clean, used_fallback = self._cleaner.clean(
+                raw, list(pipeline.merged_vocab(vocab)), context_line(context)
+            )
+        log.info("dictated %.1fs into %s, fallback=%s", len(audio) / SAMPLE_RATE, context, used_fallback)
+        if not clean:
+            return
+        callAfter(self._add_history, raw, clean, used_fallback)
+        if secure_input_active():
+            set_clipboard_text(clean)
+            callAfter(notify, "Couldn't paste into a secure field. The text is on the clipboard.")
+            return
+        paste_text(clean)
+
+
+def run_once(wav_path: str) -> None:
+    """Run the dictation pipeline on a file with no UI, for testing."""
+    import numpy as np
+    from mlx_whisper.audio import load_audio
+
+    from rpg_scribe.dictation import pipeline
+
+    config = load_config(paths.DEFAULT_CONFIG_PATH)
+    settings = pipeline.load_settings(config)
+    vocab = VocabState(notify=print).current_vocab()
+    audio = np.array(load_audio(wav_path), dtype=np.float32)
+    raw = pipeline.transcribe_clip(audio, vocab, settings)
+    print(f"RAW: {raw}")
+    cleaner = load_cleaner(config)
+    if cleaner is not None:
+        clean, used_fallback = cleaner.clean(raw, list(pipeline.merged_vocab(vocab)))
+        print(f"CLEAN: {clean}" + ("  (fallback used)" if used_fallback else ""))
+
+
+def load_cleaner(config: dict):
+    """The cleanup model, or None when `dictation.cleanup` is false."""
+    from rpg_scribe.dictation.cleanup import DEFAULT_CLEANUP_MODEL, Cleaner
+    from rpg_scribe.models import resolve_model_path
+
+    dictation = config.get("dictation") or {}
+    if not dictation.get("cleanup", True):
+        return None
+    model_dir = paths.resolve(config.get("model_dir", "./data/models"))
+    return Cleaner(resolve_model_path(dictation.get("cleanup_model", DEFAULT_CLEANUP_MODEL), model_dir))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=f"{identity.APP_NAME} menu-bar dictation app.")
+    parser.add_argument("--once", metavar="WAV", help="Transcribe WAV with no UI and print the result")
+    parser.add_argument(
+        "--print-context", action="store_true", help="Wait 3 s, then print the frontmost app and window"
+    )
+    args = parser.parse_args()
+    if args.print_context:
+        import time
+
+        time.sleep(3)
+        print(frontmost_context())
+        return
+    if args.once:
+        run_once(args.once)
+        return
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+    legacy = check_legacy_layout()
+    try:
+        if legacy:
+            raise SystemExit("\n".join(legacy))
+        config = load_config(paths.DEFAULT_CONFIG_PATH)
+        app = DictateApp(config)
+    except (SystemExit, ValueError) as e:
+        # ValueError: a bad dictation.hotkey / toggle_hotkey string.
+        log.error("%s", e)
+        rumps.alert(title=f"{identity.APP_NAME} can't start", message=str(e))
+        sys.exit(1)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

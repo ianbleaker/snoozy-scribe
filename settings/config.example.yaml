@@ -1,5 +1,8 @@
-# Copy this file to config.yaml and fill in real values. config.yaml is
-# gitignored and never pushed to GitHub.
+# Copy this file to settings/config.yaml and fill in real values.
+# settings/config.yaml is gitignored and never pushed to GitHub.
+#
+# Relative paths in this file resolve against the repo root, not the current
+# directory.
 
 # mlx-whisper model repo (Hugging Face). Larger/non-quantized models are
 # slower but more accurate. Can be overridden per-run with
@@ -11,8 +14,8 @@ whisper_model: mlx-community/whisper-large-v3-turbo
 
 # Local directory model weights are downloaded into (and read from). Created
 # automatically on first run if missing. Gitignored — weights are large and
-# environment-specific. Defaults to ./models if omitted.
-model_dir: ./models
+# environment-specific. Defaults to ./data/models if omitted.
+model_dir: ./data/models
 
 # Maps Craig's Discord usernames (discriminator stripped, e.g. "alice42#0"
 # becomes "alice42") to the name that should appear in the transcript.
@@ -22,11 +25,13 @@ speaker_map:
   alice42: Alice
   someplayer: Some Player
 
-# Path to a vocabulary.md file (campaign terms, post-fix corrections, and
-# Whisper prompt seeding). Optional — if omitted, ./vocabulary.md is used
-# when it exists. Overridable per-run with `transcribe.py --vocabulary <path>`.
-# See vocabulary.example.md for the file format.
-vocabulary_file: ./vocabulary.md
+# Active campaign: transcribe.py uses settings/vocabulary/<campaign>.md
+# (campaign terms, post-fix corrections, and Whisper prompt seeding). Any
+# *.md in settings/vocabulary/ except base.md and *.example.md is a campaign.
+# Optional — if omitted, no vocabulary is used. Overridable per-run with
+# `transcribe.py --campaign <name>` or `--vocabulary <path>`. See
+# settings/vocabulary/campaign.example.md for the file format.
+campaign: my-campaign
 
 # Whisper language code (e.g. "en") to force for every track, instead of
 # auto-detecting per track. Auto-detection only samples the first VAD speech
@@ -108,8 +113,8 @@ show_bleed_markers: false
 save_gui_log: true
 
 # Directory the transcript Markdown files are written to. Defaults to
-# ./transcripts if omitted.
-output_dir: ./transcripts
+# ./data/transcripts if omitted.
+output_dir: ./data/transcripts
 
 # Each full run deletes cached per-track segments (<output_dir>/.partial/<slug>/)
 # that no run has used for this many days, never the current session's. 0
@@ -118,8 +123,9 @@ output_dir: ./transcripts
 partial_max_age_days: 30
 
 # Directory to drop Craig .zip exports into for automatic pickup. Processed
-# zips are moved into a `processed/` subfolder here.
-input_dir: ./input
+# zips are moved into a `processed/` subfolder here. Defaults to
+# ./data/input if omitted.
+input_dir: ./data/input
 
 # Minimum pause (in milliseconds) that splits speech into separate regions
 # before transcription. Too low fragments speech on tiny pauses/breaths,
@@ -177,3 +183,40 @@ timestamp_mode: "elapsed"
 # output styling, e.g. bold speaker names with "**{speaker}**". Defaults to
 # "[{timestamp}] {speaker}: {text}" if omitted.
 line_format: "[{timestamp}] {speaker}: {text}"
+
+# Menu-bar dictation (dictate.py). Every key is optional; the values below
+# are the defaults. See README.md ("Config").
+dictation:
+  # Hold-to-talk key: right_option, right_command, right_control or fn. A
+  # hold counts only if it lasts 200 ms with no other key pressed, so ⌥←/⌥→
+  # and Option-typed characters never trigger it.
+  hotkey: right_option
+  # Press once to start recording, again to stop. Format mod+mod+key, mods
+  # ctrl, option, cmd, shift; key a single letter or space. Swallowed, so it
+  # never types into the app.
+  toggle_hotkey: ctrl+option+d
+  # Optional hotkey (same format) for "Add selected text". Unset by default.
+  # add_selection_hotkey: ctrl+option+v
+  # Whether to run the cleanup model after Whisper. false pastes the
+  # regex-cleaned transcript as-is.
+  cleanup: true
+  # Small mlx-lm instruct model that fixes punctuation, false starts and
+  # self-corrections ("X, no, Y" -> Y) after Whisper. Downloaded into
+  # model_dir. Qwen3-4B-Instruct-2507 took ~0.47 s per sentence on an M-series
+  # Mac and was the only one tested (vs Qwen3-1.7B, Llama-3.2-3B) that
+  # applied self-corrections without answering dictated questions.
+  cleanup_model: mlx-community/Qwen3-4B-Instruct-2507-4bit
+  # Filler words stripped wherever they appear (whole words, any case).
+  # Separate from filler_words above, which only drops a line that is
+  # nothing but fillers: "so" or "you" would wreck sentences if removed inline.
+  inline_fillers: [um, uh, er, erm, ah, hmm, mm]
+  # Tell the cleanup model which app and window you're dictating into, so it
+  # can match that setting's conventions. Only the app name and window title
+  # are used.
+  app_context: true
+  # Floating "Recording / Transcribing" pill with a level meter, also used
+  # for confirmations like "Added X to mycampaign.md". When false, those go
+  # to Notification Center instead (macOS asks for permission on launch).
+  overlay: true
+  # How many recent dictations the History menu keeps (in memory only).
+  history_size: 20

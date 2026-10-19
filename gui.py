@@ -2,7 +2,8 @@
 
 Runs transcribe.py as a subprocess with `--progress-events`, streaming its
 stdout into a log pane and its `@@PROGRESS@@` JSON events into a progress
-bar. Exposes only a subset of the CLI's flags; see README.md.
+bar. Exposes only a subset of the CLI's flags; see
+docs/session-transcription.md.
 """
 
 from __future__ import annotations
@@ -22,7 +23,10 @@ from pathlib import Path
 import customtkinter as ctk
 import yaml
 
-REPO_DIR = Path(__file__).resolve().parent
+from rpg_scribe import identity, paths
+from rpg_scribe.config import check_legacy_layout
+
+REPO_DIR = paths.REPO_DIR
 PROGRESS_EVENT_PREFIX = "@@PROGRESS@@ "
 # Tail of the child's stderr kept for a failure dump; tqdm redraws land
 # there too, so an uncapped buffer would grow for the whole run.
@@ -40,7 +44,7 @@ PHASE_LABELS = {"vad": "Analyzing speech", "transcribe": "Transcribing"}
 
 
 def _load_config() -> dict:
-    config_path = REPO_DIR / "config.yaml"
+    config_path = paths.DEFAULT_CONFIG_PATH
     try:
         config = yaml.safe_load(config_path.read_text())
     except (OSError, yaml.YAMLError):
@@ -51,11 +55,12 @@ def _load_config() -> dict:
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("rpg-scribe")
+        self.title(identity.APP_NAME)
         self.geometry(f"{WINDOW_WIDTH}x720")
 
         config = _load_config()
-        self._input_dir = REPO_DIR / config.get("input_dir", "./input")
+        self._input_dir = paths.resolve(config.get("input_dir", "./data/input"))
+        self._legacy_layout = check_legacy_layout()
         model_repos = [repo for _, repo in MODELS]
         default_model = config.get("whisper_model")
 
@@ -185,6 +190,8 @@ class App(ctk.CTk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._set_idle()
+        for line in self._legacy_layout:
+            self._log_append(line, "error")
 
     # --- form state -------------------------------------------------------
 
@@ -206,6 +213,9 @@ class App(ctk.CTk):
             *self.model_radios,
         ):
             widget.configure(state=state)
+        if self._legacy_layout:
+            # transcribe.py would exit with the same instructions.
+            self.start_button.configure(state="disabled")
 
     def _set_idle(self) -> None:
         self._set_form_enabled(True)
@@ -284,8 +294,8 @@ class App(ctk.CTk):
         self._set_running()
         # stdin=DEVNULL keeps transcribe.py's _CancelWatcher off (it only arms
         # on a TTY stdin); otherwise launching gui.py from a terminal would put
-        # that terminal into cbreak mode. cwd=REPO_DIR because config.yaml,
-        # vocabulary.md and input_dir all resolve relative to it.
+        # that terminal into cbreak mode. Config paths resolve against the
+        # repo root on their own; cwd=REPO_DIR covers relative argv paths.
         self._proc = subprocess.Popen(
             self._build_argv(),
             cwd=REPO_DIR,

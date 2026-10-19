@@ -1,9 +1,9 @@
 # Direct dependencies. requirements.lock pins the full resolved set; regenerate
-# it with the lock-regeneration steps in README.md after editing this.
+# it with the lock-regeneration steps in docs/development.md after editing this.
 
 # <0.5: transcribe.py relies on internals (tqdm shim, HOP_LENGTH, LANGUAGES).
 # mlx-whisper declares torch, but only its model-conversion script uses it, so
-# the lock is installed with --no-deps (see README).
+# the lock is installed with --no-deps (see docs/development.md).
 mlx-whisper>=0.4.3,<0.5.0
 mlx>=0.32,<1.0
 # Runs the vendored Silero VAD model (silero_onnx.py).
@@ -13,3 +13,19 @@ tqdm>=4.66,<5.0
 huggingface_hub>=1.0,<2.0
 PyYAML>=6.0,<7.0
 customtkinter==6.0.0
+# Dictation (dictate.py)
+# Cleanup model for dictated text, in-process on the same MLX stack as
+# mlx-whisper. 0.32.x is the first line that accepts mlx 0.32.2.
+mlx-lm>=0.32.2,<0.33
+# Menu-bar app shell.
+rumps>=0.4,<0.5
+# Global hotkey event tap and synthesized Cmd+V/Cmd+C.
+pyobjc-framework-Quartz>=11.0
+# NSPasteboard, NSWorkspace, NSPanel overlay.
+pyobjc-framework-Cocoa>=11.0
+# Accessibility API for the focused window title.
+pyobjc-framework-ApplicationServices>=11.0
+# Notification Center banners when the overlay is off.
+pyobjc-framework-UserNotifications>=11.0
+# Microphone capture.
+sounddevice>=0.5,<0.6

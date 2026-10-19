@@ -29,12 +29,27 @@ from pathlib import Path
 import mlx.core as mx
 import mlx_whisper
 import numpy as np
-import silero_onnx
 import tqdm
 import yaml
-from huggingface_hub import snapshot_download
 from mlx_whisper.audio import HOP_LENGTH
 from mlx_whisper.tokenizer import LANGUAGES
+
+from rpg_scribe import identity, paths, silero_onnx
+from rpg_scribe.config import check_legacy_layout, load_config
+from rpg_scribe.models import resolve_model_path
+from rpg_scribe.text_filters import (
+    DEFAULT_HALLUCINATION_PHRASES,
+    compile_hallucination_patterns,
+    strip_hallucination_phrases,
+)
+from rpg_scribe.vocabulary import (
+    VocabularyParseError,
+    apply_vocabulary,
+    build_initial_prompt,
+    campaign_path,
+    list_campaigns,
+    parse_vocabulary,
+)
 
 VAD_SAMPLE_RATE = 16000
 
@@ -67,18 +82,6 @@ COMPRESSION_RATIO_THRESHOLD = 2.4
 # even though the model had no real signal for them — see
 # docs/design/transcription-pipeline.md.
 LOGPROB_THRESHOLD = -1.0
-
-# Stock phrases Whisper emits from its training data on near-silent or noisy
-# audio, removed as case-insensitive substrings from each segment before
-# merging. Kept narrow on purpose: only phrases nobody says at a game table
-# (so not "See you next time!" — that belongs in `filler_words`). The
-# `hallucination_phrases` config key replaces this list rather than extending
-# it — see docs/design/transcription-pipeline.md.
-DEFAULT_HALLUCINATION_PHRASES = [
-    r"Subtitles by the Amara\.org community",
-    r"Thanks? (you )?for watching[.!]?",
-    r"www\.\S+",
-]
 
 _vad_model = None
 
@@ -387,22 +390,6 @@ def match_tracks(craig_folder: Path, usernames: list[str]) -> dict[str, Path]:
             print(f"!! warning: no audio file found for {username}, skipping")
 
     return matched
-
-
-def resolve_model_path(
-    model_repo: str, model_dir: Path, on_download: Callable[[], None] | None = None
-) -> Path:
-    """Resolve (downloading if needed) the local directory for a model repo.
-
-    `on_download` is called just before a download starts, so callers can
-    announce it.
-    """
-    target_dir = model_dir / model_repo.split("/")[-1]
-    if not target_dir.exists() or not any(target_dir.iterdir()):
-        if on_download is not None:
-            on_download()
-        snapshot_download(repo_id=model_repo, local_dir=str(target_dir))
-    return target_dir
 
 
 def find_default_zip(input_dir: Path) -> Path | None:
@@ -768,143 +755,6 @@ def transcribe_track(
                 for segment in region_segments
             )
     return segments, language
-
-
-class VocabularyParseError(Exception):
-    """Raised for a structural or content error in a vocabulary.md file."""
-
-
-_VARIANT_ARROW = re.compile(r"\s*(?:→|->)\s*")
-
-
-def parse_vocabulary(path: Path) -> dict[str, dict]:
-    """Parse a `vocabulary.md` file into `{term: {misheard_as, fields}}`.
-
-    `misheard_as` is a list of `(variant, replacement)` pairs. A variant
-    written `variant -> replacement` (or `→`) maps to that spoken form;
-    a bare variant maps to the term name itself.
-
-    See README.md ("Vocabulary") for the format.
-    """
-    vocabulary: dict[str, dict] = {}
-    current_term: str | None = None
-
-    for lineno, raw_line in enumerate(path.read_text().splitlines(), start=1):
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("### "):
-            name = line[len("### "):].strip()
-            if name in vocabulary:
-                raise VocabularyParseError(
-                    f"{path}:{lineno}: duplicate term '{name}'"
-                )
-            vocabulary[name] = {"misheard_as": [], "fields": {}}
-            current_term = name
-            continue
-        if line.startswith("# ") or line.startswith("## "):
-            continue
-        if line.startswith("- "):
-            if current_term is None:
-                raise VocabularyParseError(
-                    f"{path}:{lineno}: bullet found outside any term section: {raw_line!r}"
-                )
-            body = line[len("- "):]
-            if ":" not in body:
-                raise VocabularyParseError(
-                    f"{path}:{lineno}: malformed bullet (expected 'Label: value'): {raw_line!r}"
-                )
-            label, value = body.split(":", 1)
-            label = label.strip()
-            value = value.strip()
-            if label.lower() == "misheard as":
-                pairs = []
-                for item in value.split(","):
-                    item = item.strip()
-                    if not item:
-                        continue
-                    parts = [p.strip() for p in _VARIANT_ARROW.split(item, maxsplit=1)]
-                    if len(parts) == 2 and not all(parts):
-                        raise VocabularyParseError(
-                            f"{path}:{lineno}: malformed variant (expected "
-                            f"'variant -> replacement'): {item!r}"
-                        )
-                    pairs.append((parts[0], parts[1] if len(parts) == 2 else current_term))
-                vocabulary[current_term]["misheard_as"] = pairs
-            elif value:
-                vocabulary[current_term]["fields"][label] = value
-            continue
-        raise VocabularyParseError(f"{path}:{lineno}: malformed line: {raw_line!r}")
-
-    return vocabulary
-
-
-_SENTENCE_START = re.compile(r"^\s*$|[.!?]\s*$")
-
-
-def apply_vocabulary(text: str, vocabulary: dict) -> str:
-    """Case-insensitively replace known `misheard_as` variants with their replacements.
-
-    Capitalizes only the replacement's first letter, regardless of its own
-    casing, when the match starts `text` or follows `.`/`!`/`?` plus
-    whitespace; otherwise uses the replacement's exact casing.
-
-    All variants are matched in a single longest-first pass, so a
-    replacement is never re-scanned (no "sky-sky-ward"). Replacement forms
-    are also matched (and left untouched), so a short variant like "Ward"
-    can't fire inside an already-correct "sky-ward". Matches are anchored to word
-    boundaries so a variant like "Oste" doesn't fire inside "hosted".
-    """
-    replacements: dict[str, str] = {}
-    for data in vocabulary.values():
-        for variant, replacement in data["misheard_as"]:
-            replacements.setdefault(variant.lower(), replacement)
-    if not replacements:
-        return text
-    # Already-correct forms map to None: matched (to shield them) but left as-is.
-    targets: dict[str, str | None] = dict(replacements)
-    for replacement in replacements.values():
-        targets.setdefault(replacement.lower(), None)
-
-    alternation = "|".join(
-        re.escape(v) for v in sorted(targets, key=len, reverse=True)
-    )
-    pattern = re.compile(r"\b(?:" + alternation + r")\b", re.IGNORECASE)
-
-    def _replace(match: re.Match) -> str:
-        replacement = targets[match.group(0).lower()]
-        if replacement is None:
-            return match.group(0)
-        if _SENTENCE_START.search(text[: match.start()]):
-            return replacement[:1].upper() + replacement[1:]
-        return replacement
-
-    return pattern.sub(_replace, text)
-
-
-def build_initial_prompt(vocabulary: dict, enrich_fields: set[str] | None) -> str:
-    """Build Whisper's `initial_prompt` from vocabulary term names.
-
-    `enrich_fields is None` -> bare term names only. `enrich_fields == set()`
-    -> append every field found per term ("all"). Non-empty `enrich_fields`
-    -> append only fields whose label case-insensitively matches an entry.
-    """
-    parts = []
-    for term, data in vocabulary.items():
-        fields = data["fields"]
-        if enrich_fields is None or not fields:
-            parts.append(term)
-            continue
-        if enrich_fields:
-            wanted_lower = {f.lower() for f in enrich_fields}
-            values = [v for label, v in fields.items() if label.lower() in wanted_lower]
-        else:
-            values = list(fields.values())
-        if values:
-            parts.append(f"{term} ({'; '.join(values)})")
-        else:
-            parts.append(term)
-    return ", ".join(parts)
 
 
 def resolve_speaker(username: str, speaker_map: dict[str, str], warned: set[str]) -> str:
@@ -1421,13 +1271,8 @@ def merge_tracks(
             stats["segments_total"] += 1
             stripped = text.strip()
             if hallucination_patterns:
-                cleaned = stripped
-                hits = 0
-                for pattern in hallucination_patterns:
-                    cleaned, count = pattern.subn("", cleaned)
-                    hits += count
+                cleaned, hits = strip_hallucination_phrases(stripped, hallucination_patterns)
                 if hits:
-                    cleaned = re.sub(r"\s+", " ", cleaned).strip()
                     stats["hallucination_stripped"] += 1
                     if _normalize(cleaned) == "":
                         continue
@@ -1611,9 +1456,14 @@ def main() -> None:
     mx.random.seed(0)
 
     print(_rule())
-    print("rpg-scribe".center(len(_rule())))
+    print(identity.APP_NAME.center(len(_rule())))
     print(_rule())
     print()
+
+    legacy = check_legacy_layout()
+    if legacy:
+        print(*legacy, sep="\n")
+        sys.exit(1)
 
     parser = argparse.ArgumentParser(
         description="Transcribe a Craig-recorded Discord TTRPG session into Markdown."
@@ -1627,7 +1477,10 @@ def main() -> None:
         "*.zip in input_dir is picked up automatically.",
     )
     parser.add_argument(
-        "--config", type=Path, default=Path("config.yaml"), help="Path to config.yaml"
+        "--config",
+        type=Path,
+        default=paths.DEFAULT_CONFIG_PATH,
+        help="Path to config.yaml (default: settings/config.yaml)",
     )
     parser.add_argument("--model", help="Override the configured whisper_model")
     parser.add_argument(
@@ -1678,8 +1531,14 @@ def main() -> None:
         "--vocabulary",
         type=Path,
         default=None,
-        help="Path to vocabulary.md. Overrides the config `vocabulary_file` key "
-        "and the default ./vocabulary.md lookup.",
+        help="Path to a vocabulary file. Overrides --campaign and the config "
+        "`campaign` key.",
+    )
+    parser.add_argument(
+        "--campaign",
+        default=None,
+        help="Use settings/vocabulary/<CAMPAIGN>.md as the vocabulary. "
+        "Overrides the config `campaign` key.",
     )
     parser.add_argument(
         "--enrich-vocabulary",
@@ -1848,24 +1707,11 @@ def main() -> None:
     global _saves_partials
     _saves_partials = not windowed
 
-    if not args.config.exists():
-        sys.exit(
-            f"error: config file not found at {args.config}. "
-            "Run `cp config.example.yaml config.yaml` and fill in your values."
-        )
-    try:
-        config = yaml.safe_load(args.config.read_text())
-    except yaml.YAMLError as e:
-        sys.exit(f"error: {args.config} is not valid YAML: {e}")
-    if not isinstance(config, dict):
-        sys.exit(
-            f"error: {args.config} must be a mapping of config keys. "
-            "Copy config.example.yaml to see the expected layout."
-        )
+    config = load_config(args.config)
     if config.get("speaker_map") is not None and not isinstance(config["speaker_map"], dict):
         sys.exit(f"error: speaker_map in {args.config} must be a mapping of Discord name to speaker name")
     if args.prune_cache is not None:
-        prune_root = Path(config.get("output_dir", "./transcripts"))
+        prune_root = paths.resolve(config.get("output_dir", "./data/transcripts"))
         removed = prune_partials(prune_root, args.prune_cache)
         for slug in removed:
             print(f"  removed {prune_root / '.partial' / slug}")
@@ -1893,12 +1739,12 @@ def main() -> None:
         else config.get("logprob_threshold", LOGPROB_THRESHOLD)
     )
     best_of = args.best_of if args.best_of is not None else config.get("best_of")
-    input_dir = Path(config.get("input_dir", "./input"))
-    output_dir = Path(config.get("output_dir", "./transcripts"))
+    input_dir = paths.resolve(config.get("input_dir", "./data/input"))
+    output_dir = paths.resolve(config.get("output_dir", "./data/transcripts"))
     partial_max_age_days = _config_number(config, "partial_max_age_days", 30)
     if partial_max_age_days < 0:
         sys.exit(f"error: config `partial_max_age_days` must be 0 or more, got {partial_max_age_days!r}")
-    model_dir = Path(config.get("model_dir", "./models"))
+    model_dir = paths.resolve(config.get("model_dir", "./data/models"))
     speaker_map = config.get("speaker_map") or {}
     vad_min_silence_ms = _config_number(config, "vad_min_silence_ms", 800)
     vad_min_speech_ms = _config_number(config, "vad_min_speech_ms", 250)
@@ -1911,12 +1757,10 @@ def main() -> None:
         isinstance(phrase, str) for phrase in hallucination_phrases
     ):
         sys.exit(f"error: config `hallucination_phrases` must be a list of strings, got {hallucination_phrases!r}")
-    hallucination_patterns = []
-    for phrase in hallucination_phrases:
-        try:
-            hallucination_patterns.append(re.compile(phrase, re.IGNORECASE))
-        except re.error as err:
-            sys.exit(f"error: hallucination_phrases entry {phrase!r} is not a valid regex: {err}")
+    try:
+        hallucination_patterns = compile_hallucination_patterns(hallucination_phrases)
+    except ValueError as err:
+        sys.exit(f"error: {err}")
     show_inaudible_placeholders = (
         args.show_inaudible
         if args.show_inaudible is not None
@@ -1942,13 +1786,17 @@ def main() -> None:
     if args.elapsed_timestamps is not None:
         timestamp_mode = "elapsed" if args.elapsed_timestamps else "clock"
 
-    default_vocab_path = Path("./vocabulary.md")
+    campaign = args.campaign or config.get("campaign")
     if args.vocabulary is not None:
         vocabulary_path = args.vocabulary
-    elif config.get("vocabulary_file") and Path(config["vocabulary_file"]).exists():
-        vocabulary_path = Path(config["vocabulary_file"])
-    elif default_vocab_path.exists():
-        vocabulary_path = default_vocab_path
+    elif campaign:
+        vocabulary_path = campaign_path(campaign)
+        if not vocabulary_path.exists():
+            available = ", ".join(list_campaigns()) or "none"
+            sys.exit(
+                f"error: no vocabulary file for campaign '{campaign}' at {vocabulary_path}. "
+                f"Available campaigns: {available}"
+            )
     else:
         vocabulary_path = None
 

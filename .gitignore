@@ -1,10 +1,17 @@
 .DS_Store
 docs/craig-test-files/
-config.yaml
-vocabulary.md
 .venv/
 __pycache__/
-models/
-input/
-transcripts/
 rpg-scribe.app/
+
+settings/config.yaml
+settings/vocabulary/*.md
+!settings/vocabulary/*.example.md
+data/
+
+# legacy layout — keep so un-migrated files are never committed
+/config.yaml
+/vocabulary.md
+/models/
+/input/
+/transcripts/
