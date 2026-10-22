@@ -3,7 +3,7 @@
 The tap sees modifier changes (the hold-to-talk key) and key-downs (hold
 cancellation and the toggle chord). It's active rather than listen-only so
 the toggle chord can be swallowed before it types a character. An active tap
-needs Accessibility. Input Monitoring covers reading keys.
+needs Accessibility, which also covers reading keys, so no Input Monitoring.
 
 Handlers are called on the tap thread and must return quickly. macOS
 disables a tap whose callback stalls, so hand real work off to another thread.
@@ -16,7 +16,6 @@ import threading
 import time
 from collections.abc import Callable
 
-import ApplicationServices
 import Quartz
 
 log = logging.getLogger(__name__)
@@ -94,6 +93,8 @@ class HotkeyTap:
         self._tap = None
         self._held_since: float | None = None
         self._interrupted = False
+        # True once the tap exists, i.e. the Accessibility grant took effect.
+        self.active = False
 
     def start(self) -> None:
         threading.Thread(target=self._run, name="hotkey-tap", daemon=True).start()
@@ -102,7 +103,7 @@ class HotkeyTap:
         mask = Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged) | Quartz.CGEventMaskBit(
             Quartz.kCGEventKeyDown
         )
-        prompted = False
+        warned = False
         while True:
             self._tap = Quartz.CGEventTapCreate(
                 Quartz.kCGSessionEventTap,
@@ -114,16 +115,12 @@ class HotkeyTap:
             )
             if self._tap is not None:
                 break
-            if not prompted:
-                # Show the system prompts once. The tap is retried until both
-                # permissions are granted, so no relaunch is needed.
-                log.warning("event tap refused; grant Input Monitoring and Accessibility")
-                Quartz.CGRequestListenEventAccess()
-                ApplicationServices.AXIsProcessTrustedWithOptions(
-                    {ApplicationServices.kAXTrustedCheckOptionPrompt: True}
-                )
-                prompted = True
+            if not warned:
+                # Prompting is the permissions window's job; retry silently.
+                log.warning("event tap refused; waiting for Accessibility")
+                warned = True
             time.sleep(2)
+        self.active = True
         log.info("event tap active")
         source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
         Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes)

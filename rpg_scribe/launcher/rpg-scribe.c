@@ -4,7 +4,7 @@
  *
  * A shell launcher that execs .venv/bin/python doesn't work. Homebrew's
  * framework Python re-execs into its own Python.app, so macOS credits
- * Microphone, Input Monitoring and Accessibility to "python3.14" instead of
+ * Microphone and Accessibility to "python3.14" instead of
  * rpg-scribe (plan #50, item 10). Embedding keeps the bundle's executable
  * as the process that asks for them.
  *

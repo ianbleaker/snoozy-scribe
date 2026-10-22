@@ -56,7 +56,7 @@ clang -o "$APP/Contents/MacOS/$APP_NAME" "$REPO_DIR/rpg_scribe/launcher/rpg-scri
     $("$PY_CONFIG" --cflags) $("$PY_CONFIG" --ldflags --embed) \
     -DREPO_DIR="\"$REPO_DIR\"" -DLOG_PATH_SUFFIX="\"$LOG_PATH_SUFFIX\""
 
-# macOS keys Microphone, Input Monitoring and Accessibility grants to the
+# macOS keys the Microphone and Accessibility grants to the
 # signature's designated requirement. Signed with setup.sh's self-signed
 # certificate, that names the certificate, so grants survive rebuilds. An
 # ad-hoc signature names the build's code hash instead, so every rebuild

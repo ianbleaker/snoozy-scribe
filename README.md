@@ -34,21 +34,21 @@ time (after `git pull`, say); it only rebuilds the app when it has to. Pass
 
 ## Permissions
 
-On first launch, grant rpg-scribe these permissions when asked (System
-Settings → Privacy & Security):
+rpg-scribe needs two permissions (System Settings → Privacy & Security):
 
 - **Microphone**, to record.
-- **Input Monitoring**, for the global hotkeys.
-- **Accessibility**, to paste (synthesized ⌘V) and read the focused window
-  title.
+- **Accessibility**, for the global hotkeys, to paste (synthesized ⌘V) and
+  to read the focused window title. Input Monitoring isn't needed.
 
-Input Monitoring and Accessibility are asked for at launch; Microphone is
-asked for on your first dictation, so that one records nothing.
+A permissions window opens at launch whenever one is missing (it's also in
+the ✎ menu under "Permissions…"). Each row has a button that shows the
+macOS prompt, or opens the right Settings pane once you've been asked, and
+turns into a ✓ when granted. If a grant only takes effect after a restart,
+a Relaunch button appears.
 
 The app is signed with that certificate, so the grants survive rebuilds.
 If the certificate couldn't be created, the app is signed ad-hoc instead,
-and you have to grant the permissions again after every rebuild. If the
-hotkey does nothing after granting, quit from the ✎ menu and reopen.
+and you have to grant the permissions again after every rebuild.
 
 ## Using it
 
@@ -85,6 +85,7 @@ focused field is a password field, the text is left on the clipboard instead.
 - **Add selected text**: copies the selection from the frontmost app and
   opens Add term with it.
 - **Transcribe session…** opens the session GUI. **Open settings folder**.
+  **Permissions…** opens the permissions window.
   **Launch at login** adds a LaunchAgent that opens the app at login.
 
 ## Config

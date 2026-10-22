@@ -150,10 +150,9 @@ if [ ! -d "$INSTALLED" ] || [ "$VENV_RECREATED" = 1 ] || [ "$REBUILD" = 1 ] \
     echo
     echo "Installed $INSTALLED"
     if [ "$GRANTS_RESET" = 1 ]; then
-        echo "On first launch, grant $APP_NAME these permissions (System Settings > Privacy & Security):"
+        echo "On first launch, $APP_NAME opens a permissions window. Grant:"
         echo "  - Microphone, to record"
-        echo "  - Input Monitoring, for the global hotkeys"
-        echo "  - Accessibility, to paste and read the focused window title"
+        echo "  - Accessibility, for the global hotkeys, pasting and the focused window title"
         if is_adhoc "$INSTALLED"; then
             echo "It's signed ad-hoc, so every rebuild clears these grants."
         else

@@ -31,6 +31,7 @@ from rpg_scribe.config import check_legacy_layout, load_config
 from rpg_scribe.dictation.context import context_line, frontmost_context
 from rpg_scribe.dictation.clipboard import copy_selection, paste_text, secure_input_active, set_clipboard_text
 from rpg_scribe.dictation.hotkeys import HotkeyTap, parse_chord
+from rpg_scribe.dictation.permissions import PermissionsWindow, all_granted, running_as_bundle
 from rpg_scribe.dictation.recorder import SAMPLE_RATE, Recorder
 from rpg_scribe.dictation.vocab_state import BASE_PATH, VocabState, get_active_campaign, set_active_campaign
 from rpg_scribe.vocabulary import VocabularyParseError, add_term, apply_vocabulary, campaign_path, list_campaigns
@@ -171,6 +172,7 @@ class DictateApp(rumps.App):
             None,
             rumps.MenuItem("Transcribe session…", callback=self._open_gui),
             rumps.MenuItem("Open settings folder", callback=self._open_settings),
+            rumps.MenuItem("Permissions…", callback=lambda _s: self._permissions.show()),
             self._login_item,
             None,
         ]
@@ -209,6 +211,11 @@ class DictateApp(rumps.App):
             chords=chords,
         )
         self._tap.start()
+        self._permissions = PermissionsWindow(tap_active=lambda: self._tap.active, can_relaunch=running_as_bundle())
+        # Terminal runs skip this: their grants belong to Python, not the app.
+        if running_as_bundle() and not all_granted():
+            # NSApp isn't running until app.run(), so show on the first tick.
+            self._after_menu(self._permissions.show)
 
     # --- UI (main thread) --------------------------------------------------
 
