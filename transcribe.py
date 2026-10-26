@@ -1201,11 +1201,11 @@ def merge_tracks(
     Every segment's text is then passed through `collapse_repetition()`
     ahead of flagging and merging, regardless of its compression ratio — a
     repetition-hallucination loop can be diluted below the ratio threshold
-    if it's only part of a longer segment. A segment collapse_repetition()
-    actually changes is flagged too, using the collapsed text, since a
-    changed segment means a real hallucination loop was caught: unedited
-    repeated-word walls made the exact case compression_ratio_threshold is
-    meant to catch unreadable even after flagging.
+    if it's only part of a longer segment. The collapsed text is what gets
+    flagged/merged downstream, but a collapse alone doesn't flag the
+    segment: genuine speech (emphatic "no, no, no...", onomatopoeia,
+    laughter) repeats past the run threshold with clean ratio/logprob, while
+    a real loop also trips one of the two checks above.
 
     A flagged segment (either way) is exempt from filler-word dropping, and
     is never merged with a neighbor in either direction — it's always
@@ -1288,10 +1288,12 @@ def merge_tracks(
             if repetition_collapsed:
                 stats["repetition_collapsed"] += 1
             stripped = collapsed_text
+            # A collapse alone doesn't flag: a real loop also trips the ratio or
+            # logprob check, and genuine speech ("no, no, no...", onomatopoeia,
+            # laughter) can repeat past REPETITION_MIN_REPEATS with clean scores.
             flagged = (
                 compression_ratio > compression_ratio_threshold
                 or avg_logprob < logprob_threshold
-                or repetition_collapsed
                 or looks_garbled(stripped)
             )
             normalized = _normalize(stripped)
