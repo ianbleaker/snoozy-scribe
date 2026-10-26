@@ -978,17 +978,25 @@ def _script_of(char: str) -> str | None:
 
 
 def looks_garbled(text: str) -> bool:
-    """Return True if `text` contains a Unicode replacement character, or a
-    mix of two or more unrelated non-Latin scripts (e.g. Cyrillic and CJK in
-    the same line) — both signal a wrong-language/garbled decode that
+    """Return True if `text` contains a Unicode replacement character, a mix
+    of two or more unrelated non-Latin scripts (e.g. Cyrillic and CJK in the
+    same line), or a single word mixing Latin letters with a non-Latin
+    script ("abra제") — all signal a wrong-language/garbled decode that
     compression_ratio and avg_logprob can miss, since a short, varied
     hallucinated line doesn't always compress poorly or read as
-    low-confidence to Whisper itself.
+    low-confidence to Whisper itself. A real name or loanword in another
+    script stands as its own word, so one non-Latin script alongside Latin
+    words is still allowed.
     """
     if _REPLACEMENT_CHAR in text:
         return True
     scripts = {script for script in (_script_of(char) for char in text) if script is not None}
-    return len(scripts) > 1
+    if len(scripts) > 1:
+        return True
+    return bool(scripts) and any(
+        any(_script_of(char) for char in word) and any(char.isascii() and char.isalpha() for char in word)
+        for word in text.split()
+    )
 
 
 # Speaker/text of the single line a multi-speaker laughter run collapses to;
@@ -1245,7 +1253,8 @@ def merge_tracks(
     ratio and log-probability are only meaningful relative to the thresholds
     that drove its own retries. A segment is also flagged, regardless of
     either threshold, when `looks_garbled()` finds a Unicode replacement
-    character or a mix of unrelated non-Latin scripts — both catch
+    character, a mix of unrelated non-Latin scripts, or a word mixing Latin
+    with a non-Latin script — all catch
     wrong-language decodes that stay short/varied enough to read as
     high-confidence to mlx_whisper itself.
 
