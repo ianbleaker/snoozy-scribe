@@ -781,6 +781,19 @@ def _normalize(text: str) -> str:
     return _TRAILING_PUNCTUATION.sub("", text.lower())
 
 
+_NON_PHRASE_CHARS = re.compile(r"[^a-z0-9'\- ]")
+
+
+def _normalize_phrase(text: str) -> str:
+    """Normalize `text` for `backchannel_phrases` matching: lowercase, keep
+    only letters/digits/apostrophes/hyphens/spaces, collapse whitespace, then
+    collapse immediately repeated words ("Yeah, yeah, yeah." -> "yeah").
+    """
+    words = _NON_PHRASE_CHARS.sub("", " ".join(text.lower().split())).split()
+    deduped = [word for index, word in enumerate(words) if index == 0 or word != words[index - 1]]
+    return " ".join(deduped)
+
+
 # Genuine emphasis ("no no no") repeats a handful of times at most; a
 # repetition-hallucination loop runs for dozens or hundreds of words (see
 # docs/analysis/best-of-decoding-analysis.md and
@@ -978,6 +991,44 @@ def looks_garbled(text: str) -> bool:
     return len(scripts) > 1
 
 
+# Speaker/text of the single line a multi-speaker laughter run collapses to;
+# keeps the `[ts] Speaker: text` grammar downstream parsers rely on.
+LAUGHTER_SPEAKER = "Table"
+LAUGHTER_MARKER = "[laughter]"
+
+# `backchannel_phrases` default: whole-line reactions that add nothing when
+# said over another speaker (see merge_tracks()).
+DEFAULT_BACKCHANNEL_PHRASES = [
+    "yeah", "yep", "yup", "yes", "okay", "ok", "alright", "all right", "right", "nice", "cool",
+    "sure", "wow", "ooh", "oh", "oh yeah", "oh okay", "oh nice", "oh wow", "oh no", "oh my god",
+    "hell yeah", "uh-huh", "mm-hmm", "mhm", "true", "gotcha", "got it", "damn",
+]
+
+_LAUGH_ANNOTATION = re.compile(
+    r"^[(\[*]?\s*(?:laugh(?:s|ing|ter)?|chuckles?|giggles?)\s*[)\]*]?[.!]*$", re.IGNORECASE
+)
+_LAUGH_WORD = re.compile(r"^(?:a?h+[ae]+)+h*$")
+_LAUGH_ABBREVIATIONS = {"lol", "lmao", "lmfao"}
+_NON_LETTERS = re.compile(r"[^a-z]")
+
+
+def is_laughter(text: str) -> bool:
+    """Return True if `text` is laughter and nothing else: a laugh annotation
+    ("(laughs)", "[Laughter]", "*chuckles*") or a line whose every word is a
+    laugh ("Ha ha ha.", "hehehehe", "lol"). Matched by pattern rather than
+    via `filler_words`, so `merge_tracks()` can find multi-speaker laughter
+    runs before anything drops them.
+    """
+    stripped = text.strip()
+    if _LAUGH_ANNOTATION.match(stripped):
+        return True
+    words = [_NON_LETTERS.sub("", word) for word in stripped.lower().split()]
+    words = [word for word in words if word]
+    if not words:
+        return False
+    return all(_LAUGH_WORD.match(word) or word in _LAUGH_ABBREVIATIONS for word in words)
+
+
 # 10ms envelope frames per second, see ENVELOPE_FRAME_SAMPLES.
 _ENVELOPE_FRAMES_PER_SECOND = 100
 # A pair's span is widened to at least this long so the level/correlation
@@ -1156,8 +1207,15 @@ def merge_tracks(
     include_inaudible_placeholders: bool = False,
     hallucination_patterns: list[re.Pattern] | None = None,
     shared_spans: dict[str, list[tuple[float, float, str]]] | None = None,
+    backchannel_phrases: list[str] | None = None,
+    collapse_laughter: bool = True,
+    laughter_run_gap_seconds: float = 5.0,
 ) -> tuple[
-    list[tuple[datetime, str, str]], list[tuple[datetime, str, str]], dict[str, int], set[str]
+    list[tuple[datetime, str, str]],
+    list[tuple[datetime, str, str]],
+    dict[str, int],
+    set[str],
+    list[tuple[datetime, str, str]],
 ]:
     """Interleave per-track segments into one chronological transcript.
 
@@ -1240,24 +1298,65 @@ def merge_tracks(
     attributed to one player by hand. Every label used is returned in
     `shared_labels`, so the caller can skip `speaker_map` for it.
 
+    An unflagged segment whose `_normalize_phrase()` text is in
+    `backchannel_phrases` ("yeah", "uh-huh", ...) is dropped as crosstalk
+    when its midpoint falls inside a segment on another track that is itself
+    real speech (not a backchannel or laughter), unless it ends in "?". A
+    backchannel nobody else is talking over is kept. An empty or None list
+    disables this rule.
+
+    With `collapse_laughter`, every unflagged `is_laughter()` segment is
+    pulled out of the per-track flow. Laughs from 2+ distinct tracks, each
+    starting within `laughter_run_gap_seconds` of the latest end so far, are
+    collapsed into one `LAUGHTER_SPEAKER: LAUGHTER_MARKER` line at the run's
+    first start (`LAUGHTER_SPEAKER` is returned in `shared_labels`); any other
+    laugh is dropped.
+
+    Every line removed by filler, crosstalk or laughter is returned in
+    `pruned_lines` (same shape as `merged`, text prefixed with `(filler)`,
+    `(crosstalk)`, `(laughter)` or `(laughter-run)`) for the caller to write
+    to a companion audit file. See docs/design/transcription-pipeline.md.
+
     Also returns a stats dict counting what was pruned along the way
     (`segments_total`, `empty_dropped`, `hallucination_stripped`,
-    `repetition_collapsed`, `filler_dropped`, `repeat_deduped`, `flagged_for_review`), for the
-    caller to report and to record in the transcript's frontmatter.
+    `repetition_collapsed`, `filler_dropped`, `crosstalk_dropped`,
+    `laughter_dropped`, `laughter_runs_collapsed`, `repeat_deduped`,
+    `flagged_for_review`), for the caller to report and to record in the
+    transcript's frontmatter.
     """
     merged: list[tuple[datetime, str, str]] = []
     flagged_lines: list[tuple[datetime, str, str]] = []
+    pruned_lines: list[tuple[datetime, str, str]] = []
     shared_labels: set[str] = set()
     normalized_filler_words = {_normalize(word) for word in filler_words}
+    normalized_backchannels = {_normalize_phrase(phrase) for phrase in backchannel_phrases or []}
+    normalized_backchannels.discard("")
     stats = {
         "segments_total": 0,
         "empty_dropped": 0,
         "hallucination_stripped": 0,
         "repetition_collapsed": 0,
         "filler_dropped": 0,
+        "crosstalk_dropped": 0,
+        "laughter_dropped": 0,
+        "laughter_runs_collapsed": 0,
         "repeat_deduped": 0,
         "flagged_for_review": 0,
     }
+
+    # Per-track spans of real speech that a backchannel on another track can
+    # be "said over". Taken before the same-speaker merge, which loses end times.
+    host_intervals: dict[str, list[tuple[float, float]]] = {}
+    if normalized_backchannels:
+        for username, segments in transcripts.items():
+            host_intervals[username] = [
+                (start, end)
+                for start, end, text, _, _ in segments
+                if _normalize_phrase(text) not in normalized_backchannels
+                and _normalize_phrase(text) != ""
+                and not is_laughter(text)
+            ]
+    laugh_segments: list[tuple[float, float, str, str]] = []
 
     for username, segments in transcripts.items():
         spans = (shared_spans or {}).get(username, [])
@@ -1296,9 +1395,30 @@ def merge_tracks(
                 or avg_logprob < logprob_threshold
                 or looks_garbled(stripped)
             )
+            if collapse_laughter and not flagged and is_laughter(stripped):
+                laugh_segments.append((start, end, username, stripped))
+                continue
+            if (
+                not flagged
+                and not stripped.endswith("?")
+                and _normalize_phrase(stripped) in normalized_backchannels
+            ):
+                midpoint = (start + end) / 2
+                if any(
+                    host_start <= midpoint <= host_end
+                    for other, intervals in host_intervals.items()
+                    if other != username
+                    for host_start, host_end in intervals
+                ):
+                    stats["crosstalk_dropped"] += 1
+                    timestamp = timestamp_base + timedelta(seconds=start)
+                    pruned_lines.append((timestamp, username, f"(crosstalk) {stripped}"))
+                    continue
             normalized = _normalize(stripped)
             if not flagged and normalized in normalized_filler_words:
                 stats["filler_dropped"] += 1
+                timestamp = timestamp_base + timedelta(seconds=start)
+                pruned_lines.append((timestamp, username, f"(filler) {stripped}"))
                 continue
             if normalized == previous_normalized and flagged == previous_flagged:
                 stats["repeat_deduped"] += 1
@@ -1341,9 +1461,33 @@ def merge_tracks(
             timestamp = timestamp_base + timedelta(seconds=buffer_start)
             merged.append((timestamp, username, buffer_text))
 
+    laugh_segments.sort(key=lambda entry: entry[0])
+    clusters: list[list[tuple[float, float, str, str]]] = []
+    cluster_end = 0.0
+    for laugh in laugh_segments:
+        if clusters and laugh[0] <= cluster_end + laughter_run_gap_seconds:
+            clusters[-1].append(laugh)
+            cluster_end = max(cluster_end, laugh[1])
+        else:
+            clusters.append([laugh])
+            cluster_end = laugh[1]
+    for cluster in clusters:
+        is_run = len({username for _, _, username, _ in cluster}) >= 2
+        if is_run:
+            merged.append(
+                (timestamp_base + timedelta(seconds=cluster[0][0]), LAUGHTER_SPEAKER, LAUGHTER_MARKER)
+            )
+            shared_labels.add(LAUGHTER_SPEAKER)
+            stats["laughter_runs_collapsed"] += 1
+        reason = "laughter-run" if is_run else "laughter"
+        for start, _, username, text in cluster:
+            stats["laughter_dropped"] += 1
+            pruned_lines.append((timestamp_base + timedelta(seconds=start), username, f"({reason}) {text}"))
+
     merged.sort(key=lambda entry: entry[0])
     flagged_lines.sort(key=lambda entry: entry[0])
-    return merged, flagged_lines, stats, shared_labels
+    pruned_lines.sort(key=lambda entry: entry[0])
+    return merged, flagged_lines, stats, shared_labels, pruned_lines
 
 
 def _format_lines(
@@ -1364,6 +1508,7 @@ def _format_lines(
 def write_transcript(
     merged: list[tuple[datetime, str, str]],
     flagged_lines: list[tuple[datetime, str, str]],
+    pruned_lines: list[tuple[datetime, str, str]],
     session_title: str,
     output_dir: Path,
     timestamp_format: str,
@@ -1394,6 +1539,10 @@ def write_transcript(
     frontmatter — a disposable side file, not a document. When empty, any
     stale `.errors.md` from a previous run of the same slug is removed.
 
+    `pruned_lines` (deliberate filler/crosstalk/laughter drops, see
+    `merge_tracks()`) goes to `<slug>{filename_suffix}.pruned.md` the same
+    way, kept apart from `.errors.md` so review-worthy lines aren't buried.
+
     `output_name`, if given, overrides the filename slug (via `--output-name`)
     without affecting `session_title`, which is still recorded as-is in the
     frontmatter `title` field.
@@ -1403,6 +1552,7 @@ def write_transcript(
     slug = _slugify(output_name) if output_name else _slugify(session_title)
     output_path = output_dir / f"{slug}{filename_suffix}.md"
     errors_path = output_dir / f"{slug}{filename_suffix}.errors.md"
+    pruned_path = output_dir / f"{slug}{filename_suffix}.pruned.md"
 
     speakers = list(dict.fromkeys(name for _, name, _ in merged))
     date = session_start.date().isoformat()
@@ -1420,6 +1570,12 @@ def write_transcript(
         errors_path.write_text("\n".join(error_lines) + "\n")
     elif errors_path.exists():
         errors_path.unlink()
+
+    if pruned_lines:
+        pruned_text_lines = _format_lines(pruned_lines, timestamp_format, line_format)
+        pruned_path.write_text("\n".join(pruned_text_lines) + "\n")
+    elif pruned_path.exists():
+        pruned_path.unlink()
 
     return output_path
 
@@ -1753,7 +1909,16 @@ def main() -> None:
     merge_gap_ms = _config_number(config, "merge_gap_ms", 2000)
     timestamp_format = config.get("timestamp_format", "%H:%M:%S")
     line_format = config.get("line_format", "[{timestamp}] {speaker}: {text}")
-    filler_words = config.get("filler_words", ["so", "you", "um", "uh", "hm", "hmm"])
+    filler_words = config.get(
+        "filler_words", ["so", "you", "um", "uh", "hm", "hmm", "mm", "ah", "eh", "er", "thank you"]
+    )
+    backchannel_phrases = config.get("backchannel_phrases", DEFAULT_BACKCHANNEL_PHRASES)
+    if not isinstance(backchannel_phrases, list) or not all(
+        isinstance(phrase, str) for phrase in backchannel_phrases
+    ):
+        sys.exit(f"error: config `backchannel_phrases` must be a list of strings, got {backchannel_phrases!r}")
+    collapse_laughter = bool(config.get("collapse_laughter", True))
+    laughter_run_gap_ms = _config_number(config, "laughter_run_gap_ms", 5000)
     hallucination_phrases = config.get("hallucination_phrases", DEFAULT_HALLUCINATION_PHRASES)
     if not isinstance(hallucination_phrases, list) or not all(
         isinstance(phrase, str) for phrase in hallucination_phrases
@@ -2155,7 +2320,7 @@ def main() -> None:
             args.verbose,
         )
         timestamp_base = _ELAPSED_TIMESTAMP_EPOCH if timestamp_mode == "elapsed" else session_start
-        merged, flagged_lines, merge_stats, shared_labels = merge_tracks(
+        merged, flagged_lines, merge_stats, shared_labels, pruned_lines = merge_tracks(
             timestamp_base,
             transcripts,
             merge_gap_ms / 1000,
@@ -2165,6 +2330,9 @@ def main() -> None:
             show_inaudible_placeholders,
             hallucination_patterns,
             shared_spans,
+            backchannel_phrases,
+            collapse_laughter,
+            laughter_run_gap_ms / 1000,
         )
         merge_stats.update(bleed_stats)
         print(f"  {merge_stats['segments_total']} segments")
@@ -2173,6 +2341,9 @@ def main() -> None:
         print(f"  {merge_stats['hallucination_stripped']} hallucination phrase(s) stripped")
         print(f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed")
         print(f"  {merge_stats['filler_dropped']} filler word(s) dropped")
+        print(f"  {merge_stats['crosstalk_dropped']} crosstalk backchannel(s) dropped")
+        print(f"  {merge_stats['laughter_dropped']} laugh line(s) dropped")
+        print(f"  {merge_stats['laughter_runs_collapsed']} laughter run(s) collapsed")
         print(f"  {merge_stats['repeat_deduped']} repeat(s) deduped")
         print(f"  {merge_stats['empty_dropped']} empty segment(s) dropped")
         print(f"  {merge_stats['flagged_for_review']} line(s) flagged for review")
@@ -2194,12 +2365,21 @@ def main() -> None:
             )
             for timestamp, speaker, text in flagged_lines
         ]
+        resolved_pruned = [
+            (
+                timestamp,
+                speaker if speaker in shared_labels else resolve_speaker(speaker, speaker_map, warned_speakers),
+                text,
+            )
+            for timestamp, speaker, text in pruned_lines
+        ]
         print()
 
         print("WRITING TRANSCRIPT...")
         output_path = write_transcript(
             resolved,
             resolved_flagged,
+            resolved_pruned,
             session_title,
             output_dir,
             timestamp_format,

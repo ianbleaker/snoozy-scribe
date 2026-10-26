@@ -153,8 +153,28 @@ merge_gap_ms: 2000
 # (case/trailing-punctuation-insensitive) — cut-off speech, coughs, or
 # laughs that Whisper mistranscribed as a bare word. Never strips a word out
 # of a longer real sentence, and never applies to a "!! "-flagged line.
-# Defaults to the list below if omitted.
-filler_words: ["so", "you", "um", "uh", "hm", "hmm"]
+# Defaults to the list below if omitted. Every dropped line is logged to
+# <slug>.pruned.md.
+filler_words: ["so", "you", "um", "uh", "hm", "hmm", "mm", "ah", "eh", "er", "thank you"]
+
+# Whole-line reactions dropped only when said over another speaker (the
+# line's midpoint falls inside someone else's real speech on another track).
+# A backchannel nobody is talking over ("Yeah." answering a question) is kept,
+# as is any line ending in "?". Matching ignores case and punctuation, and
+# repeated words count once ("Yeah, yeah, yeah." matches "yeah"). Setting
+# this replaces the defaults below; set [] to disable. Every drop is logged
+# to <slug>.pruned.md. Defaults to the list below if omitted.
+backchannel_phrases: ["yeah", "yep", "yup", "yes", "okay", "ok", "alright", "all right", "right", "nice", "cool", "sure", "wow", "ooh", "oh", "oh yeah", "oh okay", "oh nice", "oh wow", "oh no", "oh my god", "hell yeah", "uh-huh", "mm-hmm", "mhm", "true", "gotcha", "got it", "damn"]
+
+# Laugh-only lines ("Ha ha", "hehehe", "(laughs)", "lol") from 2+ players
+# close together collapse into one "Table: [laughter]" line; an isolated
+# laugh is dropped. Each removed laugh is logged to <slug>.pruned.md. Set
+# false to keep laugh lines as ordinary text. Defaults to true if omitted.
+collapse_laughter: true
+
+# Max silence (ms) between one laugh's start and the latest end so far in
+# the run for it to join that laughter run. Defaults to 5000 if omitted.
+laughter_run_gap_ms: 5000
 
 # Regexes (case-insensitive) for Whisper's stock silence hallucinations,
 # removed as substrings from every segment before same-speaker merging, so
