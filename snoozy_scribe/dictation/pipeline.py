@@ -18,7 +18,7 @@ from snoozy_scribe.text_filters import (
     strip_hallucination_phrases,
     strip_inline_fillers,
 )
-from snoozy_scribe.vocabulary import apply_vocabulary, build_initial_prompt
+from snoozy_scribe.vocabulary import apply_vocabulary, build_combined_prompt, merge_vocabularies
 
 # Shorter clips are accidental taps, not speech.
 MIN_CLIP_SECONDS = 0.3
@@ -78,21 +78,10 @@ def warm_up(settings: PipelineSettings) -> None:
     )
 
 
-def initial_prompt(vocab: dict) -> str:
-    """Base terms, then the campaign's. mlx-whisper keeps the *last* ~224
-    tokens of a long prompt, so the campaign terms go last."""
-    parts = [build_initial_prompt(vocab.get("base") or {}, None),
-             build_initial_prompt(vocab.get("campaign") or {}, None)]
-    return ", ".join(p for p in parts if p)
-
-
-def merged_vocab(vocab: dict) -> dict:
-    return {**(vocab.get("base") or {}), **(vocab.get("campaign") or {})}
-
-
-def transcribe_clip(audio: np.ndarray, vocab: dict, settings: PipelineSettings) -> str:
-    """Transcribe one dictated clip. `vocab` is `{"base": ..., "campaign": ...}`
-    parsed vocabularies. Returns `""` for a too-short or speechless clip."""
+def transcribe_clip(audio: np.ndarray, vocabs: list[dict], settings: PipelineSettings) -> str:
+    """Transcribe one dictated clip. `vocabs` is the selected parsed
+    vocabularies in alphabetical order, which drives both the prompt and the
+    merge. Returns `""` for a too-short or speechless clip."""
     audio = np.asarray(audio, dtype=np.float32)
     if len(audio) < MIN_CLIP_SECONDS * SAMPLE_RATE:
         return ""
@@ -104,10 +93,10 @@ def transcribe_clip(audio: np.ndarray, vocab: dict, settings: PipelineSettings) 
         path_or_hf_repo=str(settings.whisper_model_dir),
         verbose=None,
         language=settings.language,
-        initial_prompt=initial_prompt(vocab) or None,
+        initial_prompt=build_combined_prompt(vocabs, None) or None,
         condition_on_previous_text=False,
     )
     text = result["text"].strip()
     text, _ = strip_hallucination_phrases(text, settings.hallucination_patterns)
     text = strip_inline_fillers(text, settings.inline_fillers)
-    return apply_vocabulary(text, merged_vocab(vocab))
+    return apply_vocabulary(text, merge_vocabularies(vocabs))
