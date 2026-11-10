@@ -11,6 +11,7 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_DIR = REPO_DIR / "settings"
 VOCABULARY_DIR = SETTINGS_DIR / "vocabulary"
+PROMPTS_DIR = SETTINGS_DIR / "prompts"
 DATA_DIR = REPO_DIR / "data"
 DEFAULT_CONFIG_PATH = SETTINGS_DIR / "config.yaml"
 

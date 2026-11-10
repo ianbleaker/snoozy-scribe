@@ -240,3 +240,23 @@ dictation:
   overlay: true
   # How many recent dictations the History menu keeps (in memory only).
   history_size: 20
+
+# Local LLM cleanup pass over a finished transcript (clean_transcript.py).
+# Every key is optional; the values below are the defaults. The system prompt
+# lives in settings/prompts/transcript-cleanup.md. See
+# docs/session-transcription.md ("LLM cleanup").
+transcript_cleanup:
+  # mlx-lm instruct model, downloaded into model_dir. The same model as
+  # dictation's cleanup_model by default, so only one download is needed.
+  model: mlx-community/Qwen3-4B-Instruct-2507-4bit
+  # Transcript lines sent to the model per call, with no overlap or context
+  # lines between chunks.
+  chunk_lines: 30
+  # Minimum word similarity (0-1) between a line and its rewrite. A rewrite
+  # below it is discarded and the original kept, so the model can't drift
+  # from what the player said. Stricter than dictation's 0.5.
+  min_similarity: 0.8
+  # A DROP on a line with more words than this is refused and the line kept,
+  # so a substantive line can't silently vanish. A line ending in "?" is
+  # never dropped either.
+  max_drop_words: 6

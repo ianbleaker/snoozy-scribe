@@ -172,6 +172,7 @@ class DictateApp(rumps.App):
             None,
             rumps.MenuItem("Transcribe session…", callback=self._open_gui),
             rumps.MenuItem("Open settings folder", callback=self._open_settings),
+            rumps.MenuItem("Edit cleanup prompt…", callback=self._open_cleanup_prompt),
             rumps.MenuItem("Permissions…", callback=lambda _s: self._permissions.show()),
             self._login_item,
             None,
@@ -347,6 +348,9 @@ class DictateApp(rumps.App):
 
     def _open_settings(self, _sender) -> None:
         subprocess.run(["open", str(paths.SETTINGS_DIR)], check=False)
+
+    def _open_cleanup_prompt(self, _sender) -> None:
+        subprocess.run(["open", str(paths.PROMPTS_DIR / "dictation-cleanup.md")], check=False)
 
     def _toggle_login(self, sender) -> None:
         if LAUNCH_AGENT_PATH.exists():

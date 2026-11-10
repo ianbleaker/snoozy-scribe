@@ -85,6 +85,8 @@ focused field is a password field, the text is left on the clipboard instead.
 - **Add selected text**: copies the selection from the frontmost app and
   opens Add term with it.
 - **Transcribe session…** opens the session GUI. **Open settings folder**.
+  **Edit cleanup prompt…** opens `settings/prompts/dictation-cleanup.md`,
+  the cleanup model's instructions; edits apply on the next dictation.
   **Permissions…** opens the permissions window.
   **Launch at login** adds a LaunchAgent that opens the app at login.
 
@@ -96,6 +98,11 @@ All keys sit under `dictation:` in `settings/config.yaml` and are optional.
 `inline_fillers`, `app_context`, `overlay` and `history_size`. Dictation
 also uses the top-level `whisper_model`, `language`, `model_dir` and
 `hallucination_phrases`.
+
+The cleanup models' prompts are tracked files in `settings/prompts/`. The
+transcript cleanup pass (`clean_transcript.py`) reads its own optional
+`transcript_cleanup:` section; see
+[docs/session-transcription.md](docs/session-transcription.md#llm-cleanup).
 
 ## Vocabulary
 

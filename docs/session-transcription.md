@@ -77,6 +77,30 @@ Config keys:
 - `campaign` — the campaign whose vocabulary (`settings/vocabulary/<campaign>.md`) session transcription uses. Omit it to run without a vocabulary.
 
 
+## LLM cleanup
+
+```sh
+.venv/bin/python clean_transcript.py data/transcripts/<session-title>.md
+```
+
+An optional second pass over a finished transcript, using the same local model as dictation cleanup (no network calls once it's downloaded). For each line the model either drops it (content-free lines and false starts the speaker restarts) or lightly edits it: punctuation, capitalization, um/uh, stutters. It never rephrases. Per-line guards keep the original whenever a rewrite drifts or a long line would be dropped. Design: [transcription-pipeline.md](design/transcription-pipeline.md#llm-cleanup-pass-transcript_cleanuppy).
+
+It writes two files next to the input, overwriting any from an earlier run:
+
+- `<session-title>-cleaned.md` — the cleaned transcript. Its frontmatter adds `source`, an `llm_cleanup` block (model, settings and counts) and a caveat. This is the input `/analyze-narrative` expects.
+- `<session-title>-cleaned.changes.md` — every dropped line, and every rewrite as the original line followed by `→ <new line>`.
+
+A full session (about 2,000 lines) takes several minutes. `--config <path>` uses a config file other than `settings/config.yaml`.
+
+Config keys, all optional, under `transcript_cleanup:`:
+
+- `model` — mlx-lm instruct model. Defaults to dictation's default cleanup model.
+- `chunk_lines` — lines per model call. Defaults to `30`.
+- `min_similarity` — a rewrite less similar than this to the original is discarded. Defaults to `0.8`.
+- `max_drop_words` — a line with more words than this is never dropped. Defaults to `6`. A line ending in `?` is never dropped either.
+
+The prompt is `settings/prompts/transcript-cleanup.md`; edit it to tune what gets dropped or edited.
+
 ## GUI
 
 ```sh
