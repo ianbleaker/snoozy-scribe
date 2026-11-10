@@ -1,4 +1,4 @@
-"""Transcribe a Craig-recorded Discord TTRPG session into a Markdown file."""
+"""Transcribe audio (a Craig export, an audio file, or a folder of audio files) into Markdown."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ import unicodedata
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -37,7 +37,7 @@ from mlx_whisper.audio import HOP_LENGTH
 from mlx_whisper.tokenizer import LANGUAGES
 
 from snoozy_scribe import identity, paths, silero_onnx
-from snoozy_scribe.audio_input import AUDIO_EXTENSIONS
+from snoozy_scribe.audio_input import AUDIO_EXTENSIONS, InputError, InputKind, detect_input
 from snoozy_scribe.config import check_legacy_layout, load_config
 from snoozy_scribe.models import resolve_model_path
 from snoozy_scribe.text_filters import (
@@ -554,6 +554,38 @@ def _probe_duration(audio_path: Path) -> float:
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"failed to probe duration of {audio_path}: {e.stderr.decode()}") from e
     return float(out.decode().strip())
+
+
+def _probe_creation_time(audio_path: Path) -> datetime | None:
+    """Return the container's `creation_time` tag via `ffprobe`, if it has one."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format_tags=creation_time",
+        "-of", "csv=p=0",
+        str(audio_path),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, check=True).stdout.decode().strip()
+        stamp = datetime.fromisoformat(out.replace("Z", "+00:00")) if out else None
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+    if stamp is not None and stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
+
+
+def recording_start(audio_path: Path) -> datetime:
+    """Approximate when a non-Craig recording started, in local time.
+
+    Uses the container's `creation_time` tag when present; otherwise the
+    file's mtime minus its duration, since a recorder writes the file when
+    the recording ends.
+    """
+    stamp = _probe_creation_time(audio_path)
+    if stamp is None:
+        mtime = datetime.fromtimestamp(audio_path.stat().st_mtime, tz=timezone.utc)
+        stamp = mtime - timedelta(seconds=_probe_duration(audio_path))
+    return stamp.astimezone()
 
 
 def _parse_hms(value: str) -> float:
@@ -1769,7 +1801,7 @@ class RunSettings:
 
 def craig_source(input_path: Path, tmp_dir: str | None, title: str | None) -> AudioSource:
     """Build an AudioSource from a Craig export, extracting a .zip into `tmp_dir`."""
-    is_zip = input_path.suffix == ".zip"
+    is_zip = input_path.suffix.lower() == ".zip"
     if is_zip:
         print("Extracting zip...")
         _progress_events.step("Extracting zip")
@@ -1777,6 +1809,11 @@ def craig_source(input_path: Path, tmp_dir: str | None, title: str | None) -> Au
     else:
         craig_folder = input_path
     print()
+    if is_zip and not (craig_folder / "info.txt").is_file():
+        sys.exit(
+            f"error: {input_path.name} is not a Craig export (no info.txt). "
+            "Unzip it and pick the folder or files instead."
+        )
 
     print("PARSING MANIFEST...")
     _progress_events.step("Reading manifest")
@@ -1787,6 +1824,25 @@ def craig_source(input_path: Path, tmp_dir: str | None, title: str | None) -> Au
         tracks=match_tracks(craig_folder, usernames),
         session_start=session_start,
         zip_path=input_path if is_zip else None,
+    )
+
+
+def file_source(audio_path: Path, title: str | None, speaker: str | None) -> AudioSource:
+    """Build an AudioSource from one audio file, keyed on its stem.
+
+    The speaker defaults to the literal "Speaker" rather than going through
+    speaker_map, since a file stem is usually an event name, not a person.
+    """
+    print("READING AUDIO...")
+    _progress_events.step("Reading audio")
+    session_start = recording_start(audio_path)
+    print(f"  {audio_path.name}, recording started about {session_start:%Y-%m-%d %H:%M:%S %Z}")
+    key = audio_path.stem
+    return AudioSource(
+        title=title or key,
+        tracks={key: audio_path},
+        session_start=session_start,
+        speaker_overrides={key: speaker or "Speaker"},
     )
 
 
@@ -1842,8 +1898,14 @@ def transcribe_audio(
                 sys.exit(f"error: --shared-mic spans on track {username!r} overlap")
         shared_spans.setdefault(username, []).append((span_start, span_end, label))
     warned_speakers: set[str] = set()
+
+    def speaker_name(track_key: str) -> str:
+        if track_key in source.speaker_overrides:
+            return source.speaker_overrides[track_key]
+        return resolve_speaker(track_key, settings.speaker_map, warned_speakers)
+
     for username in matched:
-        resolve_speaker(username, settings.speaker_map, warned_speakers)
+        speaker_name(username)
     print()
 
     window_start = 0.0
@@ -2096,7 +2158,7 @@ def transcribe_audio(
         transcripts,
         track_envelopes,
         window_start,
-        {u: resolve_speaker(u, settings.speaker_map, warned_speakers) for u in transcripts},
+        {u: speaker_name(u) for u in transcripts},
         settings.bleed_thresholds["bleed_level_gap_db"],
         settings.bleed_thresholds["bleed_min_correlation"],
         settings.bleed_thresholds["bleed_text_similarity"],
@@ -2137,7 +2199,7 @@ def transcribe_audio(
     resolved = [
         (
             timestamp,
-            speaker if speaker in shared_labels else resolve_speaker(speaker, settings.speaker_map, warned_speakers),
+            speaker if speaker in shared_labels else speaker_name(speaker),
             text,
         )
         for timestamp, speaker, text in merged
@@ -2145,7 +2207,7 @@ def transcribe_audio(
     resolved_flagged = [
         (
             timestamp,
-            speaker if speaker in shared_labels else resolve_speaker(speaker, settings.speaker_map, warned_speakers),
+            speaker if speaker in shared_labels else speaker_name(speaker),
             text,
         )
         for timestamp, speaker, text in flagged_lines
@@ -2153,7 +2215,7 @@ def transcribe_audio(
     resolved_pruned = [
         (
             timestamp,
-            speaker if speaker in shared_labels else resolve_speaker(speaker, settings.speaker_map, warned_speakers),
+            speaker if speaker in shared_labels else speaker_name(speaker),
             text,
         )
         for timestamp, speaker, text in pruned_lines
@@ -2204,15 +2266,15 @@ def main() -> None:
         sys.exit(1)
 
     parser = argparse.ArgumentParser(
-        description="Transcribe a Craig-recorded Discord TTRPG session into Markdown."
+        description="Transcribe audio (a Craig export, an audio file, or a folder of audio files) into Markdown."
     )
     parser.add_argument(
-        "craig_folder",
+        "input",
         type=Path,
         nargs="?",
         default=None,
-        help="Path to the Craig export folder or .zip file. If omitted, the oldest "
-        "*.zip in input_dir is picked up automatically.",
+        help="Craig .zip/folder, an audio file, or a folder of audio files. If "
+        "omitted, the oldest *.zip in input_dir is picked up automatically.",
     )
     parser.add_argument(
         "--config",
@@ -2258,6 +2320,12 @@ def main() -> None:
         "default (a single resample per retry). Overrides the config `best_of` key.",
     )
     parser.add_argument("--title", help="Override the session title")
+    parser.add_argument(
+        "--speaker",
+        metavar="NAME",
+        help="Speaker name for a single audio file's lines (default: Speaker). "
+        "Not passed through speaker_map.",
+    )
     parser.add_argument(
         "--output-name",
         help="Override the transcript filename stem (e.g. `--output-name foo` "
@@ -2433,7 +2501,7 @@ def main() -> None:
     if args.prune_cache is not None:
         if args.prune_cache < 0:
             sys.exit("error: --prune-cache DAYS must be 0 or more")
-        if args.craig_folder is not None or windowed or args.fresh or args.shared_mic:
+        if args.input is not None or windowed or args.fresh or args.shared_mic:
             sys.exit("error: --prune-cache only prunes and exits; drop the other arguments")
     if windowed and args.fresh:
         sys.exit("error: --fresh doesn't apply to windowed runs, which never use saved partial output")
@@ -2620,7 +2688,7 @@ def main() -> None:
         output_name=args.output_name,
     )
 
-    if args.craig_folder is None:
+    if args.input is None:
         found_zip = find_default_zip(input_dir)
         if found_zip is None:
             sys.exit(
@@ -2629,11 +2697,19 @@ def main() -> None:
             )
         resolved_input_path = found_zip
     else:
-        resolved_input_path = args.craig_folder
+        resolved_input_path = args.input
 
     print(f"Input: {resolved_input_path.name}")
+    try:
+        detected = detect_input(resolved_input_path)
+    except InputError as e:
+        sys.exit(f"error: {e}")
+    if args.speaker is not None and detected.kind is not InputKind.SINGLE_FILE:
+        sys.exit("error: --speaker only applies to a single audio file or --separate")
+    if detected.kind is InputKind.LOOSE_FOLDER:
+        sys.exit(f"error: {resolved_input_path} holds several audio files; folder input isn't supported yet")
 
-    is_zip = resolved_input_path.suffix == ".zip"
+    is_zip = detected.kind is InputKind.CRAIG_ZIP
     extraction_ctx = tempfile.TemporaryDirectory() if is_zip else contextlib.nullcontext()
     with (
         extraction_ctx as tmp_dir,
@@ -2643,7 +2719,10 @@ def main() -> None:
         if cancel_watcher.enabled:
             print("(press Escape, then y, to cancel — progress on completed tracks is saved)")
             print()
-        source = craig_source(resolved_input_path, tmp_dir, args.title)
+        if detected.kind is InputKind.SINGLE_FILE:
+            source = file_source(detected.path, args.title, args.speaker)
+        else:
+            source = craig_source(resolved_input_path, tmp_dir, args.title)
         output_path = transcribe_audio(source, settings, cancel_watcher, exit_stack)
 
     elapsed = time.monotonic() - start_time
