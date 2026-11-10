@@ -536,6 +536,14 @@ def main() -> None:
         run_once(args.once)
         return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # mlx_whisper opens a tqdm bar on every transcribe (even with verbose=None),
+    # and tqdm's default lock includes a multiprocessing RLock. The app quits
+    # through AppKit, which skips Python finalization, so that semaphore is
+    # never unlinked and resource_tracker logs it as leaked. Nothing here uses
+    # multiprocessing, so a thread lock is enough.
+    import tqdm
+
+    tqdm.tqdm.set_lock(threading.RLock())
 
     legacy = check_legacy_layout()
     try:

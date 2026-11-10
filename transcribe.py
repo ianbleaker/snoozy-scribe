@@ -275,7 +275,7 @@ def load_partial_meta(partial_dir: Path) -> dict | None:
         return None
 
 
-def meta_matches(
+def meta_mismatches(
     meta: dict | None,
     model_repo: str,
     vad_min_silence_ms: int,
@@ -285,21 +285,36 @@ def meta_matches(
     compression_ratio_threshold: float,
     logprob_threshold: float,
     best_of: int | None,
-) -> bool:
+) -> list[str]:
+    """Describe each way a saved `_meta.json` differs from this run's config.
+
+    Returns one human-readable line per differing key (empty when it matches),
+    so the caller can say exactly why the cache can't be reused.
+    """
     if meta is None:
-        return False
-    return (
-        meta.get("schema_version") == PARTIAL_SCHEMA_VERSION
-        and meta.get("model_repo") == model_repo
-        and meta.get("vad_min_silence_ms") == vad_min_silence_ms
-        and meta.get("vad_min_speech_ms") == vad_min_speech_ms
-        and meta.get("initial_prompt_hash")
-        == hashlib.sha256(initial_prompt.encode()).hexdigest()
-        and meta.get("language") == language
-        and meta.get("compression_ratio_threshold") == compression_ratio_threshold
-        and meta.get("logprob_threshold") == logprob_threshold
-        and meta.get("best_of") == best_of
-    )
+        return ["_meta.json is missing or unreadable"]
+    if meta.get("schema_version") != PARTIAL_SCHEMA_VERSION:
+        return [
+            f"cache format: saved v{meta.get('schema_version')}, this version of "
+            f"transcribe.py uses v{PARTIAL_SCHEMA_VERSION}"
+        ]
+    current = {
+        "model_repo": model_repo,
+        "vad_min_silence_ms": vad_min_silence_ms,
+        "vad_min_speech_ms": vad_min_speech_ms,
+        "language": language,
+        "compression_ratio_threshold": compression_ratio_threshold,
+        "logprob_threshold": logprob_threshold,
+        "best_of": best_of,
+    }
+    diffs = [
+        f"{key}: saved {meta.get(key)!r}, current {value!r}"
+        for key, value in current.items()
+        if meta.get(key) != value
+    ]
+    if meta.get("initial_prompt_hash") != hashlib.sha256(initial_prompt.encode()).hexdigest():
+        diffs.append("initial prompt: vocabulary or enrichment fields changed since the cache was built")
+    return diffs
 
 
 def write_track_partial(
@@ -2027,6 +2042,29 @@ def main() -> None:
 
     slug = _slugify(session_title)
     partial_dir = partial_dir_for(output_dir, slug)
+    # Checked before extraction and VAD so a mismatch costs nothing. Never
+    # discard the cache here: rebuilding it can take an hour, and the usual
+    # cause is a forgotten flag (e.g. the cache was built with --model).
+    if not windowed and not args.fresh and partial_dir.exists():
+        mismatches = meta_mismatches(
+            load_partial_meta(partial_dir),
+            model_repo,
+            vad_min_silence_ms,
+            vad_min_speech_ms,
+            initial_prompt,
+            language,
+            compression_ratio_threshold,
+            logprob_threshold,
+            best_of,
+        )
+        if mismatches:
+            details = "\n".join(f"  - {line}" for line in mismatches)
+            sys.exit(
+                f"error: saved partial output in {partial_dir} doesn't match this run's config:\n"
+                f"{details}\n"
+                "Rerun with the saved settings (e.g. --model <saved model_repo>) to reuse it, "
+                "or pass --fresh (or delete that directory) to discard it and retranscribe every track."
+            )
     if not windowed and partial_max_age_days > 0:
         pruned = prune_partials(output_dir, partial_max_age_days, keep=slug)
         if pruned:
@@ -2202,25 +2240,6 @@ def main() -> None:
             if args.fresh and partial_dir.exists():
                 shutil.rmtree(partial_dir)
                 print("  Ignoring saved partial output (--fresh).")
-            elif partial_dir.exists():
-                meta = load_partial_meta(partial_dir)
-                if not meta_matches(
-                    meta,
-                    model_repo,
-                    vad_min_silence_ms,
-                    vad_min_speech_ms,
-                    initial_prompt,
-                    language,
-                    compression_ratio_threshold,
-                    logprob_threshold,
-                    best_of,
-                ):
-                    print(
-                        "  !! warning: saved partial output for this session doesn't match the "
-                        "current model/VAD/vocabulary/language/compression-ratio/logprob/best-of "
-                        "config, discarding and retranscribing all tracks"
-                    )
-                    shutil.rmtree(partial_dir)
             write_partial_meta(
                 partial_dir,
                 model_repo,
