@@ -68,6 +68,16 @@ def parse_reply(reply: str) -> dict[int, str | None]:
     return result
 
 
+def only_deletes_words(original: str, new: str) -> bool:
+    """True if `new`'s words are `original`'s with some removed, in order.
+
+    Case and punctuation are ignored (as in word_similarity), so fixing them
+    passes; changing, adding or reordering a word fails.
+    """
+    remaining = iter(_words(original))
+    return all(word in remaining for word in _words(new))
+
+
 def apply_reply(
     items: list[tuple[int, str, str]],
     reply: dict[int, str | None],
@@ -96,7 +106,11 @@ def apply_reply(
         echo = f"{speaker}:"
         if new.startswith(echo) and not original.startswith(echo):
             new = new[len(echo) :].lstrip()
-        if word_similarity(original, new) < min_similarity or len(new) > 1.5 * len(original) + 40:
+        if (
+            word_similarity(original, new) < min_similarity
+            or len(new) > 1.5 * len(original) + 40
+            or not only_deletes_words(original, new)
+        ):
             stats["guard_fallbacks"] += 1
             results.append(original)
             continue
