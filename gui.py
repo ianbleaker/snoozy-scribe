@@ -1,4 +1,4 @@
-"""Basic desktop GUI for rpg-scribe.
+"""Basic desktop GUI for snoozy-scribe.
 
 Runs transcribe.py as a subprocess with `--progress-events`, streaming its
 stdout into a log pane and its `@@PROGRESS@@` JSON events into a progress
@@ -23,8 +23,8 @@ from pathlib import Path
 import customtkinter as ctk
 import yaml
 
-from rpg_scribe import identity, paths
-from rpg_scribe.config import check_legacy_layout
+from snoozy_scribe import identity, paths
+from snoozy_scribe.config import check_legacy_layout
 
 REPO_DIR = paths.REPO_DIR
 PROGRESS_EVENT_PREFIX = "@@PROGRESS@@ "

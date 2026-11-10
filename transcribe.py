@@ -35,15 +35,15 @@ import yaml
 from mlx_whisper.audio import HOP_LENGTH
 from mlx_whisper.tokenizer import LANGUAGES
 
-from rpg_scribe import identity, paths, silero_onnx
-from rpg_scribe.config import check_legacy_layout, load_config
-from rpg_scribe.models import resolve_model_path
-from rpg_scribe.text_filters import (
+from snoozy_scribe import identity, paths, silero_onnx
+from snoozy_scribe.config import check_legacy_layout, load_config
+from snoozy_scribe.models import resolve_model_path
+from snoozy_scribe.text_filters import (
     DEFAULT_HALLUCINATION_PHRASES,
     compile_hallucination_patterns,
     strip_hallucination_phrases,
 )
-from rpg_scribe.vocabulary import (
+from snoozy_scribe.vocabulary import (
     VocabularyParseError,
     apply_vocabulary,
     build_initial_prompt,

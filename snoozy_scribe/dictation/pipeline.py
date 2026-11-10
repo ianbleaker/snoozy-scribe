@@ -9,16 +9,16 @@ from pathlib import Path
 import mlx_whisper
 import numpy as np
 
-from rpg_scribe import paths, silero_onnx
-from rpg_scribe.dictation.recorder import SAMPLE_RATE
-from rpg_scribe.models import resolve_model_path
-from rpg_scribe.text_filters import (
+from snoozy_scribe import paths, silero_onnx
+from snoozy_scribe.dictation.recorder import SAMPLE_RATE
+from snoozy_scribe.models import resolve_model_path
+from snoozy_scribe.text_filters import (
     DEFAULT_HALLUCINATION_PHRASES,
     compile_hallucination_patterns,
     strip_hallucination_phrases,
     strip_inline_fillers,
 )
-from rpg_scribe.vocabulary import apply_vocabulary, build_initial_prompt
+from snoozy_scribe.vocabulary import apply_vocabulary, build_initial_prompt
 
 # Shorter clips are accidental taps, not speech.
 MIN_CLIP_SECONDS = 0.3

@@ -1,11 +1,11 @@
 /*
- * rpg-scribe.app's executable: runs dictate.py on the repo's .venv inside
+ * snoozy-scribe.app's executable: runs dictate.py on the repo's .venv inside
  * this process, with Python embedded.
  *
  * A shell launcher that execs .venv/bin/python doesn't work. Homebrew's
  * framework Python re-execs into its own Python.app, so macOS credits
  * Microphone and Accessibility to "python3.14" instead of
- * rpg-scribe (plan #50, item 10). Embedding keeps the bundle's executable
+ * snoozy-scribe (plan #50, item 10). Embedding keeps the bundle's executable
  * as the process that asks for them.
  *
  * Built by make-app.sh, which passes REPO_DIR and LOG_PATH_SUFFIX as defines.

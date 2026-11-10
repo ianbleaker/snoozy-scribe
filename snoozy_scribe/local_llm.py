@@ -10,7 +10,7 @@ import difflib
 import re
 from pathlib import Path
 
-from rpg_scribe import paths
+from snoozy_scribe import paths
 
 DEFAULT_CLEANUP_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 

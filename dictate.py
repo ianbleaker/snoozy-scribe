@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""rpg-scribe menu-bar dictation app.
+"""snoozy-scribe menu-bar dictation app.
 
 Hold the hotkey, speak, release: the clip is transcribed with mlx-whisper,
 cleaned up by a small mlx-lm model, and pasted into the frontmost app. See
@@ -27,11 +27,11 @@ from pathlib import Path
 import rumps
 from PyObjCTools.AppHelper import callAfter, callLater
 
-from rpg_scribe import identity, paths
-from rpg_scribe.config import check_legacy_layout, load_config
-from rpg_scribe.dictation.context import context_line, frontmost_context
-from rpg_scribe.dictation.clipboard import copy_selection, paste_text, secure_input_active, set_clipboard_text
-from rpg_scribe.dictation.hotkeys import (
+from snoozy_scribe import identity, paths
+from snoozy_scribe.config import check_legacy_layout, load_config
+from snoozy_scribe.dictation.context import context_line, frontmost_context
+from snoozy_scribe.dictation.clipboard import copy_selection, paste_text, secure_input_active, set_clipboard_text
+from snoozy_scribe.dictation.hotkeys import (
     DELETE_KEYCODE,
     Binding,
     HotkeyTap,
@@ -40,11 +40,11 @@ from rpg_scribe.dictation.hotkeys import (
     format_binding,
     parse_binding,
 )
-from rpg_scribe.dictation.permissions import PermissionsWindow, all_granted, running_as_bundle
-from rpg_scribe.dictation.recorder import SAMPLE_RATE, Recorder
-from rpg_scribe.dictation.state import load_state, update_state
-from rpg_scribe.dictation.vocab_state import BASE_PATH, VocabState, get_active_campaign, set_active_campaign
-from rpg_scribe.vocabulary import VocabularyParseError, add_term, apply_vocabulary, campaign_path, list_campaigns
+from snoozy_scribe.dictation.permissions import PermissionsWindow, all_granted, running_as_bundle
+from snoozy_scribe.dictation.recorder import SAMPLE_RATE, Recorder
+from snoozy_scribe.dictation.state import load_state, update_state
+from snoozy_scribe.dictation.vocab_state import BASE_PATH, VocabState, get_active_campaign, set_active_campaign
+from snoozy_scribe.vocabulary import VocabularyParseError, add_term, apply_vocabulary, campaign_path, list_campaigns
 
 log = logging.getLogger("dictate")
 
@@ -59,6 +59,7 @@ HOTKEY_ROLES = {
 }
 CAPTURE_SECONDS = 10
 LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{identity.LAUNCH_AGENT_LABEL}.plist"
+LEGACY_LAUNCH_AGENT_PATH = LAUNCH_AGENT_PATH.with_name(f"{identity.LEGACY_LAUNCH_AGENT_LABEL}.plist")
 APP_BUNDLE_ID = identity.BUNDLE_ID
 # Shown in messages, with ~ for the home folder.
 LOG_PATH_DISPLAY = f"~/{identity.LOG_PATH.relative_to(Path.home())}"
@@ -84,7 +85,7 @@ def init_notifications() -> None:
     """Send messages to Notification Center, asking permission on first run.
 
     rumps.notification (the deprecated NSUserNotificationCenter) is never shown
-    for this app. Only rpg-scribe.app uses UNUserNotificationCenter: a terminal
+    for this app. Only snoozy-scribe.app uses UNUserNotificationCenter: a terminal
     run is Homebrew's Python.app, which would ask permission as "Python", so it
     keeps the rumps fallback.
     """
@@ -148,7 +149,7 @@ def notify(message: str, title: str = identity.APP_NAME) -> None:
 
 
 def app_bundle_path() -> Path:
-    """The running .app, or the repo's rpg-scribe.app when run from a terminal."""
+    """The running .app, or the repo's snoozy-scribe.app when run from a terminal."""
     import AppKit
 
     bundle = Path(AppKit.NSBundle.mainBundle().bundlePath())
@@ -211,7 +212,7 @@ class DictateApp(rumps.App):
         self._rebuild_history()
         self._overlay = None
         if dictation.get("overlay", True):
-            from rpg_scribe.dictation.overlay import Overlay
+            from snoozy_scribe.dictation.overlay import Overlay
 
             self._overlay = Overlay(level=lambda: self._recorder.level)
             global _toast
@@ -517,18 +518,7 @@ class DictateApp(rumps.App):
             LAUNCH_AGENT_PATH.unlink()
             sender.state = False
             return
-        # Launched through LaunchServices like a Finder double-click, so the
-        # permissions granted to the bundle still apply.
-        LAUNCH_AGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with LAUNCH_AGENT_PATH.open("wb") as f:
-            plistlib.dump(
-                {
-                    "Label": identity.LAUNCH_AGENT_LABEL,
-                    "ProgramArguments": ["/usr/bin/open", "-a", str(app_bundle_path())],
-                    "RunAtLoad": True,
-                },
-                f,
-            )
+        write_launch_agent()
         sender.state = True
 
     # --- control thread: mic on/off ----------------------------------------
@@ -585,7 +575,7 @@ class DictateApp(rumps.App):
     # --- worker thread: all MLX work ---------------------------------------
 
     def _worker_loop(self) -> None:
-        from rpg_scribe.dictation import pipeline
+        from snoozy_scribe.dictation import pipeline
 
         try:
             self._settings = pipeline.load_settings(self._config)
@@ -617,7 +607,7 @@ class DictateApp(rumps.App):
 
     def _refix(self, raw: str) -> None:
         """Re-apply the (just updated) vocabulary and cleanup to an earlier raw text."""
-        from rpg_scribe.dictation import pipeline
+        from snoozy_scribe.dictation import pipeline
 
         vocab = self._vocab.current_vocab()
         raw = apply_vocabulary(raw, pipeline.merged_vocab(vocab))
@@ -628,7 +618,7 @@ class DictateApp(rumps.App):
         callAfter(notify, "Corrected text copied")
 
     def _process(self, audio, context: dict | None) -> None:
-        from rpg_scribe.dictation import pipeline
+        from snoozy_scribe.dictation import pipeline
 
         vocab = self._vocab.current_vocab()
         raw = pipeline.transcribe_clip(audio, vocab, self._settings)
@@ -653,7 +643,7 @@ def run_once(wav_path: str) -> None:
     import numpy as np
     from mlx_whisper.audio import load_audio
 
-    from rpg_scribe.dictation import pipeline
+    from snoozy_scribe.dictation import pipeline
 
     config = load_config(paths.DEFAULT_CONFIG_PATH)
     settings = pipeline.load_settings(config)
@@ -669,14 +659,42 @@ def run_once(wav_path: str) -> None:
 
 def load_cleaner(config: dict):
     """The cleanup model, or None when `dictation.cleanup` is false."""
-    from rpg_scribe.dictation.cleanup import DEFAULT_CLEANUP_MODEL, Cleaner
-    from rpg_scribe.models import resolve_model_path
+    from snoozy_scribe.dictation.cleanup import DEFAULT_CLEANUP_MODEL, Cleaner
+    from snoozy_scribe.models import resolve_model_path
 
     dictation = config.get("dictation") or {}
     if not dictation.get("cleanup", True):
         return None
     model_dir = paths.resolve(config.get("model_dir", "./data/models"))
     return Cleaner(resolve_model_path(dictation.get("cleanup_model", DEFAULT_CLEANUP_MODEL), model_dir))
+
+
+def write_launch_agent() -> None:
+    # Launched through LaunchServices like a Finder double-click, so the
+    # permissions granted to the bundle still apply.
+    LAUNCH_AGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LAUNCH_AGENT_PATH.open("wb") as f:
+        plistlib.dump(
+            {
+                "Label": identity.LAUNCH_AGENT_LABEL,
+                "ProgramArguments": ["/usr/bin/open", "-a", str(app_bundle_path())],
+                "RunAtLoad": True,
+            },
+            f,
+        )
+
+
+def migrate_legacy_launch_agent() -> None:
+    """Replace the old name's login item, which would keep opening the old app."""
+    if not LEGACY_LAUNCH_AGENT_PATH.exists():
+        return
+    try:
+        LEGACY_LAUNCH_AGENT_PATH.unlink()
+        write_launch_agent()
+    except OSError as e:
+        log.warning("couldn't move Launch at login from %s: %s", LEGACY_LAUNCH_AGENT_PATH.name, e)
+        return
+    log.info("moved Launch at login from %s to %s", LEGACY_LAUNCH_AGENT_PATH.name, LAUNCH_AGENT_PATH.name)
 
 
 def main() -> None:
@@ -710,6 +728,7 @@ def main() -> None:
         if legacy:
             raise SystemExit("\n".join(legacy))
         config = load_config(paths.DEFAULT_CONFIG_PATH)
+        migrate_legacy_launch_agent()
         app = DictateApp(config)
     except (SystemExit, ValueError) as e:
         # ValueError: a bad or clashing hotkey string in config.yaml.

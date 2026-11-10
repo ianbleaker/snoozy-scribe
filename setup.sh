@@ -68,8 +68,23 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 
 # 9. App name, bundle ID and log path (-m finds the package from the repo).
-eval "$(.venv/bin/python -m rpg_scribe.identity --shell)"
+eval "$(.venv/bin/python -m snoozy_scribe.identity --shell)"
 INSTALLED="$HOME/Applications/$APP_NAME.app"
+
+# The app's old name: remove its build and install, and clear its permission
+# grants. The new app moves an old Launch at login item over on first launch.
+rm -rf "$LEGACY_APP_NAME.app"
+LEGACY_INSTALLED="$HOME/Applications/$LEGACY_APP_NAME.app"
+if [ -d "$LEGACY_INSTALLED" ]; then
+    if [ "$(osascript -e "application id \"$LEGACY_BUNDLE_ID\" is running" 2>/dev/null)" = true ]; then
+        die "$LEGACY_APP_NAME is running. Quit it from its menu first, then rerun ./setup.sh."
+    fi
+    rm -rf "$LEGACY_INSTALLED"
+    for service in Microphone ListenEvent Accessibility PostEvent; do
+        tccutil reset "$service" "$LEGACY_BUNDLE_ID" >/dev/null 2>&1 || true
+    done
+    echo "Removed $LEGACY_INSTALLED (renamed to $APP_NAME)"
+fi
 
 # 10. The code-signing certificate. macOS keys permission grants to the
 # signature's designated requirement: for a certificate-signed app that names
@@ -97,9 +112,9 @@ create_signing_identity() {
             -addext "keyUsage=critical,digitalSignature" \
             -addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1 || return 1
         /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
-            -out "$tmp/identity.p12" -passout pass:rpg-scribe || return 1
+            -out "$tmp/identity.p12" -passout pass:snoozy-scribe || return 1
         # -T lets codesign use the key without a keychain prompt.
-        security import "$tmp/identity.p12" -k "$keychain" -P rpg-scribe \
+        security import "$tmp/identity.p12" -k "$keychain" -P snoozy-scribe \
             -T /usr/bin/codesign >/dev/null || return 1
     fi
     echo "Trusting it for code signing; macOS asks for your password once"

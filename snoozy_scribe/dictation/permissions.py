@@ -19,7 +19,7 @@ import objc
 import rumps
 from PyObjCTools.AppHelper import callAfter
 
-from rpg_scribe import identity
+from snoozy_scribe import identity
 
 log = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ def open_settings(name: str) -> None:
 
 
 def running_as_bundle() -> bool:
-    """True inside rpg-scribe.app; False for a terminal run, whose grants belong to Python."""
+    """True inside snoozy-scribe.app; False for a terminal run, whose grants belong to Python."""
     return AppKit.NSBundle.mainBundle().bundleIdentifier() == identity.BUNDLE_ID
 
 

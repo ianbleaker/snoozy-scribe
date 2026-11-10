@@ -2,7 +2,7 @@
 docs/craig-test-files/
 .venv/
 __pycache__/
-rpg-scribe.app/
+snoozy-scribe.app/
 
 settings/config.yaml
 settings/vocabulary/*.md

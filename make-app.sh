@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the app bundle, a double-clickable macOS launcher for the dictate.py
 # menu-bar app (its menu opens the gui.py session transcriber). The name,
-# bundle ID and log path come from rpg_scribe/identity.py.
+# bundle ID and log path come from snoozy_scribe/identity.py.
 #
 # The bundle's executable is a small compiled launcher with this repo's
 # absolute path baked in, so the .app can be moved anywhere (Applications, Dock,
@@ -17,7 +17,7 @@ if [ ! -x "$REPO_DIR/.venv/bin/python" ]; then
 fi
 
 # -m finds the package from the current directory, hence the cd.
-eval "$(cd "$REPO_DIR" && .venv/bin/python -m rpg_scribe.identity --shell)"
+eval "$(cd "$REPO_DIR" && .venv/bin/python -m snoozy_scribe.identity --shell)"
 APP="$REPO_DIR/$APP_NAME.app"
 
 rm -rf "$APP"
@@ -48,11 +48,11 @@ EOF
 
 # The executable embeds Python rather than exec'ing .venv/bin/python, so
 # macOS credits permissions to the app and not to Python. See
-# rpg_scribe/launcher/rpg-scribe.c. It links the venv's base Python, so
+# snoozy_scribe/launcher/snoozy-scribe.c. It links the venv's base Python, so
 # rerun ./setup.sh after a Homebrew Python upgrade.
 PY_CONFIG="$("$REPO_DIR/.venv/bin/python" -c 'import sys; print(sys._base_executable)')-config"
 # shellcheck disable=SC2046
-clang -o "$APP/Contents/MacOS/$APP_NAME" "$REPO_DIR/rpg_scribe/launcher/rpg-scribe.c" \
+clang -o "$APP/Contents/MacOS/$APP_NAME" "$REPO_DIR/snoozy_scribe/launcher/snoozy-scribe.c" \
     $("$PY_CONFIG" --cflags) $("$PY_CONFIG" --ldflags --embed) \
     -DREPO_DIR="\"$REPO_DIR\"" -DLOG_PATH_SUFFIX="\"$LOG_PATH_SUFFIX\""
 

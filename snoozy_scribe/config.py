@@ -6,8 +6,8 @@ from pathlib import Path
 
 import yaml
 
-from rpg_scribe.identity import APP_NAME
-from rpg_scribe.paths import DEFAULT_CONFIG_PATH, REPO_DIR
+from snoozy_scribe.identity import APP_NAME
+from snoozy_scribe.paths import DEFAULT_CONFIG_PATH, REPO_DIR
 
 # Old root-level location -> new location, for files and folders moved by
 # the settings/ + data/ layout. Nothing is moved automatically.

@@ -10,7 +10,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from rpg_scribe.paths import VOCABULARY_DIR
+from snoozy_scribe.paths import VOCABULARY_DIR
 
 
 class VocabularyParseError(Exception):

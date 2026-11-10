@@ -1,7 +1,7 @@
 """Torch-free Silero VAD: the batched ("sequence") ONNX model run through onnxruntime.
 
 Vendored from Silero VAD 6.2.3 (https://github.com/snakers4/silero-vad),
-MIT-licensed; the license is at rpg_scribe/vendor/silero_vad/LICENSE. Copied from
+MIT-licensed; the license is at snoozy_scribe/vendor/silero_vad/LICENSE. Copied from
 upstream:
 
 - `frame_blocks` (silero_vad/sequence_vad.py), verbatim.

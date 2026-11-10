@@ -9,9 +9,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from rpg_scribe import paths
-from rpg_scribe.dictation.state import load_state, update_state
-from rpg_scribe.vocabulary import VocabularyParseError, campaign_path, parse_vocabulary
+from snoozy_scribe import paths
+from snoozy_scribe.dictation.state import load_state, update_state
+from snoozy_scribe.vocabulary import VocabularyParseError, campaign_path, parse_vocabulary
 
 BASE_PATH = paths.VOCABULARY_DIR / "base.md"
 

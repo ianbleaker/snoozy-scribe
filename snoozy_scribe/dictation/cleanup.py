@@ -11,7 +11,7 @@ the output looks like it isn't a light edit of the input.
 from __future__ import annotations
 
 # DEFAULT_CLEANUP_MODEL is re-exported for dictate.py's load_cleaner().
-from rpg_scribe.local_llm import DEFAULT_CLEANUP_MODEL, LocalLLM, _words, load_prompt, word_similarity
+from snoozy_scribe.local_llm import DEFAULT_CLEANUP_MODEL, LocalLLM, _words, load_prompt, word_similarity
 
 
 def guard_fails(raw: str, cleaned: str) -> bool:

@@ -15,7 +15,7 @@ from pathlib import Path
 import tqdm
 import yaml
 
-from rpg_scribe.local_llm import LocalLLM, _words, load_prompt, word_similarity
+from snoozy_scribe.local_llm import LocalLLM, _words, load_prompt, word_similarity
 
 DEFAULT_CHUNK_LINES = 30
 DEFAULT_MIN_SIMILARITY = 0.8

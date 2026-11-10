@@ -11,8 +11,8 @@ import sys
 import time
 from pathlib import Path
 
-from rpg_scribe import paths
-from rpg_scribe.config import load_config
+from snoozy_scribe import paths
+from snoozy_scribe.config import load_config
 
 DERIVED_SUFFIXES = ("-cleaned.md", ".changes.md", ".pruned.md", ".errors.md")
 
@@ -35,9 +35,9 @@ def main() -> None:
         sys.exit(f"error: {transcript.name} is a derived file; pass the original transcript .md")
 
     # Imported after argument checks: these pull in MLX.
-    from rpg_scribe.local_llm import DEFAULT_CLEANUP_MODEL, LocalLLM
-    from rpg_scribe.models import resolve_model_path
-    from rpg_scribe.transcript_cleanup import (
+    from snoozy_scribe.local_llm import DEFAULT_CLEANUP_MODEL, LocalLLM
+    from snoozy_scribe.models import resolve_model_path
+    from snoozy_scribe.transcript_cleanup import (
         DEFAULT_CHUNK_LINES,
         DEFAULT_MAX_DROP_WORDS,
         DEFAULT_MIN_SIMILARITY,

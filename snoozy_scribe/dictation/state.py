@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from rpg_scribe import paths
+from snoozy_scribe import paths
 
 STATE_PATH = paths.DATA_DIR / "dictation-state.json"
 
