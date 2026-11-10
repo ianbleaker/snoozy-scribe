@@ -21,18 +21,28 @@ import subprocess
 import sys
 import threading
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 
 import rumps
-from PyObjCTools.AppHelper import callAfter
+from PyObjCTools.AppHelper import callAfter, callLater
 
 from rpg_scribe import identity, paths
 from rpg_scribe.config import check_legacy_layout, load_config
 from rpg_scribe.dictation.context import context_line, frontmost_context
 from rpg_scribe.dictation.clipboard import copy_selection, paste_text, secure_input_active, set_clipboard_text
-from rpg_scribe.dictation.hotkeys import HotkeyTap, parse_chord
+from rpg_scribe.dictation.hotkeys import (
+    DELETE_KEYCODE,
+    Binding,
+    HotkeyTap,
+    binding_problem,
+    display_binding,
+    format_binding,
+    parse_binding,
+)
 from rpg_scribe.dictation.permissions import PermissionsWindow, all_granted, running_as_bundle
 from rpg_scribe.dictation.recorder import SAMPLE_RATE, Recorder
+from rpg_scribe.dictation.state import load_state, update_state
 from rpg_scribe.dictation.vocab_state import BASE_PATH, VocabState, get_active_campaign, set_active_campaign
 from rpg_scribe.vocabulary import VocabularyParseError, add_term, apply_vocabulary, campaign_path, list_campaigns
 
@@ -40,6 +50,14 @@ log = logging.getLogger("dictate")
 
 DEFAULT_HOLD_KEY = "right_option"
 DEFAULT_TOGGLE_HOTKEY = "ctrl+option+d"
+# Config key -> (menu label, is the hold key, default). Menu-bound overrides
+# live under "hotkeys" in data/dictation-state.json, keyed the same way.
+HOTKEY_ROLES = {
+    "hotkey": ("Hold to talk", True, DEFAULT_HOLD_KEY),
+    "toggle_hotkey": ("Toggle recording", False, DEFAULT_TOGGLE_HOTKEY),
+    "add_selection_hotkey": ("Add selected text", False, None),
+}
+CAPTURE_SECONDS = 10
 LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{identity.LAUNCH_AGENT_LABEL}.plist"
 APP_BUNDLE_ID = identity.BUNDLE_ID
 # Shown in messages, with ~ for the home folder.
@@ -159,6 +177,17 @@ class DictateApp(rumps.App):
         self._history_menu = rumps.MenuItem("History")
         self._login_item = rumps.MenuItem("Launch at login", callback=self._toggle_login)
         self._login_item.state = LAUNCH_AGENT_PATH.exists()
+        self._hotkeys_menu = rumps.MenuItem("Hotkeys")
+        self._hotkey_items: dict[str, rumps.MenuItem] = {}
+        for role in HOTKEY_ROLES:
+            # After the menu closes, so the key press doesn't go to the menu.
+            item = rumps.MenuItem(role, callback=lambda _s, r=role: self._after_menu(lambda: self._capture_hotkey(r)))
+            self._hotkey_items[role] = item
+            self._hotkeys_menu.add(item)
+        self._hotkeys_menu.add(None)
+        self._hotkeys_menu.add(rumps.MenuItem("Reset to config defaults", callback=self._reset_hotkeys))
+        # Bumped per capture, so a superseded capture's result is ignored.
+        self._capture_serial = 0
         self.menu = [
             self._status_item,
             None,
@@ -173,6 +202,7 @@ class DictateApp(rumps.App):
             rumps.MenuItem("Transcribe session…", callback=self._open_gui),
             rumps.MenuItem("Open settings folder", callback=self._open_settings),
             rumps.MenuItem("Edit cleanup prompt…", callback=self._open_cleanup_prompt),
+            self._hotkeys_menu,
             rumps.MenuItem("Permissions…", callback=lambda _s: self._permissions.show()),
             self._login_item,
             None,
@@ -192,13 +222,9 @@ class DictateApp(rumps.App):
         self._campaign_timer = rumps.Timer(lambda _t: self._refresh_campaigns(), 5)
         self._campaign_timer.start()
 
-        chords = {
-            parse_chord(dictation.get("toggle_hotkey", DEFAULT_TOGGLE_HOTKEY)): lambda: self._control.put(
-                ("toggle", None)
-            ),
-        }
-        if dictation.get("add_selection_hotkey"):
-            chords[parse_chord(dictation["add_selection_hotkey"])] = lambda: callAfter(self._add_selection)
+        self._hotkeys = self._config_hotkeys()
+        self._hotkeys.update(self._saved_hotkeys())
+        self._refresh_hotkey_items()
 
         # Hotkey events -> control thread (mic); clips -> worker thread (MLX).
         self._control: queue.Queue = queue.Queue()
@@ -206,10 +232,10 @@ class DictateApp(rumps.App):
         threading.Thread(target=self._control_loop, name="dictate-control", daemon=True).start()
         threading.Thread(target=self._worker_loop, name="dictate-worker", daemon=True).start()
         self._tap = HotkeyTap(
-            dictation.get("hotkey", DEFAULT_HOLD_KEY),
+            self._hotkeys["hotkey"],
             on_hold_start=lambda: self._control.put(("start", None)),
             on_hold_end=lambda valid: self._control.put(("stop", valid)),
-            chords=chords,
+            presses=self._presses(self._hotkeys),
         )
         self._tap.start()
         self._permissions = PermissionsWindow(tap_active=lambda: self._tap.active, can_relaunch=running_as_bundle())
@@ -269,6 +295,140 @@ class DictateApp(rumps.App):
             # Keys must be unique; identical labels would otherwise collide.
             self._history_serial += 1
             self._history_menu[f"history-{self._history_serial}"] = item
+
+    # --- hotkey binding (main thread) -----------------------------------------
+
+    def _config_hotkeys(self) -> dict[str, Binding | None]:
+        """Bindings from config.yaml (or the defaults). A bad one stops startup."""
+        dictation = self._config.get("dictation") or {}
+        hotkeys = {}
+        for role, (_label, _hold, default) in HOTKEY_ROLES.items():
+            spec = dictation.get(role, default)
+            if not spec and default is not None:
+                raise ValueError(f"dictation.{role} in config.yaml is empty")
+            hotkeys[role] = parse_binding(spec) if spec else None
+        problem = self._hotkey_conflict(hotkeys)
+        if problem:
+            raise ValueError(f"dictation hotkeys in config.yaml: {problem}")
+        return hotkeys
+
+    def _saved_hotkeys(self) -> dict[str, Binding | None]:
+        """Menu-bound overrides. Bad ones are dropped with a message, not fatal."""
+        saved = load_state().get("hotkeys")
+        if not isinstance(saved, dict):
+            return {}
+        overrides = {}
+        for role, spec in saved.items():
+            if role not in HOTKEY_ROLES:
+                continue
+            label, hold, default = HOTKEY_ROLES[role]
+            if spec is None and default is None:  # an optional hotkey, cleared
+                overrides[role] = None
+                continue
+            try:
+                binding = parse_binding(spec)
+                problem = binding_problem(binding, hold)
+            except (ValueError, TypeError, AttributeError) as e:
+                problem = str(e)
+            if problem:
+                log.warning("ignoring saved %s %r: %s", role, spec, problem)
+                callAfter(notify, f"Ignored the saved {label} hotkey ({spec}); using config.yaml.")
+                continue
+            overrides[role] = binding
+        problem = self._hotkey_conflict({**self._hotkeys, **overrides})
+        if problem:
+            log.warning("ignoring saved hotkeys: %s", problem)
+            callAfter(notify, f"Ignored saved hotkeys ({problem}); using config.yaml.")
+            return {}
+        return overrides
+
+    @staticmethod
+    def _hotkey_conflict(hotkeys: dict[str, Binding | None]) -> str | None:
+        seen: dict[Binding, str] = {}
+        for role, binding in hotkeys.items():
+            if binding is None:
+                continue
+            if binding in seen:
+                first, second = HOTKEY_ROLES[seen[binding]][0], HOTKEY_ROLES[role][0]
+                return f"{display_binding(binding)} is bound to both {first} and {second}"
+            seen[binding] = role
+        return None
+
+    def _presses(self, hotkeys: dict[str, Binding | None]) -> dict[Binding, Callable[[], None]]:
+        handlers = {
+            "toggle_hotkey": lambda: self._control.put(("toggle", None)),
+            "add_selection_hotkey": lambda: callAfter(self._add_selection),
+        }
+        return {hotkeys[role]: handler for role, handler in handlers.items() if hotkeys[role] is not None}
+
+    def _set_hotkeys(self, hotkeys: dict[str, Binding | None]) -> None:
+        self._tap.set_bindings(hotkeys["hotkey"], self._presses(hotkeys))
+        self._hotkeys = hotkeys
+        self._refresh_hotkey_items()
+
+    def _refresh_hotkey_items(self) -> None:
+        for role, item in self._hotkey_items.items():
+            item.title = f"{HOTKEY_ROLES[role][0]}: {display_binding(self._hotkeys[role])}…"
+
+    def _capture_hotkey(self, role: str) -> None:
+        label, hold, _default = HOTKEY_ROLES[role]
+        if not self._tap.active:
+            notify("Hotkeys need Accessibility first; see Permissions….")
+            return
+        if self._mode is not None or self.title not in (TITLES["ready"], TITLES["loading"]):
+            notify("Wait until dictation is idle before changing a hotkey.")
+            return
+        self._capture_serial += 1
+        serial = self._capture_serial
+        if self._tap.capturing:
+            self._tap.cancel_capture()
+        prompt = f"Press a key or mouse button for {label}. Esc cancels"
+        if role == "add_selection_hotkey":
+            prompt += ", ⌫ clears"
+        if self._overlay is not None:
+            self._overlay.show_prompt(prompt + ".")
+        else:
+            notify(prompt + ".")
+        # Not rumps.Timer: its first fire is immediate, not after the interval.
+        callLater(CAPTURE_SECONDS, self._capture_timed_out, serial)
+        self._tap.capture(hold, lambda b: callAfter(self._hotkey_captured, serial, role, b))
+
+    def _hotkey_captured(self, serial: int, role: str, binding: Binding | None) -> None:
+        if serial != self._capture_serial:
+            return  # replaced by a newer capture
+        self._capture_serial += 1  # disarm the timeout
+        label, hold, _default = HOTKEY_ROLES[role]
+        if binding is None:
+            notify(f"{label} hotkey unchanged.")
+            return
+        if role == "add_selection_hotkey" and binding == Binding("key", DELETE_KEYCODE):
+            binding = None
+        else:
+            problem = binding_problem(binding, hold)
+            if problem:
+                notify(f"Can't use {display_binding(binding)}: {problem}.")
+                return
+        hotkeys = {**self._hotkeys, role: binding}
+        problem = self._hotkey_conflict(hotkeys)
+        if problem:
+            notify(f"Not changed: {problem}.")
+            return
+        self._set_hotkeys(hotkeys)
+        saved = load_state().get("hotkeys")
+        saved = saved if isinstance(saved, dict) else {}
+        saved[role] = format_binding(binding) if binding else None
+        update_state(hotkeys=saved)
+        log.info("bound %s to %s", role, saved[role])
+        notify(f"{label}: {display_binding(binding)}")
+
+    def _capture_timed_out(self, serial: int) -> None:
+        if serial == self._capture_serial and self._tap.capturing:
+            self._tap.cancel_capture()
+
+    def _reset_hotkeys(self, _sender) -> None:
+        update_state(hotkeys=None)
+        self._set_hotkeys(self._config_hotkeys())
+        notify("Hotkeys reset to config.yaml.")
 
     # --- vocabulary capture (main thread) -------------------------------------
 
@@ -552,7 +712,7 @@ def main() -> None:
         config = load_config(paths.DEFAULT_CONFIG_PATH)
         app = DictateApp(config)
     except (SystemExit, ValueError) as e:
-        # ValueError: a bad dictation.hotkey / toggle_hotkey string.
+        # ValueError: a bad or clashing hotkey string in config.yaml.
         log.error("%s", e)
         rumps.alert(title=f"{identity.APP_NAME} can't start", message=str(e))
         sys.exit(1)

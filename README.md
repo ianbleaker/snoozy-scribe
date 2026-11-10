@@ -64,9 +64,17 @@ they do. They stay in memory (roughly 3–4 GB) so dictation is fast.
   recording; press it again to stop. The hold key does nothing meanwhile.
 - **Add selected text** can also get a hotkey (`dictation.add_selection_hotkey`).
 
+Rebind any of them from **Hotkeys ▸** in the menu: choose one, then press
+the key or mouse button you want (Esc cancels). The hold key can be any
+modifier, an F-key or mouse button 3 and up; the others take optional
+modifiers plus a key or button. Foot pedals and macro pads that send F13–F19
+or extra mouse buttons work too; controllers that only show up as gamepads
+don't. Keys that type need a modifier, and left/right click can't be bound.
+
 A pill near the bottom of the screen shows "● Recording" with a level meter,
 then "Transcribing…". It never takes focus, so the paste lands where you were
-typing. Confirmations ("Added X to mycampaign.md") show there too. If the
+typing. Confirmations ("Added X to mycampaign.md") and prompts show in the
+same pill at the top right, under the menu bar. If the
 focused field is a password field, the text is left on the clipboard instead.
 
 ### Menu
@@ -74,6 +82,10 @@ focused field is a password field, the text is left on the clipboard instead.
 - **Campaign ▸**: Off or one of your campaigns. Dictation always uses
   `base.md`, plus the active campaign's terms. The choice is saved in
   `data/dictation-state.json`.
+- **Hotkeys ▸**: the current bindings; choose one to rebind it (see
+  Hotkeys above), ⌫ clears the Add selected text one. Bindings set here
+  are saved in `data/dictation-state.json` and override `config.yaml`
+  until **Reset to config defaults**.
 - **History ▸**: the last `dictation.history_size` results (memory only;
   dictated text is never written to disk). Each has "Copy cleaned" and
   "Copy raw", and "(fallback used)" when the cleanup model's output was

@@ -6,29 +6,24 @@ data/dictation-state.json, so it survives restarts.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from pathlib import Path
 
 from rpg_scribe import paths
+from rpg_scribe.dictation.state import load_state, update_state
 from rpg_scribe.vocabulary import VocabularyParseError, campaign_path, parse_vocabulary
 
-STATE_PATH = paths.DATA_DIR / "dictation-state.json"
 BASE_PATH = paths.VOCABULARY_DIR / "base.md"
 
 
 def get_active_campaign() -> str | None:
     """The persisted campaign name, or None if unset, missing or corrupt."""
-    try:
-        campaign = json.loads(STATE_PATH.read_text()).get("campaign")
-    except (OSError, ValueError, AttributeError):
-        return None
+    campaign = load_state().get("campaign")
     return campaign if isinstance(campaign, str) and campaign else None
 
 
 def set_active_campaign(name: str | None) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps({"campaign": name}) + "\n")
+    update_state(campaign=name)
 
 
 class VocabState:

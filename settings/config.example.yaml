@@ -207,13 +207,19 @@ line_format: "[{timestamp}] {speaker}: {text}"
 # Menu-bar dictation (dictate.py). Every key is optional; the values below
 # are the defaults. See README.md ("Config").
 dictation:
-  # Hold-to-talk key: right_option, right_command, right_control or fn. A
-  # hold counts only if it lasts 200 ms with no other key pressed, so ⌥←/⌥→
-  # and Option-typed characters never trigger it.
+  # Hotkeys can also be set from the menu (Hotkeys ▸) by pressing them;
+  # those are saved in data/dictation-state.json and override these.
+  #
+  # Hold-to-talk key: a modifier (right_option, left_option, right_command,
+  # left_command, right_control, left_control, right_shift, left_shift, fn),
+  # an F-key (f1-f20), mouse3 and up, or keycode:N. A hold counts only if it
+  # lasts 200 ms with no other key pressed, so ⌥←/⌥→ and Option-typed
+  # characters never trigger it.
   hotkey: right_option
   # Press once to start recording, again to stop. Format mod+mod+key, mods
-  # ctrl, option, cmd, shift; key a single letter or space. Swallowed, so it
-  # never types into the app.
+  # ctrl, option, cmd, shift; key a letter, digit, space, f13, mouse4,
+  # keycode:N, etc. Keys that type need a modifier. Swallowed, so it never
+  # types into the app.
   toggle_hotkey: ctrl+option+d
   # Optional hotkey (same format) for "Add selected text". Unset by default.
   # add_selection_hotkey: ctrl+option+v

@@ -1,5 +1,8 @@
 """Floating "Recording / Transcribing" pill near the bottom of the screen.
 
+The same panel shows toasts and prompts at the top right, under the menu
+bar, where the user is looking after using the menu.
+
 A borderless, non-activating panel that ignores the mouse, so it never takes
 focus and the paste still lands in the app being dictated into. All methods
 must be called on the main thread.
@@ -11,10 +14,13 @@ from collections.abc import Callable
 
 import AppKit
 import rumps
+from PyObjCTools.AppHelper import callLater
 
 WIDTH = 220
 HEIGHT = 44
 BOTTOM_MARGIN = 90
+# Toasts sit under the menu bar's right end, near the app's menu-bar icon.
+TOP_RIGHT_MARGIN = 12
 BAR_X = 120
 BAR_WIDTH = 84
 BAR_HEIGHT = 6
@@ -75,15 +81,24 @@ class Overlay:
 
         self._panel = panel
         self._timer = rumps.Timer(lambda _t: self._update_level(), 0.05)
-        self._message_timer = rumps.Timer(lambda _t: self.hide(), MESSAGE_SECONDS)
+        # Toast expiry via callLater: a rumps.Timer fires as soon as it starts.
+        # Bumping the serial cancels a pending expiry.
+        self._message_serial = 0
+        self._message_showing = False
 
-    def _place(self) -> None:
+    def _place(self, top_right: bool = False) -> None:
         screen = AppKit.NSScreen.mainScreen()
         if screen is None:
             return
         frame = screen.visibleFrame()
-        x = frame.origin.x + (frame.size.width - self._panel.frame().size.width) / 2
-        self._panel.setFrameOrigin_((x, frame.origin.y + BOTTOM_MARGIN))
+        size = self._panel.frame().size
+        if top_right:
+            x = frame.origin.x + frame.size.width - size.width - TOP_RIGHT_MARGIN
+            y = frame.origin.y + frame.size.height - size.height - TOP_RIGHT_MARGIN
+        else:
+            x = frame.origin.x + (frame.size.width - size.width) / 2
+            y = frame.origin.y + BOTTOM_MARGIN
+        self._panel.setFrameOrigin_((x, y))
 
     def _update_level(self) -> None:
         width = min(1.0, self._level() * LEVEL_GAIN) * BAR_WIDTH
@@ -94,25 +109,42 @@ class Overlay:
         self._label.setFrame_(AppKit.NSMakeRect(18, (HEIGHT - 20) / 2, label_width, 20))
 
     def _show_status(self, text: str, level_bar: bool) -> None:
-        self._message_timer.stop()
+        self._end_message()
         self._set_width(WIDTH, BAR_X - 24)
         self._label.setStringValue_(text)
         self._track.setHidden_(not level_bar)
         self._place()
         self._panel.orderFrontRegardless()
 
-    def show_message(self, text: str) -> None:
-        """Show `text` briefly, like a toast. Recording or transcribing replaces it."""
-        if self._timer.is_alive():
-            return  # don't cover the recording meter
+    def _end_message(self) -> None:
+        self._message_serial += 1
+        self._message_showing = False
+
+    def _message_expired(self, serial: int) -> None:
+        if serial == self._message_serial:
+            self.hide()
+
+    def _show_text(self, text: str) -> None:
+        self._end_message()
         self._label.setStringValue_(text)
         text_width = min(self._label.intrinsicContentSize().width + 4, MAX_MESSAGE_WIDTH - 36)
         self._set_width(text_width + 36, text_width)
         self._track.setHidden_(True)
-        self._place()
+        self._place(top_right=True)
         self._panel.orderFrontRegardless()
-        self._message_timer.stop()
-        self._message_timer.start()
+
+    def show_message(self, text: str) -> None:
+        """Show `text` briefly, like a toast. Recording or transcribing replaces it."""
+        if self._timer.is_alive():
+            return  # don't cover the recording meter
+        self._show_text(text)
+        self._message_showing = True
+        callLater(MESSAGE_SECONDS, self._message_expired, self._message_serial)
+
+    def show_prompt(self, text: str) -> None:
+        """Show `text` until the next message or hide(), e.g. while waiting for a key."""
+        if not self._timer.is_alive():
+            self._show_text(text)
 
     def show_recording(self) -> None:
         self._show_status("● Recording", level_bar=True)
@@ -127,10 +159,10 @@ class Overlay:
 
     def hide_status(self) -> None:
         """Hide the recording/transcribing pill, but let a toast finish."""
-        if not self._message_timer.is_alive():
+        if not self._message_showing:
             self.hide()
 
     def hide(self) -> None:
         self._timer.stop()
-        self._message_timer.stop()
+        self._end_message()
         self._panel.orderOut_(None)
