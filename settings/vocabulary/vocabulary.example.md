@@ -1,6 +1,4 @@
-# Example Vocabulary
-
-Copy to <name>.md (any name except *.example.md) to make a vocabulary. `#` and `##` headings are free-form grouping; each `###` heading is a term.
+# Example vocabulary: copy to <name>.md to use it
 
 ## Factions
 ### Aldric
