@@ -13,7 +13,7 @@ from snoozy_scribe.paths import DEFAULT_CONFIG_PATH, REPO_DIR
 # the settings/ + data/ layout. Nothing is moved automatically.
 _LEGACY_MOVES = [
     ("config.yaml", "settings/config.yaml"),
-    ("vocabulary.md", "settings/vocabulary/<campaign>.md"),
+    ("vocabulary.md", "settings/vocabulary/<name>.md"),
     ("models", "data/models"),
     ("input", "data/input"),
     ("transcripts", "data/transcripts"),
@@ -79,7 +79,7 @@ def check_legacy_layout(config_path: Path = DEFAULT_CONFIG_PATH) -> list[str]:
         label = "settings/config.yaml" if path == (REPO_DIR / "config.yaml").resolve() else str(path)
         if "vocabulary_file" in config:
             config_notes.append(
-                f"  {label}: remove `vocabulary_file` (removed) and set `campaign: <campaign>`"
+                f"  {label}: remove `vocabulary_file` (removed) and set `vocabularies: [<name>]`"
             )
         for key, old_value in _LEGACY_DIR_VALUES.items():
             value = config.get(key)
@@ -101,10 +101,10 @@ def check_legacy_layout(config_path: Path = DEFAULT_CONFIG_PATH) -> list[str]:
             "  mkdir -p settings/vocabulary data",
             *commands,
         ]
-        if any("<campaign>" in c for c in commands):
+        if any("<name>" in c for c in commands):
             lines.append(
-                "Replace <campaign> with a short campaign name, and set "
-                "`campaign: <campaign>` in settings/config.yaml."
+                "Replace <name> with a short vocabulary name, and set "
+                "`vocabularies: [<name>]` in settings/config.yaml."
             )
     if config_notes:
         lines += ["", "Then fix these config keys:", *config_notes]
