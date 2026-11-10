@@ -1846,6 +1846,35 @@ def file_source(audio_path: Path, title: str | None, speaker: str | None) -> Aud
     )
 
 
+def unique_stems(audio_files: list[Path]) -> dict[Path, str]:
+    """Name each file by its stem, appending the extension (`a-wav`, `a-m4a`)
+    to stems that collide, so track keys, titles and cache slugs stay unique."""
+    counts: dict[str, int] = {}
+    for path in audio_files:
+        counts[path.stem] = counts.get(path.stem, 0) + 1
+    return {
+        path: f"{path.stem}-{path.suffix.lstrip('.').lower()}" if counts[path.stem] > 1 else path.stem
+        for path in audio_files
+    }
+
+
+def folder_source(folder: Path, audio_files: list[Path], title: str | None) -> AudioSource:
+    """Build a merged AudioSource from a folder of audio files, one track per
+    file keyed on its stem. Assumes every file started recording at the same
+    moment, as Craig's tracks do; nothing checks that."""
+    print("READING AUDIO...")
+    _progress_events.step("Reading audio")
+    keys = unique_stems(audio_files)
+    starts = {path: recording_start(path) for path in audio_files}
+    for path in audio_files:
+        print(f"  {path.name}, recording started about {starts[path]:%Y-%m-%d %H:%M:%S %Z}")
+    return AudioSource(
+        title=title or folder.resolve().name,
+        tracks={keys[path]: path for path in audio_files},
+        session_start=min(starts.values()),
+    )
+
+
 def transcribe_audio(
     source: AudioSource,
     settings: RunSettings,
@@ -2706,8 +2735,6 @@ def main() -> None:
         sys.exit(f"error: {e}")
     if args.speaker is not None and detected.kind is not InputKind.SINGLE_FILE:
         sys.exit("error: --speaker only applies to a single audio file or --separate")
-    if detected.kind is InputKind.LOOSE_FOLDER:
-        sys.exit(f"error: {resolved_input_path} holds several audio files; folder input isn't supported yet")
 
     is_zip = detected.kind is InputKind.CRAIG_ZIP
     extraction_ctx = tempfile.TemporaryDirectory() if is_zip else contextlib.nullcontext()
@@ -2721,6 +2748,8 @@ def main() -> None:
             print()
         if detected.kind is InputKind.SINGLE_FILE:
             source = file_source(detected.path, args.title, args.speaker)
+        elif detected.kind is InputKind.LOOSE_FOLDER:
+            source = folder_source(detected.path, detected.audio_files, args.title)
         else:
             source = craig_source(resolved_input_path, tmp_dir, args.title)
         output_path = transcribe_audio(source, settings, cancel_watcher, exit_stack)
