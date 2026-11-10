@@ -3,16 +3,9 @@
 Vocabulary files live in `settings/vocabulary/` (gitignored, except the
 `*.example.md` files). They hold terms Whisper gets wrong: post-fix
 corrections for known mis-transcriptions, and optional enrichment fields for
-prompt seeding. There are two tiers:
+prompt seeding.
 
-- **Campaign files**, `settings/vocabulary/<campaign>.md`: names and places
-  for one campaign. Any `*.md` there except `base.md` and `*.example.md` is a
-  campaign. Session transcription uses **only** the campaign file (config
-  `campaign` or `--campaign`), so its terms get Whisper's whole ~224-token
-  prompt. Start from `campaign.example.md`.
-- **`base.md`**: terms that are always on for dictation (tool names, LLM
-  jargon). Session transcription doesn't use it. Start from
-  `base.example.md`.
+Any `*.md` there except `*.example.md` is a vocabulary, named by its file stem. Dictation applies the ones ticked in its **Vocabulary ▸** menu; session transcription applies the config `vocabularies` list, or the repeatable `--vocabulary NAME` flag. When several are applied they're merged alphabetically by name: a later vocabulary's term overrides an earlier one with the same name, and Whisper's prompt lists them in the same order, so the later ones survive when a long prompt is cut to its last ~224 tokens. Start from `vocabulary.example.md`.
 
 Format: `#`/`##` headings are free-form organizational grouping (e.g.
 "Factions", "Locations") and are ignored by the parser. `###` marks a term
@@ -31,7 +24,7 @@ marks a term as a player character and names who plays it (using the
 characters.
 
 ```markdown
-# Campaign Vocabulary
+# My Vocabulary
 
 ## Factions
 ### Aldric
@@ -65,8 +58,7 @@ won't fire inside a correct `sky-ward`.
 The dictation app's menu has **Fix last dictation…**, **Add term…** and
 **Add selected text** (see the [README](../README.md#menu)).
 
-The capture dialogs ask which file to write: **Base** or the active
-campaign. New terms go under a `## Inbox` heading at the end of that file
+The capture dialogs ask which file to write, with one button per vocabulary file, ticked or not. New terms go under a `## Inbox` heading at the end of that file
 for you to re-file later. Edits to vocabulary files take effect on the next
 dictation; a file that fails to parse keeps its last good version and shows
 the error.
