@@ -406,7 +406,7 @@ class App(ctk.CTk):
         detail = (
             "Windowed runs don't save progress."
             if self._windowed
-            else "Progress on completed tracks is saved."
+            else "Progress so far is saved."
         )
         if not messagebox.askyesno("Cancel", f"Stop transcription? {detail}", parent=self):
             return

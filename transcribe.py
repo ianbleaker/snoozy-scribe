@@ -25,6 +25,7 @@ import zipfile
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 import mlx.core as mx
 import mlx_whisper
@@ -317,47 +318,99 @@ def meta_mismatches(
     return diffs
 
 
+Segment = tuple[float, float, str, float, float]
+
+
+class TrackPartial(NamedTuple):
+    """A track's saved progress: its segments so far and where to pick up.
+
+    `regions_done` counts the VAD regions (pairs in the flat region list)
+    already transcribed; it equals the track's region count once the track
+    is complete. `last_region_text` is the last finished region's decoded
+    text, which seeds the next region's rolling prompt on resume.
+    """
+
+    segments: list[Segment]
+    language: str | None
+    regions_done: int
+    last_region_text: str
+
+
 def write_track_partial(
     partial_dir: Path,
     username: str,
     audio_path: Path,
-    segments: list[tuple[float, float, str, float, float]],
-    language: str | None,
+    progress: TrackPartial,
+    speech_regions: list[float],
 ) -> None:
+    """Save a track's progress, written after every region so a crash or
+    cancel mid-track loses at most the region in flight.
+
+    `speech_regions` is the track's full flat region list; the regions
+    already done are saved with it so a resume can check that this run's
+    VAD still produced the same leading regions. Written via a temp file
+    and rename, so a crash mid-write never leaves a truncated file behind.
+    """
     stat = audio_path.stat()
     data = {
         "audio_size": stat.st_size,
-        "language": language,
-        "segments": segments,
+        "language": progress.language,
+        "segments": progress.segments,
+        "regions": speech_regions[: progress.regions_done * 2],
+        "last_region_text": progress.last_region_text,
     }
     partial_path = partial_dir / f"{_safe_track_filename(username)}.json"
-    partial_path.write_text(json.dumps(data))
+    tmp_path = partial_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(data))
+    tmp_path.replace(partial_path)
 
 
 def load_track_partial(
-    partial_dir: Path, username: str, audio_path: Path, progress: tqdm.tqdm | None = None
-) -> tuple[list[tuple[float, float, str, float, float]], str | None] | None:
+    partial_dir: Path,
+    username: str,
+    audio_path: Path,
+    speech_regions: list[float],
+    progress: tqdm.tqdm | None = None,
+) -> TrackPartial | None:
+    """Load a track's saved progress, or None if there's nothing usable.
+
+    A file without a `regions` key predates per-region checkpoints and was
+    only ever written once the whole track finished, so it counts as
+    complete. Otherwise the saved regions must be a prefix of this run's
+    `speech_regions`, or the saved segments no longer line up and the track
+    is retranscribed.
+    """
     partial_path = partial_dir / f"{_safe_track_filename(username)}.json"
     try:
         data = json.loads(partial_path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
 
+    def warn(reason: str) -> None:
+        message = f"!! warning: partial for {username} is {reason}, retranscribing"
+        progress.write(message) if progress is not None else print(message)
+
     stat = audio_path.stat()
     try:
         if data["audio_size"] != stat.st_size:
-            message = f"!! warning: partial for {username} is stale (audio file changed), retranscribing"
-            progress.write(message) if progress is not None else print(message)
+            warn("stale (audio file changed)")
             return None
 
         segments = [
             (start, end, text, compression_ratio, avg_logprob)
             for start, end, text, compression_ratio, avg_logprob in data["segments"]
         ]
-        return segments, data["language"]
+        if "regions" not in data:
+            return TrackPartial(segments, data["language"], len(speech_regions) // 2, "")
+        saved_regions = [float(bound) for bound in data["regions"]]
+        if len(saved_regions) % 2 or saved_regions != speech_regions[: len(saved_regions)]:
+            warn("stale (speech regions changed)")
+            return None
+        return TrackPartial(
+            segments, data["language"], len(saved_regions) // 2, str(data["last_region_text"])
+        )
     except (KeyError, TypeError, ValueError):
-        message = f"!! warning: partial for {username} is malformed, retranscribing"
-        progress.write(message) if progress is not None else print(message)
+        warn("malformed")
         return None
 
 
@@ -674,7 +727,9 @@ def transcribe_track(
     logprob_threshold: float = LOGPROB_THRESHOLD,
     best_of: int | None = None,
     cancelled: threading.Event | None = None,
-) -> tuple[list[tuple[float, float, str, float, float]], str | None]:
+    resume: TrackPartial | None = None,
+    checkpoint: Callable[[TrackPartial], None] | None = None,
+) -> tuple[list[Segment], str | None]:
     """Transcribe one audio track into ((segment_start_offset, segment_end_offset,
     text, compression_ratio, avg_logprob) tuples, detected language).
 
@@ -728,6 +783,13 @@ def transcribe_track(
     as several whole segments with identical text rather than one segment
     with repeated words inside it — the latter is what `collapse_repetition()`
     (used downstream in `merge_tracks()`) catches; this catches the former.
+
+    `resume`, a track's saved progress from `load_track_partial()`, skips the
+    regions it already covers, carrying over its segments, detected language
+    and rolling prompt; the caller advances `progress` past those regions.
+    `checkpoint`, if given, is called with the track's progress after every
+    region, so the caller can save it and a crash or cancel mid-track only
+    loses the region in flight. See docs/design/transcription-pipeline.md.
     """
     # verbose=None (not mlx_whisper's default False) suppresses its own prints,
     # which would otherwise corrupt the live progress bar; see
@@ -735,12 +797,21 @@ def transcribe_track(
     if not speech_regions:
         return [], None
 
+    segments: list[Segment] = []
+    prompt = initial_prompt
+    regions_done = 0
+    if resume is not None:
+        segments = list(resume.segments)
+        language = language or resume.language
+        regions_done = resume.regions_done
+        if regions_done:
+            prompt = ((initial_prompt or "") + " " + _tail_words(resume.last_region_text)).strip()
+
     audio = _decode_audio_mono16k(audio_path)
 
-    segments: list[tuple[float, float, str, float, float]] = []
-    prompt = initial_prompt
     with _redirect_mlx_whisper_progress(progress):
-        for start, end in zip(speech_regions[::2], speech_regions[1::2]):
+        regions = list(zip(speech_regions[::2], speech_regions[1::2]))
+        for start, end in regions[regions_done:]:
             if cancelled is not None and cancelled.is_set():
                 raise TranscriptionCancelled()
             region_audio = audio[round(start * VAD_SAMPLE_RATE):round(end * VAD_SAMPLE_RATE)]
@@ -769,6 +840,9 @@ def transcribe_track(
                 )
                 for segment in region_segments
             )
+            regions_done += 1
+            if checkpoint is not None:
+                checkpoint(TrackPartial(segments, language, regions_done, region_text))
     return segments, language
 
 
@@ -2277,24 +2351,44 @@ def main() -> None:
                 if cancel_watcher.cancelled.is_set():
                     raise TranscriptionCancelled()
                 track_start = time.monotonic()
+                regions = track_regions[username]
+                region_count = len(regions) // 2
                 partial = (
                     None
                     if windowed
-                    else load_track_partial(partial_dir, username, audio_path, progress)
+                    else load_track_partial(partial_dir, username, audio_path, regions, progress)
                 )
-                if partial is not None:
-                    segments, detected_language = partial
+                if partial is not None and partial.regions_done >= region_count:
+                    segments, detected_language = partial.segments, partial.language
                     progress.write(
                         f"  Resuming track {i}/{total} ({username}) (from saved partial)..."
                     )
-                    progress.update(speech_frames(track_regions[username]))
+                    progress.update(speech_frames(regions))
                 else:
-                    progress.write(f"  Transcribing track {i}/{total} ({username})...")
+                    if partial is not None:
+                        progress.write(
+                            f"  Resuming track {i}/{total} ({username}) at region "
+                            f"{partial.regions_done + 1}/{region_count} (from saved partial)..."
+                        )
+                        progress.update(speech_frames(regions[: partial.regions_done * 2]))
+                    else:
+                        progress.write(f"  Transcribing track {i}/{total} ({username})...")
                     _progress_events.step(f"Transcribing — decoding audio ({username})")
+
+                    def save_progress(
+                        track_progress: TrackPartial,
+                        username: str = username,
+                        audio_path: Path = audio_path,
+                        regions: list[float] = regions,
+                    ) -> None:
+                        write_track_partial(
+                            partial_dir, username, audio_path, track_progress, regions
+                        )
+
                     segments, detected_language = transcribe_track(
                         audio_path,
                         model_path,
-                        track_regions[username],
+                        regions,
                         progress,
                         initial_prompt,
                         language,
@@ -2302,10 +2396,12 @@ def main() -> None:
                         logprob_threshold,
                         best_of,
                         cancel_watcher.cancelled,
+                        resume=partial,
+                        checkpoint=None if windowed else save_progress,
                     )
                     if not windowed:
-                        write_track_partial(
-                            partial_dir, username, audio_path, segments, detected_language
+                        save_progress(
+                            TrackPartial(segments, detected_language, region_count, "")
                         )
                 track_elapsed = time.monotonic() - track_start
                 if detected_language:
@@ -2432,7 +2528,7 @@ if __name__ == "__main__":
         main()
     except TranscriptionCancelled:
         message = (
-            "Cancelled. Progress on completed tracks was saved; rerun to resume."
+            "Cancelled. Progress so far was saved; rerun to resume."
             if _saves_partials
             else "Cancelled."
         )
