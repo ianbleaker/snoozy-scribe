@@ -453,24 +453,29 @@ class DictateApp(rumps.App):
         self._one_shot.start()
 
     def _ask(self, title: str, message: str, default: str = "") -> tuple[str, Path] | None:
-        """Ask for text and a target file ("Base" or the active campaign)."""
+        """Ask for text and a target file: one button per vocabulary file,
+        selected or not, alphabetically."""
         import AppKit
 
-        campaign = get_active_campaign()
+        names = list_vocabularies()
+        if not names:
+            notify("No vocabulary files. Add one in settings/vocabulary/ first.")
+            return None
         window = rumps.Window(
-            message=message, title=title, default_text=default, ok="Base", cancel="Cancel", dimensions=(320, 24)
+            message=message, title=title, default_text=default, ok=names[0], cancel="Cancel", dimensions=(320, 24)
         )
-        if campaign:
-            window.add_button(campaign)
+        for name in names[1:]:
+            window.add_button(name)
         AppKit.NSApp.activateIgnoringOtherApps_(True)
         response = window.run()
+        # rumps: 0 is cancel, 1 is ok, 2.. are the added buttons in order.
         if response.clicked == 0:
             return None
         if not response.text.strip():
             notify("Nothing entered, so no changes were made.")
             return None
-        target = BASE_PATH if response.clicked == 1 else campaign_path(campaign)
-        return response.text.strip(), target
+        name = names[0] if response.clicked == 1 else names[response.clicked - 1]
+        return response.text.strip(), vocabulary_path(name)
 
     def _write_term(self, target: Path, term: str, variants: list[str]) -> bool:
         try:
