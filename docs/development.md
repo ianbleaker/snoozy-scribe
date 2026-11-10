@@ -17,7 +17,7 @@ Relative paths in `settings/config.yaml` resolve against the repo root, not the 
 `./setup.sh` is the supported install. If it can't run, these are the steps it takes, in order, from the repo root:
 
 1. Check for Apple Silicon, Homebrew and the Xcode command-line tools.
-2. Create `.venv` with Homebrew's `python3` (Apple's `/usr/bin/python3` lacks the `python3-config --embed` that `make-app.sh` needs), or recreate it if it no longer starts: `"$(brew --prefix)/bin/python3" -m venv .venv`
+2. Create `.venv` with Homebrew's `python3` (Apple's `/usr/bin/python3` lacks the `python3-config --embed` that `make-app.sh` needs), or recreate it if it no longer starts or was created at another path (its scripts, `pip` included, hold the venv's absolute path): `"$(brew --prefix)/bin/python3" -m venv .venv`
 3. `.venv/bin/pip install --no-deps -r requirements.lock`
 4. `cp settings/config.example.yaml settings/config.yaml`, if it doesn't exist.
 5. Warn if `ffmpeg` is missing (`brew install ffmpeg`; only session transcription needs it).

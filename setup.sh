@@ -42,9 +42,19 @@ PY="$(brew --prefix)/bin/python3"
 [ -x "$PY" ] || die "Homebrew Python not found. Run: brew install python"
 
 # 5. The venv. A Homebrew Python upgrade can leave it pointing at a removed
-# interpreter, so recreate it when it can't start.
+# interpreter, so recreate it when it can't start. Its scripts (pip
+# included) hold the venv's absolute path, so also recreate it when the repo
+# has moved. The comparison ignores case, like the default macOS filesystem.
+venv_moved() {
+    [ -f .venv/bin/pip ] || return 1
+    expected=$(printf '#!%s/.venv/bin/' "$PWD" | tr '[:upper:]' '[:lower:]')
+    case "$(head -n 1 .venv/bin/pip | tr '[:upper:]' '[:lower:]')" in
+        "$expected"*) return 1 ;;
+    esac
+    return 0
+}
 VENV_RECREATED=0
-if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c 'import sys' >/dev/null 2>&1; then
+if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c 'import sys' >/dev/null 2>&1 || venv_moved; then
     echo "Creating .venv with $PY"
     rm -rf .venv
     "$PY" -m venv .venv

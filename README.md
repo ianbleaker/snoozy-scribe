@@ -71,7 +71,7 @@ Vocabulary files in `settings/vocabulary/` hold terms Whisper gets wrong: `base.
 ## Troubleshooting
 
 - **Logs**: the app writes to `~/Library/Logs/snoozy-scribe.log`.
-- **App won't start after a Homebrew Python upgrade, or after moving the repo**: rerun `./setup.sh --rebuild-app`.
+- **App won't start after a Homebrew Python upgrade, or after moving the repo**: rerun `./setup.sh`. It recreates `.venv` and rebuilds the app.
 - **Old copy in `/Applications`**: earlier installs had you drag the app there, and that copy goes stale. Delete it and use `~/Applications/snoozy-scribe.app`; if **Launch at login** is on, toggle it off and on. `setup.sh` warns when it finds one.
 - **Upgrading from rpg-scribe** (the app's old name): rerun `./setup.sh`. It removes `~/Applications/rpg-scribe.app`, and the new app moves **Launch at login** over on first launch. The new name is a new app identity to macOS, so grant Microphone and Accessibility again once. The old `rpg-scribe Code Signing` certificate can be deleted in Keychain Access.
 
