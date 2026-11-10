@@ -3,7 +3,7 @@
 Each line is either dropped or lightly edited (punctuation, fillers,
 stutters) by the shared local model, guarded per line so a substantive line
 can't vanish or drift. Writes `<stem>-cleaned.md` plus `<stem>-cleaned.changes.md`
-listing every drop and rewrite. See docs/design/transcription-pipeline.md.
+listing every drop and rewrite.
 """
 
 from __future__ import annotations

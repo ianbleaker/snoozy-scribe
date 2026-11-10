@@ -1,6 +1,6 @@
 # snoozy-scribe
 
-A menu-bar app for local push-to-talk dictation on the Mac: hold a key, speak, release, and cleaned-up text is pasted into the frontmost app. Everything runs on-device: Whisper transcribes, a small mlx-lm model (`dictation.cleanup_model`) fixes punctuation, fillers, false starts and self-corrections ("send it to Bob, no, Alice" → "Send it to Alice."), and your vocabulary fixes spellings. It also transcribes recorded Discord sessions (Craig exports) into Markdown transcripts, offline too. How the dictation app works: [docs/design/dictation.md](docs/design/dictation.md).
+A menu-bar app for local push-to-talk dictation on the Mac: hold a key, speak, release, and cleaned-up text is pasted into the frontmost app. Everything runs on-device: Whisper transcribes, a small mlx-lm model (`dictation.cleanup_model`) fixes punctuation, fillers, false starts and self-corrections ("send it to Bob, no, Alice" → "Send it to Alice."), and your vocabulary fixes spellings. It also transcribes recorded Discord sessions (Craig exports) into Markdown transcripts, offline too.
 
 ## Requirements
 

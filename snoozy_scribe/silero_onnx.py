@@ -12,8 +12,7 @@ upstream:
   minus the matplotlib `visualize_probs` option.
 
 The `silero_vad` package itself can't be imported without torch, which is why
-this code is vendored rather than imported. See
-docs/design/transcription-pipeline.md.
+this code is vendored rather than imported.
 """
 
 from __future__ import annotations

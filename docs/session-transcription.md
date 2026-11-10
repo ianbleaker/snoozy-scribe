@@ -83,7 +83,7 @@ Config keys:
 .venv/bin/python clean_transcript.py data/transcripts/<session-title>.md
 ```
 
-An optional second pass over a finished transcript, using the same local model as dictation cleanup (no network calls once it's downloaded). For each line the model either drops it (content-free lines and false starts the speaker restarts) or lightly edits it: punctuation, capitalization, um/uh, stutters. It never rephrases. Per-line guards keep the original whenever a rewrite drifts or a long line would be dropped. Design: [transcription-pipeline.md](design/transcription-pipeline.md#llm-cleanup-pass-transcript_cleanuppy).
+An optional second pass over a finished transcript, using the same local model as dictation cleanup (no network calls once it's downloaded). For each line the model either drops it (content-free lines and false starts the speaker restarts) or lightly edits it: punctuation, capitalization, um/uh, stutters. It never rephrases. Per-line guards keep the original whenever a rewrite drifts or a long line would be dropped.
 
 It writes two files next to the input, overwriting any from an earlier run:
 

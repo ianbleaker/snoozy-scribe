@@ -6,8 +6,7 @@
 
 # mlx-whisper model repo (Hugging Face). Larger/non-quantized models are
 # slower but more accurate. Can be overridden per-run with
-# `transcribe.py --model <repo-id>`. See docs/analysis/model-weight-analysis.md
-# for a speed/accuracy comparison — the fp16 turbo model avoided a
+# `transcribe.py --model <repo-id>`. The fp16 turbo model avoided a
 # repetition-hallucination failure mode the 4-bit quantized version hit, at
 # comparable speed.
 whisper_model: mlx-community/whisper-large-v3-turbo
@@ -78,7 +77,7 @@ logprob_threshold: -1.0
 # log-probability, which can favor a confident repetition loop over a
 # correct-but-less-certain transcription, and in 2 of 3 test windows it
 # introduced new hallucination loops greedy decoding didn't produce, at
-# 2-3.5x the decode time. See docs/analysis/best-of-decoding-analysis.md.
+# 2-3.5x the decode time.
 # best_of: 5
 
 # Whether a flagged/low-confidence line keeps an inline "!! [inaudible]"
@@ -92,7 +91,7 @@ show_inaudible_placeholders: false
 # Co-located mic bleed dedup: when two players share a room, each mic picks
 # up the other and Whisper transcribes the bleed as a duplicate line. A
 # matching cross-track pair is dropped only if the audio shows a correlated,
-# attenuated copy; see docs/design/transcription-pipeline.md. Tune these from
+# attenuated copy. Tune these from
 # `transcribe.py --verbose` output.
 # Minimum dB gap between the louder and quieter track over the pair's span.
 bleed_level_gap_db: 4

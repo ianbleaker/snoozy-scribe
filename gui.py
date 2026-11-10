@@ -32,7 +32,7 @@ PROGRESS_EVENT_PREFIX = "@@PROGRESS@@ "
 # there too, so an uncapped buffer would grow for the whole run.
 STDERR_TAIL_LINES = 500
 
-# (label, --model repo); see docs/analysis/model-weight-analysis.md.
+# (label, --model repo).
 MODELS = [
     ("q4", "mlx-community/whisper-large-v3-turbo-q4"),
     ("turbo", "mlx-community/whisper-large-v3-turbo"),

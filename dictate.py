@@ -3,7 +3,7 @@
 
 Hold the hotkey, speak, release: the clip is transcribed with mlx-whisper,
 cleaned up by a small mlx-lm model, and pasted into the frontmost app. See
-README.md ("Using it") and docs/design/dictation.md.
+README.md ("Using it").
 
 Threads: rumps owns the main thread. The hotkey tap runs on its own thread
 and only enqueues events. A control thread opens and closes the mic. One

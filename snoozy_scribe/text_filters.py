@@ -9,7 +9,7 @@ import re
 # merging. Kept narrow on purpose: only phrases nobody says at a game table
 # (so not "See you next time!" — that belongs in `filler_words`). The
 # `hallucination_phrases` config key replaces this list rather than extending
-# it — see docs/design/transcription-pipeline.md.
+# it.
 DEFAULT_HALLUCINATION_PHRASES = [
     r"Subtitles by the Amara\.org community",
     r"Thanks? (you )?for watching[.!]?",

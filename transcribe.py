@@ -71,7 +71,7 @@ PARTIAL_SCHEMA_VERSION = 3
 # compression ratio is repetitive enough that mlx_whisper already retried it
 # at higher temperatures internally. If it's still above threshold here,
 # every retry failed and mlx_whisper fell back to the last (still bad)
-# decode rather than dropping it — see docs/design/transcription-pipeline.md.
+# decode rather than dropping it.
 COMPRESSION_RATIO_THRESHOLD = 2.4
 
 # Matches mlx_whisper.transcribe's own default: a segment whose average
@@ -80,8 +80,7 @@ COMPRESSION_RATIO_THRESHOLD = 2.4
 # segment still below threshold here means every retry failed. Catches
 # garbled/wrong-language hallucinations that compression_ratio_threshold
 # misses, since made-up words are high-entropy (they don't compress well)
-# even though the model had no real signal for them — see
-# docs/design/transcription-pipeline.md.
+# even though the model had no real signal for them.
 LOGPROB_THRESHOLD = -1.0
 
 _vad_model = None
@@ -500,8 +499,7 @@ def _decode_audio_mono16k(audio_path: Path) -> np.ndarray:
 
     Shared decode helper for both VAD and transcription (Whisper itself
     expects 16kHz mono input, same as VAD)."""
-    # Shells out to ffmpeg rather than soundfile/torchaudio; see
-    # docs/design/transcription-pipeline.md for why.
+    # Shells out to ffmpeg rather than soundfile/torchaudio.
     cmd = [
         "ffmpeg", "-nostdin", "-i", str(audio_path),
         "-threads", "0",
@@ -624,12 +622,11 @@ def detect_speech_regions(
     of the same decoded audio, used by `dedup_bleed()`.
 
     `min_silence_ms` sets how long a pause must be before it splits speech
-    into separate regions; see docs/design/transcription-pipeline.md for why
-    the default (800ms) overrides Silero's own 100ms.
+    into separate regions; the default (800ms) overrides Silero's own 100ms.
 
     `min_speech_ms` drops detected speech regions shorter than this (coughs,
     breath, mic pops) before they reach Whisper; defaults to Silero's own
-    250ms default. See docs/design/transcription-pipeline.md.
+    250ms default.
     """
     global _vad_model
     if _vad_model is None:
@@ -662,7 +659,7 @@ def speech_frames(regions: list[float]) -> int:
 
     Mirrors `transcribe_track`'s own sample-based slicing (seconds -> samples
     -> mel frames) so this estimate and mlx_whisper's reported frame count
-    for each region agree exactly; see docs/design/transcription-pipeline.md.
+    for each region agree exactly.
     """
     samples = [round(ts * VAD_SAMPLE_RATE) for ts in regions]
     return sum(
@@ -687,8 +684,7 @@ class _ForwardingPbar:
 
 
 class _TqdmShim:
-    """Replaces the `tqdm` name mlx_whisper.transcribe's module sees; see
-    docs/design/transcription-pipeline.md for why."""
+    """Replaces the `tqdm` name mlx_whisper.transcribe's module sees."""
 
     def __init__(self, master: tqdm.tqdm):
         self._master = master
@@ -737,8 +733,7 @@ def transcribe_track(
     batched call for the whole track): mlx_whisper's own `clip_timestamps`
     handling never resets its internal `seek` pointer between clips, so a
     single batched call decodes straight through the silence between
-    regions. A single-clip-per-call shape sidesteps that entirely. See
-    docs/design/transcription-pipeline.md.
+    regions. A single-clip-per-call shape sidesteps that entirely.
 
     `language`, if given, is forced for every region's call instead of being
     auto-detected from the first region. Auto-detection runs Whisper's own
@@ -755,8 +750,7 @@ def transcribe_track(
     retried. Lowering it triggers more retries (slower, but catches more
     repetitive/garbled decodes); it also becomes the threshold `merge_tracks`
     uses to flag a segment for human review, since a segment still above it
-    after retrying means every retry failed. See
-    docs/design/transcription-pipeline.md.
+    after retrying means every retry failed.
 
     `logprob_threshold` is the same idea for a different failure mode: a
     segment whose average per-token log-probability falls below it is a
@@ -767,7 +761,7 @@ def transcribe_track(
     forcing `language="en"` sets the decode's language token but doesn't
     constrain which tokens can come out, so a low-confidence region can
     still decode as other-script gibberish). `merge_tracks` flags on this
-    the same way, for the same reason. See docs/design/transcription-pipeline.md.
+    the same way, for the same reason.
 
     `best_of` only affects those same retries: mlx_whisper's first decode
     attempt is always greedy (temperature 0), and `best_of` is silently
@@ -789,11 +783,10 @@ def transcribe_track(
     and rolling prompt; the caller advances `progress` past those regions.
     `checkpoint`, if given, is called with the track's progress after every
     region, so the caller can save it and a crash or cancel mid-track only
-    loses the region in flight. See docs/design/transcription-pipeline.md.
+    loses the region in flight.
     """
     # verbose=None (not mlx_whisper's default False) suppresses its own prints,
-    # which would otherwise corrupt the live progress bar; see
-    # docs/design/transcription-pipeline.md.
+    # which would otherwise corrupt the live progress bar.
     if not speech_regions:
         return [], None
 
@@ -884,9 +877,7 @@ def _normalize_phrase(text: str) -> str:
 
 
 # Genuine emphasis ("no no no") repeats a handful of times at most; a
-# repetition-hallucination loop runs for dozens or hundreds of words (see
-# docs/analysis/best-of-decoding-analysis.md and
-# docs/analysis/model-weight-analysis.md for real examples). Set well above
+# repetition-hallucination loop runs for dozens or hundreds of words. Set well above
 # normal speech's repeat count so collapse_repetition() only fires on loops.
 REPETITION_MIN_REPEATS = 6
 REPETITION_MAX_PHRASE_WORDS = 6
@@ -1204,7 +1195,7 @@ def dedup_bleed(
     the louder track's, and the level gap is large enough. Bleed drops the
     quieter segment; a matching pair with an active quieter track that
     misses the gap/correlation thresholds is kept and counted as ambiguous,
-    optionally marked. See docs/design/transcription-pipeline.md.
+    optionally marked.
 
     `envelopes` are `compute_envelope()` output per track, with index 0 at
     `window_start`. Runs before `merge_tracks()`, while segments still carry
@@ -1319,7 +1310,7 @@ def merge_tracks(
     Consecutive segments from the same speaker (per-track, ignoring what
     other speakers' tracks were doing at the same time) are merged into one
     line when the silence between them (`next.start - prev.end`) is at most
-    `merge_gap_seconds`; see docs/design/transcription-pipeline.md.
+    `merge_gap_seconds`.
 
     A segment is dropped entirely if its text, normalized (lowercased,
     trailing punctuation stripped), is empty — this catches not just a
@@ -1413,7 +1404,7 @@ def merge_tracks(
     Every line removed by filler, crosstalk or laughter is returned in
     `pruned_lines` (same shape as `merged`, text prefixed with `(filler)`,
     `(crosstalk)`, `(laughter)` or `(laughter-run)`) for the caller to write
-    to a companion audit file. See docs/design/transcription-pipeline.md.
+    to a companion audit file.
 
     Also returns a stats dict counting what was pruned along the way
     (`segments_total`, `empty_dropped`, `hallucination_stripped`,
