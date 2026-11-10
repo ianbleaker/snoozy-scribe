@@ -46,10 +46,11 @@ from snoozy_scribe.text_filters import (
 from snoozy_scribe.vocabulary import (
     VocabularyParseError,
     apply_vocabulary,
-    build_initial_prompt,
-    campaign_path,
-    list_campaigns,
+    build_combined_prompt,
+    list_vocabularies,
+    merge_vocabularies,
     parse_vocabulary,
+    vocabulary_path,
 )
 
 VAD_SAMPLE_RATE = 16000
@@ -1776,16 +1777,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--vocabulary",
-        type=Path,
+        action="append",
+        metavar="NAME",
         default=None,
-        help="Path to a vocabulary file. Overrides --campaign and the config "
-        "`campaign` key.",
-    )
-    parser.add_argument(
-        "--campaign",
-        default=None,
-        help="Use settings/vocabulary/<CAMPAIGN>.md as the vocabulary. "
-        "Overrides the config `campaign` key.",
+        help="Vocabulary name in settings/vocabulary/ (repeatable). Overrides "
+        "the config `vocabularies` list.",
     )
     parser.add_argument(
         "--enrich-vocabulary",
@@ -2042,28 +2038,40 @@ def main() -> None:
     if args.elapsed_timestamps is not None:
         timestamp_mode = "elapsed" if args.elapsed_timestamps else "clock"
 
-    campaign = args.campaign or config.get("campaign")
+    if "campaign" in config:
+        sys.exit(
+            "error: config key `campaign` was renamed; replace `campaign: X` with "
+            "`vocabularies: [X]` in settings/config.yaml"
+        )
     if args.vocabulary is not None:
-        vocabulary_path = args.vocabulary
-    elif campaign:
-        vocabulary_path = campaign_path(campaign)
-        if not vocabulary_path.exists():
-            available = ", ".join(list_campaigns()) or "none"
+        vocabulary_names = args.vocabulary
+    else:
+        vocabulary_names = config.get("vocabularies") or []
+        if isinstance(vocabulary_names, str):
+            vocabulary_names = [vocabulary_names]
+        elif not isinstance(vocabulary_names, list) or not all(
+            isinstance(name, str) for name in vocabulary_names
+        ):
             sys.exit(
-                f"error: no vocabulary file for campaign '{campaign}' at {vocabulary_path}. "
-                f"Available campaigns: {available}"
+                f"error: config `vocabularies` must be a list of vocabulary names, got {vocabulary_names!r}"
             )
-    else:
-        vocabulary_path = None
+    vocabulary_names = sorted(set(vocabulary_names))
 
-    if vocabulary_path is None:
-        print("No vocabulary file configured or found; continuing without vocabulary.")
-        vocabulary: dict = {}
-    else:
+    parsed_vocabularies: list[dict] = []
+    for name in vocabulary_names:
+        path = vocabulary_path(name)
+        if not path.exists():
+            available = ", ".join(list_vocabularies()) or "none"
+            sys.exit(f"error: no vocabulary named '{name}' at {path}. Available vocabularies: {available}")
         try:
-            vocabulary = parse_vocabulary(vocabulary_path)
+            parsed_vocabularies.append(parse_vocabulary(path))
         except VocabularyParseError as e:
             sys.exit(f"error: {e}")
+    vocabulary = merge_vocabularies(parsed_vocabularies)
+
+    if not vocabulary_names:
+        print("No vocabulary configured; continuing without vocabulary.")
+    else:
         field_counts: dict[str, tuple[str, int]] = {}
         for term_data in vocabulary.values():
             for label in term_data["fields"]:
@@ -2074,10 +2082,8 @@ def main() -> None:
             f"{display} ×{count}" for display, count in field_counts.values()
         )
         fields_note = f" (fields found: {fields_summary})" if fields_summary else ""
-        print(
-            f"Loaded vocabulary: {len(vocabulary)} terms from {vocabulary_path.name}"
-            f"{fields_note}"
-        )
+        files = ", ".join(f"{name}.md" for name in vocabulary_names)
+        print(f"Loaded vocabulary: {len(vocabulary)} terms from {files}{fields_note}")
 
     if args.enrich_vocabulary is None:
         enrich_fields = None
@@ -2085,7 +2091,7 @@ def main() -> None:
         enrich_fields = set()
     else:
         enrich_fields = {f.strip() for f in args.enrich_vocabulary.split(",")}
-    initial_prompt = build_initial_prompt(vocabulary, enrich_fields)
+    initial_prompt = build_combined_prompt(parsed_vocabularies, enrich_fields)
 
     if args.craig_folder is None:
         found_zip = find_default_zip(input_dir)

@@ -150,18 +150,36 @@ def build_initial_prompt(vocabulary: dict, enrich_fields: set[str] | None) -> st
     return ", ".join(parts)
 
 
-def list_campaigns() -> list[str]:
-    """Campaign names: stems of `VOCABULARY_DIR/*.md`, minus `base` and `*.example`."""
+def merge_vocabularies(vocabs: list[dict]) -> dict:
+    """Merge parsed vocabularies in list order; a later term overrides an earlier one."""
+    merged: dict = {}
+    for vocab in vocabs:
+        merged.update(vocab)
+    return merged
+
+
+def build_combined_prompt(vocabs: list[dict], enrich_fields: set[str] | None) -> str:
+    """Join each vocabulary's `build_initial_prompt` in list order.
+
+    mlx-whisper keeps only the *last* ~224 tokens of a long prompt, so the
+    vocabularies last in the list survive truncation.
+    """
+    parts = (build_initial_prompt(v, enrich_fields) for v in vocabs)
+    return ", ".join(p for p in parts if p)
+
+
+def list_vocabularies() -> list[str]:
+    """Vocabulary names: sorted stems of `VOCABULARY_DIR/*.md`, minus `*.example`."""
     if not VOCABULARY_DIR.is_dir():
         return []
     return sorted(
         path.stem
         for path in VOCABULARY_DIR.glob("*.md")
-        if path.stem != "base" and not path.stem.endswith(".example")
+        if not path.stem.endswith(".example")
     )
 
 
-def campaign_path(name: str) -> Path:
+def vocabulary_path(name: str) -> Path:
     return VOCABULARY_DIR / f"{name}.md"
 
 

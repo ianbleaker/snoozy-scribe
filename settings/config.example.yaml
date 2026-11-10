@@ -24,13 +24,15 @@ speaker_map:
   alice42: Alice
   someplayer: Some Player
 
-# Active campaign: transcribe.py uses settings/vocabulary/<campaign>.md
-# (campaign terms, post-fix corrections, and Whisper prompt seeding). Any
-# *.md in settings/vocabulary/ except base.md and *.example.md is a campaign.
-# Optional — if omitted, no vocabulary is used. Overridable per-run with
-# `transcribe.py --campaign <name>` or `--vocabulary <path>`. See
-# settings/vocabulary/campaign.example.md for the file format.
-campaign: my-campaign
+# Vocabularies transcribe.py applies: names are file stems in
+# settings/vocabulary/ (any *.md except *.example.md), used for term
+# corrections and Whisper prompt seeding. Several are merged alphabetically:
+# a later vocabulary's term overrides an earlier one with the same name, and
+# the later ones survive when a long prompt gets truncated. Optional — if
+# omitted, no vocabulary is used. Overridable per-run with a repeatable
+# `transcribe.py --vocabulary <name>`. See
+# settings/vocabulary/vocabulary.example.md for the file format.
+vocabularies: [my-vocabulary]
 
 # Whisper language code (e.g. "en") to force for every track, instead of
 # auto-detecting per track. Auto-detection only samples the first VAD speech
@@ -240,7 +242,7 @@ dictation:
   # are used.
   app_context: true
   # Floating "Recording / Transcribing" pill with a level meter, also used
-  # for confirmations like "Added X to mycampaign.md". When false, those go
+  # for confirmations like "Added X to my-vocabulary.md". When false, those go
   # to Notification Center instead (macOS asks for permission on launch).
   overlay: true
   # How many recent dictations the History menu keeps (in memory only).

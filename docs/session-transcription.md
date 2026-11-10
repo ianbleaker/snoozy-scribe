@@ -16,7 +16,7 @@ brew install ffmpeg
 
 Edit `settings/config.yaml` with your Discord usernames → display name mapping (`speaker_map`). It's gitignored — local to your machine.
 
-Optionally, `cp settings/vocabulary/campaign.example.md settings/vocabulary/<campaign>.md`, fill in your campaign's terms and set `campaign: <campaign>` in the config — see [vocabulary.md](vocabulary.md).
+Optionally, `cp settings/vocabulary/vocabulary.example.md settings/vocabulary/<name>.md`, fill in your terms and set `vocabularies: [<name>]` in the config — see [vocabulary.md](vocabulary.md).
 
 **Upgrading from the old layout** (`config.yaml`, `vocabulary.md`, `models/`, `input/` and `transcripts/` at the repo root): `transcribe.py`, `gui.py` and the dictation app check for it at startup. They exit and print the exact `mv` commands and config keys to fix. Nothing is moved automatically.
 
@@ -40,8 +40,7 @@ Options:
 - `--config <path>` — use a config file other than `settings/config.yaml`.
 - `--model <repo-id>` — override the configured `whisper_model`.
 - `--title <title>` — override the session title (defaults to the input's basename, without the `.zip` extension if applicable).
-- `--campaign <name>` — use `settings/vocabulary/<name>.md` as the vocabulary, overriding the config `campaign` key. An unknown name exits with the list of available campaigns.
-- `--vocabulary <path>` — use this vocabulary file instead (overrides `--campaign` and `campaign`).
+- `--vocabulary <name>` — apply `settings/vocabulary/<name>.md`. Repeat it to apply several (merged alphabetically, see [vocabulary.md](vocabulary.md)). When given, it replaces the config `vocabularies` list. An unknown name exits with the list of available vocabularies.
 - `--enrich-vocabulary [FIELD,...]` — seed Whisper's `initial_prompt` with vocabulary enrichment fields in addition to term names. Bare flag includes every field found on any term; a comma-separated list (e.g. `--enrich-vocabulary Tagline,Description`) includes only those fields. Omit the flag entirely to seed only term names, with no enrichment.
 - `--start HH:MM:SS` / `--end HH:MM:SS` — transcribe only part of the session. Either bound can be omitted to mean the start or end of the recording. Timestamps stay relative to the whole session. The transcript is written as `<session-title>-<start>-<end>.md` (e.g. `my-session-01h30m-02h15m.md`) unless `--output-name` is given. A windowed run doesn't save resumable progress and doesn't move the zip into `processed/`, so you can come back for other windows or a full run later.
 - `--test [SECONDS]` — a quick windowed run of SECONDS (default 120), starting at `--start` if given or at a random point otherwise, written to `<session-title>-<start>-<end>.md` like `--start`/`--end`.
@@ -74,7 +73,7 @@ Config keys:
 - `timestamp_format` — `strftime()` format for each line's timestamp. Defaults to `"%H:%M:%S"`.
 - `timestamp_mode` — `"elapsed"` stamps each line with time since the start of the recording, so the first segment reads `00:00:00`; `"clock"` stamps it with the real wall-clock time it was recorded. Defaults to `"elapsed"`. Overridden by `--elapsed-timestamps` / `--clock-timestamps`.
 - `line_format` — `str.format()` template for each transcript line, with `{timestamp}`, `{speaker}`, and `{text}` placeholders. Use Markdown here to style the output, e.g. `"[{timestamp}] **{speaker}**: {text}"` to bold speaker names. Defaults to `"[{timestamp}] {speaker}: {text}"`.
-- `campaign` — the campaign whose vocabulary (`settings/vocabulary/<campaign>.md`) session transcription uses. Omit it to run without a vocabulary.
+- `vocabularies` — list of vocabulary names (`settings/vocabulary/<name>.md`) session transcription applies, merged alphabetically. A single name is also accepted. Omit it to run without a vocabulary. The old `campaign` key is rejected with a message telling you to rename it.
 
 
 ## LLM cleanup
@@ -118,6 +117,6 @@ A basic desktop window you can use instead of the CLI. It runs `transcribe.py` f
 - Mark possible mic bleed (`--show-bleed-markers` / `--hide-bleed-markers`)
 - Shared mic (`--shared-mic`) — several entries separated by `;`
 
-Everything else still comes from `settings/config.yaml`, including the `campaign`. Advanced flags (`--language`, `--campaign`, `--test`, `--fresh`, `--vocabulary`, thresholds, etc.) need the CLI. Cancel stops the run after a confirmation, and progress on completed tracks is saved (except in windowed runs), just like the CLI's Escape-then-y. When a run finishes, the window offers buttons to open the transcript or reveal it in Finder, and its log is saved next to the transcript as `<session-title>.log` (uncheck "Save log next to the transcript", or set `save_gui_log: false` in the config, to skip it).
+Everything else still comes from `settings/config.yaml`, including `vocabularies`. Advanced flags (`--language`, `--vocabulary`, `--test`, `--fresh`, thresholds, etc.) need the CLI. Cancel stops the run after a confirmation, and progress on completed tracks is saved (except in windowed runs), just like the CLI's Escape-then-y. When a run finishes, the window offers buttons to open the transcript or reveal it in Finder, and its log is saved next to the transcript as `<session-title>.log` (uncheck "Save log next to the transcript", or set `save_gui_log: false` in the config, to skip it).
 
 The GUI also opens from the dictation app's menu ("Transcribe session…").

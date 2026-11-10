@@ -1,6 +1,6 @@
 """Menu-bar choices that survive restarts, kept in data/dictation-state.json.
 
-Several features share the file (active campaign, hotkey overrides), so
+Several features share the file (selected vocabularies, hotkey overrides), so
 writes merge into what's there rather than replacing it.
 """
 

@@ -1,4 +1,4 @@
-# Campaign Vocabulary
+# Example vocabulary: copy to <name>.md to use it
 
 ## Factions
 ### Aldric
@@ -24,3 +24,7 @@
 ## General
 ### goblin
 - Description: Standard enemy type, expect frequent mentions.
+
+## Tools
+### mlx
+- Misheard as: MLX, M L X

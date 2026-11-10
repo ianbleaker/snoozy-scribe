@@ -42,11 +42,11 @@ The models load in the background at launch (about 30 s); ✎… shows while the
 
 Rebind any of them from **Hotkeys ▸** in the menu: choose one, then press the key or mouse button you want (Esc cancels). The hold key can be any modifier, an F-key or mouse button 3 and up; the others take optional modifiers plus a key or button. Foot pedals and macro pads that send F13–F19 or extra mouse buttons work too; controllers that only show up as gamepads don't. Keys that type need a modifier, and left/right click can't be bound.
 
-A pill near the bottom of the screen shows "● Recording" with a level meter, then "Transcribing…". It never takes focus, so the paste lands where you were typing. Confirmations ("Added X to mycampaign.md") and prompts show in the same pill at the top right, under the menu bar. If the focused field is a password field, the text is left on the clipboard instead.
+A pill near the bottom of the screen shows "● Recording" with a level meter, then "Transcribing…". It never takes focus, so the paste lands where you were typing. Confirmations ("Added X to my-vocabulary.md") and prompts show in the same pill at the top right, under the menu bar. If the focused field is a password field, the text is left on the clipboard instead.
 
 ### Menu
 
-- **Campaign ▸**: Off or one of your campaigns. Dictation always uses `base.md`, plus the active campaign's terms. The choice is saved in `data/dictation-state.json`.
+- **Vocabulary ▸**: one checkmark per vocabulary file; tick any number to apply them to dictation. The selection is saved in `data/dictation-state.json`.
 - **Hotkeys ▸**: the current bindings; choose one to rebind it (see Hotkeys above), ⌫ clears the Add selected text one. Bindings set here are saved in `data/dictation-state.json` and override `config.yaml` until **Reset to config defaults**.
 - **History ▸**: the last `dictation.history_size` results (memory only; dictated text is never written to disk). Each has "Copy cleaned" and "Copy raw", and "(fallback used)" when the cleanup model's output was rejected and the raw text was pasted instead.
 - **Fix last dictation…**: enter `wrong -> right`. Adds `wrong` as a `Misheard as` variant of `right`, then copies the corrected last dictation to the clipboard.
@@ -62,7 +62,7 @@ The cleanup models' prompts are tracked files in `settings/prompts/`. The transc
 
 ## Vocabulary
 
-Vocabulary files in `settings/vocabulary/` hold terms Whisper gets wrong: `base.md` is always on for dictation, and a campaign file adds one campaign's names and places. Format, tiers and capture: [docs/vocabulary.md](docs/vocabulary.md).
+Vocabulary files in `settings/vocabulary/` hold terms Whisper gets wrong, such as names and places. Each file is one vocabulary; dictation applies the ones ticked in the menu, session transcription the ones in config `vocabularies`. Format, merging and capture: [docs/vocabulary.md](docs/vocabulary.md).
 
 ## Transcribing recorded sessions
 

@@ -43,8 +43,15 @@ from snoozy_scribe.dictation.hotkeys import (
 from snoozy_scribe.dictation.permissions import PermissionsWindow, all_granted, running_as_bundle
 from snoozy_scribe.dictation.recorder import SAMPLE_RATE, Recorder
 from snoozy_scribe.dictation.state import load_state, update_state
-from snoozy_scribe.dictation.vocab_state import BASE_PATH, VocabState, get_active_campaign, set_active_campaign
-from snoozy_scribe.vocabulary import VocabularyParseError, add_term, apply_vocabulary, campaign_path, list_campaigns
+from snoozy_scribe.dictation.vocab_state import VocabState, get_selected_vocabularies, set_vocabulary_selected
+from snoozy_scribe.vocabulary import (
+    VocabularyParseError,
+    add_term,
+    apply_vocabulary,
+    list_vocabularies,
+    merge_vocabularies,
+    vocabulary_path,
+)
 
 log = logging.getLogger("dictate")
 
@@ -171,10 +178,10 @@ class DictateApp(rumps.App):
         self._history_serial = 0
         # Control thread only: None, "hold" or "toggle".
         self._mode: str | None = None
-        self._campaigns: list[str] | None = None
+        self._vocab_names: list[str] | None = None
 
         self._status_item = rumps.MenuItem(STATUS_LABELS["loading"])
-        self._campaign_menu = rumps.MenuItem("Campaign")
+        self._vocab_menu = rumps.MenuItem("Vocabulary")
         self._history_menu = rumps.MenuItem("History")
         self._login_item = rumps.MenuItem("Launch at login", callback=self._toggle_login)
         self._login_item.state = LAUNCH_AGENT_PATH.exists()
@@ -192,7 +199,7 @@ class DictateApp(rumps.App):
         self.menu = [
             self._status_item,
             None,
-            self._campaign_menu,
+            self._vocab_menu,
             self._history_menu,
             None,
             rumps.MenuItem("Fix last dictation…", callback=self._fix_last),
@@ -208,7 +215,7 @@ class DictateApp(rumps.App):
             self._login_item,
             None,
         ]
-        self._refresh_campaigns()
+        self._refresh_vocab_menu()
         self._rebuild_history()
         self._overlay = None
         if dictation.get("overlay", True):
@@ -219,9 +226,9 @@ class DictateApp(rumps.App):
             _toast = self._overlay.show_message
         else:
             init_notifications()
-        # Picks up campaign files added or removed while running.
-        self._campaign_timer = rumps.Timer(lambda _t: self._refresh_campaigns(), 5)
-        self._campaign_timer.start()
+        # Picks up vocabulary files added or removed while running.
+        self._vocab_timer = rumps.Timer(lambda _t: self._refresh_vocab_menu(), 5)
+        self._vocab_timer.start()
 
         self._hotkeys = self._config_hotkeys()
         self._hotkeys.update(self._saved_hotkeys())
@@ -258,22 +265,26 @@ class DictateApp(rumps.App):
             else:
                 self._overlay.hide_status()
 
-    def _refresh_campaigns(self) -> None:
-        campaigns = list_campaigns()
-        active = get_active_campaign()
-        if campaigns != self._campaigns:
-            if self._campaigns is not None:
-                self._campaign_menu.clear()
-            self._campaigns = campaigns
-            self._campaign_menu.add(rumps.MenuItem("Off", callback=self._choose_campaign))
-            for name in campaigns:
-                self._campaign_menu.add(rumps.MenuItem(name, callback=self._choose_campaign))
-        for item in self._campaign_menu.values():
-            item.state = item.title == (active or "Off")
+    def _refresh_vocab_menu(self) -> None:
+        names = list_vocabularies()
+        if names != self._vocab_names:
+            if self._vocab_names is not None:
+                self._vocab_menu.clear()
+            self._vocab_names = names
+            for name in names:
+                self._vocab_menu.add(rumps.MenuItem(name, callback=self._toggle_vocabulary))
+            if not names:
+                # No callback, so it shows disabled.
+                self._vocab_menu.add(rumps.MenuItem("(none)"))
+        if not names:
+            return
+        selected = get_selected_vocabularies()
+        for item in self._vocab_menu.values():
+            item.state = item.title in selected
 
-    def _choose_campaign(self, sender) -> None:
-        set_active_campaign(None if sender.title == "Off" else sender.title)
-        self._refresh_campaigns()
+    def _toggle_vocabulary(self, sender) -> None:
+        set_vocabulary_selected(sender.title, not sender.state)
+        self._refresh_vocab_menu()
 
     def _add_history(self, raw: str, clean: str, used_fallback: bool) -> None:
         self._history.appendleft({"raw": raw, "clean": clean, "used_fallback": used_fallback})
@@ -442,24 +453,29 @@ class DictateApp(rumps.App):
         self._one_shot.start()
 
     def _ask(self, title: str, message: str, default: str = "") -> tuple[str, Path] | None:
-        """Ask for text and a target file ("Base" or the active campaign)."""
+        """Ask for text and a target file: one button per vocabulary file,
+        selected or not, alphabetically."""
         import AppKit
 
-        campaign = get_active_campaign()
+        names = list_vocabularies()
+        if not names:
+            notify("No vocabulary files. Add one in settings/vocabulary/ first.")
+            return None
         window = rumps.Window(
-            message=message, title=title, default_text=default, ok="Base", cancel="Cancel", dimensions=(320, 24)
+            message=message, title=title, default_text=default, ok=names[0], cancel="Cancel", dimensions=(320, 24)
         )
-        if campaign:
-            window.add_button(campaign)
+        for name in names[1:]:
+            window.add_button(name)
         AppKit.NSApp.activateIgnoringOtherApps_(True)
         response = window.run()
+        # rumps: 0 is cancel, 1 is ok, 2.. are the added buttons in order.
         if response.clicked == 0:
             return None
         if not response.text.strip():
             notify("Nothing entered, so no changes were made.")
             return None
-        target = BASE_PATH if response.clicked == 1 else campaign_path(campaign)
-        return response.text.strip(), target
+        name = names[0] if response.clicked == 1 else names[response.clicked - 1]
+        return response.text.strip(), vocabulary_path(name)
 
     def _write_term(self, target: Path, term: str, variants: list[str]) -> bool:
         try:
@@ -607,25 +623,23 @@ class DictateApp(rumps.App):
 
     def _refix(self, raw: str) -> None:
         """Re-apply the (just updated) vocabulary and cleanup to an earlier raw text."""
-        from snoozy_scribe.dictation import pipeline
-
-        vocab = self._vocab.current_vocab()
-        raw = apply_vocabulary(raw, pipeline.merged_vocab(vocab))
+        merged = merge_vocabularies(self._vocab.current_vocabs())
+        raw = apply_vocabulary(raw, merged)
         clean = raw
         if self._cleaner is not None and raw:
-            clean, _ = self._cleaner.clean(raw, list(pipeline.merged_vocab(vocab)))
+            clean, _ = self._cleaner.clean(raw, list(merged))
         set_clipboard_text(clean)
         callAfter(notify, "Corrected text copied")
 
     def _process(self, audio, context: dict | None) -> None:
         from snoozy_scribe.dictation import pipeline
 
-        vocab = self._vocab.current_vocab()
-        raw = pipeline.transcribe_clip(audio, vocab, self._settings)
+        vocabs = self._vocab.current_vocabs()
+        raw = pipeline.transcribe_clip(audio, vocabs, self._settings)
         clean, used_fallback = raw, False
         if self._cleaner is not None and raw:
             clean, used_fallback = self._cleaner.clean(
-                raw, list(pipeline.merged_vocab(vocab)), context_line(context)
+                raw, list(merge_vocabularies(vocabs)), context_line(context)
             )
         log.info("dictated %.1fs into %s, fallback=%s", len(audio) / SAMPLE_RATE, context, used_fallback)
         if not clean:
@@ -647,13 +661,13 @@ def run_once(wav_path: str) -> None:
 
     config = load_config(paths.DEFAULT_CONFIG_PATH)
     settings = pipeline.load_settings(config)
-    vocab = VocabState(notify=print).current_vocab()
+    vocabs = VocabState(notify=print).current_vocabs()
     audio = np.array(load_audio(wav_path), dtype=np.float32)
-    raw = pipeline.transcribe_clip(audio, vocab, settings)
+    raw = pipeline.transcribe_clip(audio, vocabs, settings)
     print(f"RAW: {raw}")
     cleaner = load_cleaner(config)
     if cleaner is not None:
-        clean, used_fallback = cleaner.clean(raw, list(pipeline.merged_vocab(vocab)))
+        clean, used_fallback = cleaner.clean(raw, list(merge_vocabularies(vocabs)))
         print(f"CLEAN: {clean}" + ("  (fallback used)" if used_fallback else ""))
 
 
