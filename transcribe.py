@@ -36,6 +36,7 @@ from mlx_whisper.audio import HOP_LENGTH
 from mlx_whisper.tokenizer import LANGUAGES
 
 from snoozy_scribe import identity, paths, silero_onnx
+from snoozy_scribe.audio_input import AUDIO_EXTENSIONS
 from snoozy_scribe.config import check_legacy_layout, load_config
 from snoozy_scribe.models import resolve_model_path
 from snoozy_scribe.text_filters import (
@@ -54,8 +55,6 @@ from snoozy_scribe.vocabulary import (
 )
 
 VAD_SAMPLE_RATE = 16000
-
-AUDIO_EXTENSIONS = {".flac", ".wav", ".mp3", ".m4a", ".ogg", ".aac"}
 
 # Arbitrary fixed epoch used as merge_tracks()'s timestamp base in "elapsed"
 # timestamp mode, so the first segment lands at 00:00:00 instead of the real
