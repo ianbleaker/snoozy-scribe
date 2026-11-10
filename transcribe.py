@@ -336,6 +336,23 @@ class TrackPartial(NamedTuple):
     last_region_text: str
 
 
+FINGERPRINT_BYTES = 1024 * 1024
+
+
+def audio_fingerprint(audio_path: Path) -> str:
+    """sha256 of the file's first MiB plus its size.
+
+    The cache root is shared by every input, including generically named
+    files (`Recording 1.m4a`), and same-length WAVs share a size, so size
+    alone can't tell two recordings apart.
+    """
+    digest = hashlib.sha256()
+    with audio_path.open("rb") as audio_file:
+        digest.update(audio_file.read(FINGERPRINT_BYTES))
+    digest.update(str(audio_path.stat().st_size).encode())
+    return digest.hexdigest()
+
+
 def write_track_partial(
     partial_dir: Path,
     username: str,
@@ -354,6 +371,7 @@ def write_track_partial(
     stat = audio_path.stat()
     data = {
         "audio_size": stat.st_size,
+        "audio_fingerprint": audio_fingerprint(audio_path),
         "language": progress.language,
         "segments": progress.segments,
         "regions": speech_regions[: progress.regions_done * 2],
@@ -392,7 +410,11 @@ def load_track_partial(
 
     stat = audio_path.stat()
     try:
-        if data["audio_size"] != stat.st_size:
+        # Partials written before the fingerprint existed are trusted on size
+        # alone; discarding them would throw away hours of Craig caches.
+        if data["audio_size"] != stat.st_size or (
+            "audio_fingerprint" in data and data["audio_fingerprint"] != audio_fingerprint(audio_path)
+        ):
             warn("stale (audio file changed)")
             return None
 
