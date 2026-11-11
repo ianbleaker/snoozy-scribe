@@ -1770,7 +1770,10 @@ class RunSettings:
     logprob_threshold: float
     best_of: int | None
     input_dir: Path
+    # Config output_dir: the partial cache's root, whatever --output-dir says.
     output_dir: Path
+    # Where transcript files go: --output-dir if given, else output_dir.
+    transcript_dir: Path
     partial_max_age_days: float
     speaker_map: dict[str, str]
     vad_min_silence_ms: float
@@ -2273,7 +2276,7 @@ def transcribe_audio(
         resolved_flagged,
         resolved_pruned,
         source.title,
-        settings.output_dir,
+        settings.transcript_dir,
         settings.timestamp_format,
         settings.line_format,
         merge_stats,
@@ -2389,6 +2392,14 @@ def main() -> None:
         type=Path,
         default=paths.DEFAULT_CONFIG_PATH,
         help="Path to config.yaml (default: settings/config.yaml)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Write transcript files here instead of the config `output_dir`. "
+        "The segment cache stays under the config `output_dir`/.partial/.",
     )
     parser.add_argument("--model", help="Override the configured whisper_model")
     parser.add_argument(
@@ -2615,7 +2626,7 @@ def main() -> None:
     if args.prune_cache is not None:
         if args.prune_cache < 0:
             sys.exit("error: --prune-cache DAYS must be 0 or more")
-        if args.input is not None or windowed or args.fresh or args.shared_mic:
+        if args.input is not None or windowed or args.fresh or args.shared_mic or args.output_dir:
             sys.exit("error: --prune-cache only prunes and exits; drop the other arguments")
     if args.separate:
         for flag, value in (
@@ -2785,6 +2796,7 @@ def main() -> None:
         best_of=best_of,
         input_dir=input_dir,
         output_dir=output_dir,
+        transcript_dir=args.output_dir.expanduser().resolve() if args.output_dir else output_dir,
         partial_max_age_days=partial_max_age_days,
         speaker_map=speaker_map,
         vad_min_silence_ms=vad_min_silence_ms,
