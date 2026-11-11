@@ -1,6 +1,6 @@
 # snoozy-scribe
 
-A menu-bar app for local push-to-talk dictation on the Mac: hold a key, speak, release, and cleaned-up text is pasted into the frontmost app. Everything runs on-device: Whisper transcribes, a small mlx-lm model (`dictation.cleanup_model`) fixes punctuation, fillers, false starts and self-corrections ("send it to Bob, no, Alice" → "Send it to Alice."), and your vocabulary fixes spellings. It also transcribes recorded Discord sessions (Craig exports) into Markdown transcripts, offline too.
+A menu-bar app for local push-to-talk dictation on the Mac: hold a key, speak, release, and cleaned-up text is pasted into the frontmost app. Everything runs on-device: Whisper transcribes, a small mlx-lm model (`dictation.cleanup_model`) fixes punctuation, fillers, false starts and self-corrections ("send it to Bob, no, Alice" → "Send it to Alice."), and your vocabulary fixes spellings. It also transcribes recorded audio (Craig exports of Discord sessions, single audio files, or folders of them) into Markdown transcripts, offline too.
 
 ## Requirements
 
@@ -52,7 +52,7 @@ A pill near the bottom of the screen shows "● Recording" with a level meter, t
 - **Fix last dictation…**: enter `wrong -> right`. Adds `wrong` as a `Misheard as` variant of `right`, then copies the corrected last dictation to the clipboard.
 - **Add term…**: `Term`, or `Term | misheard1, misheard2`.
 - **Add selected text**: copies the selection from the frontmost app and opens Add term with it.
-- **Transcribe session…** opens the session GUI. **Open settings folder**. **Edit cleanup prompt…** opens `settings/prompts/dictation-cleanup.md`, the cleanup model's instructions; edits apply on the next dictation. **Permissions…** opens the permissions window. **Launch at login** adds a LaunchAgent that opens the app at login.
+- **Transcribe audio…** opens the transcription GUI. **Open settings folder**. **Edit cleanup prompt…** opens `settings/prompts/dictation-cleanup.md`, the cleanup model's instructions; edits apply on the next dictation. **Permissions…** opens the permissions window. **Launch at login** adds a LaunchAgent that opens the app at login.
 
 ## Config
 
@@ -64,9 +64,9 @@ The cleanup models' prompts are tracked files in `settings/prompts/`. The transc
 
 Vocabulary files in `settings/vocabulary/` hold terms Whisper gets wrong, such as names and places. Each file is one vocabulary; dictation applies the ones ticked in the menu, session transcription the ones in config `vocabularies`. Format, merging and capture: [docs/vocabulary.md](docs/vocabulary.md).
 
-## Transcribing recorded sessions
+## Transcribing audio
 
-`transcribe.py` (or the GUI, from **Transcribe session…**) turns a Craig export of a Discord session into one Markdown transcript, with speakers merged by time. Setup and usage: [docs/session-transcription.md](docs/session-transcription.md).
+`transcribe.py` (or the GUI, from **Transcribe audio…**) turns a Craig export of a Discord session, an audio file, or a folder of audio files into a Markdown transcript, with speakers merged by time. Setup and usage: [docs/session-transcription.md](docs/session-transcription.md).
 
 ## Troubleshooting
 
