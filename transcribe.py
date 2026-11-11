@@ -22,7 +22,7 @@ import time
 import tty
 import unicodedata
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -245,12 +245,12 @@ def write_partial_meta(
     (partial_dir / "_meta.json").write_text(json.dumps(meta))
 
 
-def prune_partials(output_dir: Path, max_age_days: float, keep: str | None = None) -> list[str]:
+def prune_partials(output_dir: Path, max_age_days: float, keep: Collection[str] = ()) -> list[str]:
     """Delete `.partial/<slug>/` dirs unused for at least `max_age_days`.
 
     Age comes from `_meta.json`'s mtime, since every full run rewrites it
     (falling back to the directory's own mtime if it's missing).
-    `max_age_days=0` removes every dir. `keep` names a slug never to remove
+    `max_age_days=0` removes every dir. `keep` names slugs never to remove
     (the current run's). Returns the removed slugs.
     """
     root = output_dir / ".partial"
@@ -259,7 +259,7 @@ def prune_partials(output_dir: Path, max_age_days: float, keep: str | None = Non
     cutoff = time.time() - max_age_days * 86400
     removed = []
     for slug_dir in sorted(root.iterdir()):
-        if not slug_dir.is_dir() or slug_dir.name == keep:
+        if not slug_dir.is_dir() or slug_dir.name in keep:
             continue
         meta_path = slug_dir / "_meta.json"
         last_used = (meta_path if meta_path.exists() else slug_dir).stat().st_mtime
@@ -1875,13 +1875,44 @@ def folder_source(folder: Path, audio_files: list[Path], title: str | None) -> A
     )
 
 
+def prune_stale_partials(settings: RunSettings, keep: Collection[str]) -> None:
+    """Apply `partial_max_age_days` to the cache, sparing the slugs in `keep`."""
+    if settings.windowed or settings.partial_max_age_days <= 0:
+        return
+    pruned = prune_partials(settings.output_dir, settings.partial_max_age_days, keep=keep)
+    if pruned:
+        print(
+            f"Pruned {len(pruned)} cached session(s) unused for "
+            f"{settings.partial_max_age_days:g}+ days: {', '.join(pruned)}"
+        )
+
+
+def resolve_whisper_model(settings: RunSettings) -> Path:
+    """Resolve (downloading on first run) the Whisper model, once per process."""
+    print("RESOLVING MODEL...")
+    print(f"  {settings.model_repo}")
+
+    def announce_download() -> None:
+        print("  Downloading model (first run)...")
+        _progress_events.step("Downloading Whisper model (first run)")
+
+    model_path = resolve_model_path(settings.model_repo, settings.model_dir, on_download=announce_download)
+    print()
+    return model_path
+
+
 def transcribe_audio(
     source: AudioSource,
     settings: RunSettings,
+    model_path: Path,
     cancel_watcher: _CancelWatcher,
     exit_stack: contextlib.ExitStack,
+    prune: bool = True,
 ) -> Path:
-    """Transcribe, merge and write one AudioSource; return the transcript path."""
+    """Transcribe, merge and write one AudioSource; return the transcript path.
+
+    `prune` applies `partial_max_age_days` first; a batch prunes once up
+    front instead, so one file's run can't remove a later file's cache."""
     slug = _slugify(source.title)
     partial_dir = partial_dir_for(settings.output_dir, slug)
     # Never discard the cache here: rebuilding it can take an hour, and the
@@ -1906,13 +1937,8 @@ def transcribe_audio(
                 "Rerun with the saved settings (e.g. --model <saved model_repo>) to reuse it, "
                 "or pass --fresh (or delete that directory) to discard it and retranscribe every track."
             )
-    if not settings.windowed and settings.partial_max_age_days > 0:
-        pruned = prune_partials(settings.output_dir, settings.partial_max_age_days, keep=slug)
-        if pruned:
-            print(
-                f"Pruned {len(pruned)} cached session(s) unused for "
-                f"{settings.partial_max_age_days:g}+ days: {', '.join(pruned)}"
-            )
+    if prune:
+        prune_stale_partials(settings, keep={slug})
 
     matched = dict(source.tracks)
     shared_spans: dict[str, list[tuple[float, float, str]]] = {}
@@ -2044,16 +2070,6 @@ def transcribe_audio(
         f"{_format_duration(total_raw_s)} raw audio ({speech_pct:.0f}%) to transcribe "
         f"in {_format_duration(vad_elapsed)}"
     )
-    print()
-
-    print("RESOLVING MODEL...")
-    print(f"  {settings.model_repo}")
-
-    def announce_download() -> None:
-        print("  Downloading model (first run)...")
-        _progress_events.step("Downloading Whisper model (first run)")
-
-    model_path = resolve_model_path(settings.model_repo, settings.model_dir, on_download=announce_download)
     print()
 
     print("TRANSCRIBING TRACKS...")
@@ -2270,6 +2286,69 @@ def transcribe_audio(
     return output_path
 
 
+def transcribe_separately(
+    audio_files: list[Path],
+    speaker: str | None,
+    settings: RunSettings,
+    cancel_watcher: _CancelWatcher,
+    exit_stack: contextlib.ExitStack,
+) -> None:
+    """--separate: transcribe each file into its own transcript, in this
+    process so the model loads once. A failed file is reported and skipped;
+    cancelling stops the batch. Exits 1 if any file failed."""
+    titles = unique_stems(audio_files)
+    prune_stale_partials(settings, keep={_slugify(title) for title in titles.values()})
+    model_path = resolve_whisper_model(settings)
+    output_paths: list[Path] = []
+    failed: list[dict[str, str]] = []
+    total = len(audio_files)
+    for i, audio_path in enumerate(audio_files, start=1):
+        print(_rule("-"))
+        print(f"FILE {i}/{total}: {audio_path.name}")
+        print()
+        _progress_events.step(f"File {i}/{total}: {audio_path.name}")
+        try:
+            source = file_source(audio_path, titles[audio_path], speaker)
+            output_path = transcribe_audio(
+                source, settings, model_path, cancel_watcher, exit_stack, prune=False
+            )
+        except TranscriptionCancelled:
+            raise
+        except (Exception, SystemExit) as e:
+            # A per-file sys.exit("error: ...") (e.g. a cache built with other
+            # settings) fails that file, not the batch.
+            if isinstance(e, SystemExit) and not isinstance(e.code, str):
+                raise
+            message = (e.code if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}").strip()
+            print(f"!! {audio_path.name} failed: {message}")
+            print()
+            failed.append({"file": audio_path.name, "message": message})
+            continue
+        print(f"Wrote transcript to {output_path}")
+        print()
+        output_paths.append(output_path)
+
+    print(_rule("-"))
+    print(f"Transcribed {len(output_paths)} of {total} file(s).")
+    for failure in failed:
+        print(f"  failed: {failure['file']} ({failure['message']})")
+    print()
+    if not output_paths:
+        _progress_events.emit(phase="error", message=f"All {total} files failed")
+        print(_rule())
+        sys.exit(1)
+    resolved_paths = [str(path.resolve()) for path in output_paths]
+    _progress_events.emit(
+        phase="done",
+        output_path=resolved_paths[-1],
+        output_paths=resolved_paths,
+        failed=failed,
+    )
+    print(_rule())
+    if failed:
+        sys.exit(1)
+
+
 def main() -> None:
     start_time = time.monotonic()
 
@@ -2349,6 +2428,12 @@ def main() -> None:
         "default (a single resample per retry). Overrides the config `best_of` key.",
     )
     parser.add_argument("--title", help="Override the session title")
+    parser.add_argument(
+        "--separate",
+        action="store_true",
+        help="With a folder of audio files, transcribe each file into its own "
+        "transcript instead of merging them into one.",
+    )
     parser.add_argument(
         "--speaker",
         metavar="NAME",
@@ -2532,6 +2617,17 @@ def main() -> None:
             sys.exit("error: --prune-cache DAYS must be 0 or more")
         if args.input is not None or windowed or args.fresh or args.shared_mic:
             sys.exit("error: --prune-cache only prunes and exits; drop the other arguments")
+    if args.separate:
+        for flag, value in (
+            ("--title", args.title),
+            ("--output-name", args.output_name),
+            ("--start", args.start),
+            ("--end", args.end),
+            ("--test", args.test),
+            ("--shared-mic", args.shared_mic),
+        ):
+            if value is not None:
+                sys.exit(f"error: {flag} can't be combined with --separate, which writes one transcript per file")
     if windowed and args.fresh:
         sys.exit("error: --fresh doesn't apply to windowed runs, which never use saved partial output")
     global _saves_partials
@@ -2733,7 +2829,9 @@ def main() -> None:
         detected = detect_input(resolved_input_path)
     except InputError as e:
         sys.exit(f"error: {e}")
-    if args.speaker is not None and detected.kind is not InputKind.SINGLE_FILE:
+    if args.separate and detected.kind is not InputKind.LOOSE_FOLDER:
+        sys.exit("error: --separate only applies to a folder of audio files")
+    if args.speaker is not None and detected.kind is not InputKind.SINGLE_FILE and not args.separate:
         sys.exit("error: --speaker only applies to a single audio file or --separate")
 
     is_zip = detected.kind is InputKind.CRAIG_ZIP
@@ -2746,13 +2844,17 @@ def main() -> None:
         if cancel_watcher.enabled:
             print("(press Escape, then y, to cancel — progress on completed tracks is saved)")
             print()
+        if args.separate:
+            transcribe_separately(detected.audio_files, args.speaker, settings, cancel_watcher, exit_stack)
+            return
         if detected.kind is InputKind.SINGLE_FILE:
             source = file_source(detected.path, args.title, args.speaker)
         elif detected.kind is InputKind.LOOSE_FOLDER:
             source = folder_source(detected.path, detected.audio_files, args.title)
         else:
             source = craig_source(resolved_input_path, tmp_dir, args.title)
-        output_path = transcribe_audio(source, settings, cancel_watcher, exit_stack)
+        model_path = resolve_whisper_model(settings)
+        output_path = transcribe_audio(source, settings, model_path, cancel_watcher, exit_stack)
 
     elapsed = time.monotonic() - start_time
     print(f"Wrote transcript to {output_path} ({_format_duration(elapsed)})")
