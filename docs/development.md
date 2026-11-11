@@ -21,12 +21,12 @@ Relative paths in `settings/config.yaml` resolve against the repo root, not the 
 3. `.venv/bin/pip install --no-deps -r requirements.lock`
 4. `cp settings/config.example.yaml settings/config.yaml`, if it doesn't exist.
 5. Warn if `ffmpeg` is missing (`brew install ffmpeg`; only session transcription needs it).
-6. If `~/Applications/rpg-scribe.app` (the old name) exists: refuse while it's running, delete it and clear its grants with `tccutil reset <service> local.rpg-scribe.gui`. The app itself moves an old `local.rpg-scribe.dictate` LaunchAgent to the new label on launch.
+6. If `~/Applications/rpg-scribe.app` (the old name) exists: refuse while it's running, delete it and clear its grants with `tccutil reset <service> local.rpg-scribe.gui`. The app itself replaces an old `local.rpg-scribe.dictate` or `local.snoozy-scribe.dictate` LaunchAgent with an SMAppService login item on launch.
 7. Create the `snoozy-scribe Code Signing` certificate in the login keychain if `security find-identity -v -p codesigning` doesn't list it (see [Code signing](#code-signing)). If that fails, warn and carry on; the app is then signed ad-hoc.
 8. If `~/Applications/snoozy-scribe.app` is missing, the venv was recreated, `--rebuild-app` was passed, or the installed copy is ad-hoc signed while the certificate exists: refuse while the app is running, run `./make-app.sh`, and copy the bundle with `ditto snoozy-scribe.app ~/Applications/snoozy-scribe.app`. If the designated requirement changed (`codesign -d -r-`), or the build is ad-hoc, clear the old grants with `tccutil reset <service> local.snoozy-scribe.gui` for Microphone, ListenEvent, Accessibility and PostEvent.
 9. Warn about a stale copy in `/Applications`.
 
-The app's name, bundle ID, LaunchAgent label, log path and certificate name all come from `snoozy_scribe/identity.py`; `make-app.sh` and `setup.sh` read them with `.venv/bin/python -m snoozy_scribe.identity --shell`.
+The app's name, bundle ID, old LaunchAgent labels, log path and certificate name all come from `snoozy_scribe/identity.py`; `make-app.sh` and `setup.sh` read them with `.venv/bin/python -m snoozy_scribe.identity --shell`.
 
 `--no-deps` matters: mlx-whisper declares torch but doesn't need it for transcription, and a normal install would pull in ~700MB of torch.
 

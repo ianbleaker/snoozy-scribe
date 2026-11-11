@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-import plistlib
+import os
 import queue
 import subprocess
 import sys
@@ -65,8 +65,10 @@ HOTKEY_ROLES = {
     "add_selection_hotkey": ("Add selected text", False, None),
 }
 CAPTURE_SECONDS = 10
-LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{identity.LAUNCH_AGENT_LABEL}.plist"
-LEGACY_LAUNCH_AGENT_PATH = LAUNCH_AGENT_PATH.with_name(f"{identity.LEGACY_LAUNCH_AGENT_LABEL}.plist")
+# Hand-written LaunchAgents that earlier versions used for Launch at login.
+# They showed only under Allow in the Background; the app now registers itself
+# with SMAppService, so it's listed under Open at Login.
+OLD_LAUNCH_AGENT_LABELS = (identity.LAUNCH_AGENT_LABEL, identity.LEGACY_LAUNCH_AGENT_LABEL)
 APP_BUNDLE_ID = identity.BUNDLE_ID
 # Shown in messages, with ~ for the home folder.
 LOG_PATH_DISPLAY = f"~/{identity.LOG_PATH.relative_to(Path.home())}"
@@ -155,12 +157,52 @@ def notify(message: str, title: str = identity.APP_NAME) -> None:
         log.exception("notification failed")
 
 
-def app_bundle_path() -> Path:
-    """The running .app, or the repo's snoozy-scribe.app when run from a terminal."""
-    import AppKit
+def _login_service():
+    """SMAppService for this app, or None when not running as the app bundle.
 
-    bundle = Path(AppKit.NSBundle.mainBundle().bundlePath())
-    return bundle if bundle.suffix == ".app" else paths.REPO_DIR / f"{identity.APP_NAME}.app"
+    mainAppService() acts on the process's main bundle, which is Python itself
+    when dictate.py runs from a terminal; registering that would open Python at
+    login.
+    """
+    import AppKit
+    import ServiceManagement
+
+    if AppKit.NSBundle.mainBundle().bundleIdentifier() != identity.BUNDLE_ID:
+        return None
+    return ServiceManagement.SMAppService.mainAppService()
+
+
+def login_item_enabled() -> bool:
+    import ServiceManagement
+
+    service = _login_service()
+    return service is not None and service.status() == ServiceManagement.SMAppServiceStatusEnabled
+
+
+def set_login_item(enabled: bool) -> str | None:
+    """Register or unregister the app as a login item. Returns an error message, or None."""
+    import ServiceManagement
+
+    service = _login_service()
+    if service is None:
+        return f"Launch at login works only from {identity.APP_NAME}.app, not from a terminal."
+    if enabled:
+        ok, err = service.registerAndReturnError_(None)
+    else:
+        ok, err = service.unregisterAndReturnError_(None)
+    if not ok:
+        log.error(
+            "couldn't %s login item: %s %s %s",
+            "register" if enabled else "unregister",
+            err.domain(),
+            err.code(),
+            err.localizedDescription(),
+        )
+        return str(err.localizedDescription())
+    if enabled and service.status() == ServiceManagement.SMAppServiceStatusRequiresApproval:
+        ServiceManagement.SMAppService.openSystemSettingsLoginItems()
+        return f"Turn {identity.APP_NAME} on under Open at Login in System Settings."
+    return None
 
 
 class DictateApp(rumps.App):
@@ -184,7 +226,7 @@ class DictateApp(rumps.App):
         self._vocab_menu = rumps.MenuItem("Vocabulary")
         self._history_menu = rumps.MenuItem("History")
         self._login_item = rumps.MenuItem("Launch at login", callback=self._toggle_login)
-        self._login_item.state = LAUNCH_AGENT_PATH.exists()
+        self._login_item.state = login_item_enabled()
         self._hotkeys_menu = rumps.MenuItem("Hotkeys")
         self._hotkey_items: dict[str, rumps.MenuItem] = {}
         for role in HOTKEY_ROLES:
@@ -530,12 +572,11 @@ class DictateApp(rumps.App):
         subprocess.run(["open", str(paths.PROMPTS_DIR / "dictation-cleanup.md")], check=False)
 
     def _toggle_login(self, sender) -> None:
-        if LAUNCH_AGENT_PATH.exists():
-            LAUNCH_AGENT_PATH.unlink()
-            sender.state = False
-            return
-        write_launch_agent()
-        sender.state = True
+        # Read the status fresh: the user may have changed it in System Settings.
+        error = set_login_item(not login_item_enabled())
+        sender.state = login_item_enabled()
+        if error:
+            rumps.alert(title="Launch at login", message=error)
 
     # --- control thread: mic on/off ----------------------------------------
 
@@ -683,32 +724,27 @@ def load_cleaner(config: dict):
     return Cleaner(resolve_model_path(dictation.get("cleanup_model", DEFAULT_CLEANUP_MODEL), model_dir))
 
 
-def write_launch_agent() -> None:
-    # Launched through LaunchServices like a Finder double-click, so the
-    # permissions granted to the bundle still apply.
-    LAUNCH_AGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LAUNCH_AGENT_PATH.open("wb") as f:
-        plistlib.dump(
-            {
-                "Label": identity.LAUNCH_AGENT_LABEL,
-                "ProgramArguments": ["/usr/bin/open", "-a", str(app_bundle_path())],
-                "RunAtLoad": True,
-            },
-            f,
-        )
-
-
-def migrate_legacy_launch_agent() -> None:
-    """Replace the old name's login item, which would keep opening the old app."""
-    if not LEGACY_LAUNCH_AGENT_PATH.exists():
+def migrate_launch_agents() -> None:
+    """Move Launch at login from an old hand-written LaunchAgent to SMAppService."""
+    agents = Path.home() / "Library/LaunchAgents"
+    found = [label for label in OLD_LAUNCH_AGENT_LABELS if (agents / f"{label}.plist").exists()]
+    if not found:
         return
-    try:
-        LEGACY_LAUNCH_AGENT_PATH.unlink()
-        write_launch_agent()
-    except OSError as e:
-        log.warning("couldn't move Launch at login from %s: %s", LEGACY_LAUNCH_AGENT_PATH.name, e)
+    if _login_service() is None:
+        return  # Leave them for the app bundle to migrate.
+    # Register first, so a failure keeps the old LaunchAgent working.
+    error = set_login_item(True)
+    if error:
+        log.warning("couldn't move Launch at login to SMAppService: %s", error)
         return
-    log.info("moved Launch at login from %s to %s", LEGACY_LAUNCH_AGENT_PATH.name, LAUNCH_AGENT_PATH.name)
+    for label in found:
+        try:
+            (agents / f"{label}.plist").unlink()
+        except OSError as e:
+            log.warning("couldn't remove LaunchAgent %s: %s", label, e)
+        # Unload it now so it leaves Allow in the Background before the next login.
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], check=False, capture_output=True)
+    log.info("moved Launch at login from LaunchAgent %s to SMAppService", ", ".join(found))
 
 
 def main() -> None:
@@ -742,7 +778,7 @@ def main() -> None:
         if legacy:
             raise SystemExit("\n".join(legacy))
         config = load_config(paths.DEFAULT_CONFIG_PATH)
-        migrate_legacy_launch_agent()
+        migrate_launch_agents()
         app = DictateApp(config)
     except (SystemExit, ValueError) as e:
         # ValueError: a bad or clashing hotkey string in config.yaml.

@@ -52,7 +52,7 @@ A pill near the bottom of the screen shows "● Recording" with a level meter, t
 - **Fix last dictation…**: enter `wrong -> right`. Adds `wrong` as a `Misheard as` variant of `right`, then copies the corrected last dictation to the clipboard.
 - **Add term…**: `Term`, or `Term | misheard1, misheard2`.
 - **Add selected text**: copies the selection from the frontmost app and opens Add term with it.
-- **Transcribe audio…** opens the transcription GUI. **Open settings folder**. **Edit cleanup prompt…** opens `settings/prompts/dictation-cleanup.md`, the cleanup model's instructions; edits apply on the next dictation. **Permissions…** opens the permissions window. **Launch at login** adds a LaunchAgent that opens the app at login.
+- **Transcribe audio…** opens the transcription GUI. **Open settings folder**. **Edit cleanup prompt…** opens `settings/prompts/dictation-cleanup.md`, the cleanup model's instructions; edits apply on the next dictation. **Permissions…** opens the permissions window. **Launch at login** adds the app to System Settings → General → Login Items → Open at Login; if macOS asks for approval there, turn it on.
 
 ## Config
 
@@ -72,8 +72,8 @@ Vocabulary files in `settings/vocabulary/` hold terms Whisper gets wrong, such a
 
 - **Logs**: the app writes to `~/Library/Logs/snoozy-scribe.log`.
 - **App won't start after a Homebrew Python upgrade, or after moving the repo**: rerun `./setup.sh`. It recreates `.venv` and rebuilds the app.
-- **Old copy in `/Applications`**: earlier installs had you drag the app there, and that copy goes stale. Delete it and use `~/Applications/snoozy-scribe.app`; if **Launch at login** is on, toggle it off and on. `setup.sh` warns when it finds one.
-- **Upgrading from rpg-scribe** (the app's old name): rerun `./setup.sh`. It removes `~/Applications/rpg-scribe.app`, and the new app moves **Launch at login** over on first launch. The new name is a new app identity to macOS, so grant Microphone and Accessibility again once. The old `rpg-scribe Code Signing` certificate can be deleted in Keychain Access.
+- **Old copy in `/Applications`**: earlier installs had you drag the app there, and that copy goes stale. Delete it and use `~/Applications/snoozy-scribe.app`; if you turned **Launch at login** on from the old copy, toggle it off and on from the new one. `setup.sh` warns when it finds one.
+- **Upgrading from rpg-scribe** (the app's old name): rerun `./setup.sh`. It removes `~/Applications/rpg-scribe.app`, and the new app moves **Launch at login** over to Open at Login on first launch. The new name is a new app identity to macOS, so grant Microphone and Accessibility again once. The old `rpg-scribe Code Signing` certificate can be deleted in Keychain Access.
 
 ## Development
 
