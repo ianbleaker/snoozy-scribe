@@ -207,7 +207,7 @@ class DictateApp(rumps.App):
             # After the menu closes, so ⌘C reaches the app with the selection.
             rumps.MenuItem("Add selected text", callback=lambda _s: self._after_menu(self._add_selection)),
             None,
-            rumps.MenuItem("Transcribe session…", callback=self._open_gui),
+            rumps.MenuItem("Transcribe audio…", callback=self._open_gui),
             rumps.MenuItem("Open settings folder", callback=self._open_settings),
             rumps.MenuItem("Edit cleanup prompt…", callback=self._open_cleanup_prompt),
             self._hotkeys_menu,
