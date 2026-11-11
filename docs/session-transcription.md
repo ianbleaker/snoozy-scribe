@@ -94,7 +94,7 @@ An optional second pass over a finished transcript, using the same local model a
 It writes two files next to the input, overwriting any from an earlier run:
 
 - `<session-title>-cleaned.md` — the cleaned transcript. Its frontmatter adds `source`, an `llm_cleanup` block (model, settings and counts) and a caveat. This is the input `/analyze-narrative` expects.
-- `<session-title>-cleaned.changes.md` — every dropped line, and every rewrite as the original line followed by `→ <new line>`.
+- `<session-title>-cleaned.changes.md` — every dropped line, and every rewrite as its timestamp and speaker followed by only the changed word spans (`old` → `new`, with ∅ for an empty side).
 
 A full session (about 2,000 lines) takes several minutes. `--config <path>` uses a config file other than `settings/config.yaml`.
 
