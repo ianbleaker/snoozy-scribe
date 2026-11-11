@@ -114,7 +114,8 @@ show_bleed_markers: false
 save_gui_log: true
 
 # Directory the transcript Markdown files are written to. Defaults to
-# ./data/transcripts if omitted.
+# ./data/transcripts if omitted. The GUI's "Output folder" and `--output-dir`
+# can send transcripts elsewhere; the segment cache (.partial/) stays here.
 output_dir: ./data/transcripts
 
 # Each full run deletes cached per-track segments (<output_dir>/.partial/<slug>/)

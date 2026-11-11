@@ -1,6 +1,6 @@
 # Session transcription
 
-A local CLI tool that transcribes a Craig-recorded Discord TTRPG session (one audio file per speaker + an `info.txt` manifest) into a single Markdown transcript, chronologically merged across speakers with per-line timestamps.
+A local CLI tool that transcribes audio into a Markdown transcript with per-line timestamps. It takes a Craig-recorded Discord session (one audio file per speaker plus an `info.txt` manifest), a single audio file, or a folder of audio files. Several tracks are merged chronologically across speakers.
 
 Runs fully offline via [`mlx-whisper`](https://github.com/ml-explore/mlx-examples) on Apple Silicon's Metal GPU — no cloud API calls.
 
@@ -23,15 +23,19 @@ Optionally, `cp settings/vocabulary/vocabulary.example.md settings/vocabulary/<n
 ## Usage
 
 ```sh
-python3 transcribe.py [craig_folder]
+python3 transcribe.py [input]
 ```
 
-`<craig_folder>` is optional, and accepts either:
+`input` is optional. Its kind is detected automatically, in this order:
 
-- The folder Craig's Discord bot exports for a session (containing `info.txt` and the per-speaker audio files) — used as-is.
-- A path to a Craig `.zip` export — extracted automatically before transcription.
+- A `.zip` — always a Craig export, extracted before transcription. A zip without `info.txt` stops with an error: unzip it and pass the folder or files instead.
+- A folder containing `info.txt` — a Craig export folder, used as-is.
+- An audio file (`.aac`, `.flac`, `.m4a`, `.mp3`, `.ogg`, `.wav`) — transcribed on its own. Its lines are labelled `Speaker`, or the name given with `--speaker NAME`; the name isn't passed through `speaker_map`, since a file name is usually an event, not a person. The title is the file name without its extension.
+- Any other folder — scanned at the top level only (subfolders are ignored) for audio files. One file is treated like a single audio file. Several are merged into one transcript, one speaker per file: the speaker is the file name without its extension, mapped through `speaker_map` when it has an entry, and the title is the folder name. Merging assumes every file started recording at the same moment, as Craig guarantees. Files that didn't start together come out with shifted timelines, and the mic-bleed dedup may drop or mark lines wrongly; nothing detects this. Pass `--separate` to transcribe each file into its own transcript instead.
 
-If omitted, the oldest `.zip` file in `input_dir` (`data/input/` by default) is picked up automatically — drop Craig `.zip` exports there and run without arguments. After a successful run, a zip that was extracted (whether passed explicitly or auto-picked) is moved into `<input_dir>/processed/`. Each track's transcribed segments are cached under `<output_dir>/.partial/<slug>/` as each speech region finishes, and kept after the run. A run that crashes or is cancelled resumes from the last finished region when rerun. Rerunning the same zip, including one already in `data/input/processed/`, reuses them and only re-runs VAD and merging. Pass `--fresh` to retranscribe from scratch. If the cache was built with different settings (for example another `--model`), the run stops and lists what differs instead of discarding it. Caches unused for `partial_max_age_days` (default 30; `0` turns it off) are deleted at the start of each full run. `--prune-cache` deletes every cache and exits, and `--prune-cache DAYS` deletes only the ones unused for DAYS or more.
+For non-Craig input, the recording's start time (used by `--clock-timestamps` and the frontmatter `date`) is approximate: the file's `creation_time` tag when it has one, otherwise its modification time minus its duration, shown in local time. In a merged folder the earliest file's start is used.
+
+If omitted, the oldest `.zip` file in `input_dir` (`data/input/` by default) is picked up automatically — drop Craig `.zip` exports there and run without arguments. After a successful run, a zip that was extracted (whether passed explicitly or auto-picked) is moved into `<input_dir>/processed/`. Each track's transcribed segments are cached under `<output_dir>/.partial/<slug>/` (the config `output_dir`, even with `--output-dir`) as each speech region finishes, and kept after the run. A run that crashes or is cancelled resumes from the last finished region when rerun. Rerunning the same input, including a zip already in `data/input/processed/`, reuses them and only re-runs VAD and merging. A cached track is reused only if its audio file is unchanged (same size and same first MiB). Pass `--fresh` to retranscribe from scratch. If the cache was built with different settings (for example another `--model`), the run stops and lists what differs instead of discarding it. Caches unused for `partial_max_age_days` (default 30; `0` turns it off) are deleted at the start of each full run. `--prune-cache` deletes every cache and exits, and `--prune-cache DAYS` deletes only the ones unused for DAYS or more.
 
 The transcript is written to `output_dir` (`data/transcripts/` by default) as `<session-title>.md`. Lines Whisper's decode couldn't be trusted for show `!! [inaudible]` in the transcript; if the run had any, the original garbled text is written alongside it to `<session-title>.errors.md` for manual review against the audio. Lines deliberately dropped as filler, crosstalk backchannels or laughter are logged, with the reason, to `<session-title>.pruned.md`.
 
@@ -39,7 +43,10 @@ Options:
 
 - `--config <path>` — use a config file other than `settings/config.yaml`.
 - `--model <repo-id>` — override the configured `whisper_model`.
-- `--title <title>` — override the session title (defaults to the input's basename, without the `.zip` extension if applicable).
+- `--title <title>` — override the session title (defaults to the input's basename, without the `.zip` or audio extension if applicable).
+- `--speaker NAME` — speaker name for a single audio file, or for every file with `--separate` (default `Speaker`). Rejected for Craig and merged-folder input.
+- `--separate` — with a folder of audio files, transcribe each file into its own transcript, in one process so the model loads once. A file that fails is reported and skipped; the run ends with a summary and exits 1 if any file failed. Cancelling stops the batch, and finished files keep their transcripts. Can't be combined with `--title`, `--output-name`, `--start`/`--end`/`--test` or `--shared-mic`. Files whose names differ only by extension (`a.wav`, `a.m4a`) get it appended to their titles (`a-wav`, `a-m4a`).
+- `--output-dir PATH` — write the transcript files (`.md`, `.errors.md`, `.pruned.md`) here instead of `output_dir`. The segment cache stays under `output_dir`.
 - `--vocabulary <name>` — apply `settings/vocabulary/<name>.md`. Repeat it to apply several (merged alphabetically, see [vocabulary.md](vocabulary.md)). When given, it replaces the config `vocabularies` list. An unknown name exits with the list of available vocabularies.
 - `--enrich-vocabulary [FIELD,...]` — seed Whisper's `initial_prompt` with vocabulary enrichment fields in addition to term names. Bare flag includes every field found on any term; a comma-separated list (e.g. `--enrich-vocabulary Tagline,Description`) includes only those fields. Omit the flag entirely to seed only term names, with no enrichment.
 - `--start HH:MM:SS` / `--end HH:MM:SS` — transcribe only part of the session. Either bound can be omitted to mean the start or end of the recording. Timestamps stay relative to the whole session. The transcript is written as `<session-title>-<start>-<end>.md` (e.g. `my-session-01h30m-02h15m.md`) unless `--output-name` is given. A windowed run doesn't save resumable progress and doesn't move the zip into `processed/`, so you can come back for other windows or a full run later.
@@ -66,7 +73,7 @@ On first run, the configured Whisper model is downloaded into `model_dir` (`data
 
 Config keys:
 
-- `output_dir` — directory transcript Markdown files are written to. Defaults to `./data/transcripts`.
+- `output_dir` — directory transcript Markdown files are written to, and the root of the segment cache. Defaults to `./data/transcripts`. `--output-dir` (and the GUI's "Output folder") moves only the transcripts.
 - `input_dir` — directory to drop Craig `.zip` exports into for automatic pickup. Defaults to `./data/input`.
 - `model_dir` — where model weights are downloaded. Defaults to `./data/models`.
 - `vad_min_silence_ms` — minimum pause (in milliseconds) that splits speech into separate regions before transcription. Defaults to `800`.
@@ -108,7 +115,10 @@ python3 gui.py
 
 A basic desktop window you can use instead of the CLI. It runs `transcribe.py` for you and shows a progress bar, the elapsed time, and its log output (collapsed by default; it opens by itself if a run fails). It exposes only a subset of the CLI's options:
 
-- Craig export — a `.zip` or an export folder. Leave it blank to pick up the oldest `.zip` in `input_dir`, as the CLI does.
+- Audio — a Craig `.zip` or export folder, an audio file, or a folder of audio files ("File…" or "Folder…"). Leave it blank to pick up the oldest `.zip` in `input_dir`, as the CLI does. The line under it shows what was detected: Craig export, single audio file, or the number of audio files in a folder.
+- Output folder (`--output-dir`) — prefilled with the config `output_dir`.
+- Transcribe each file separately (`--separate`) — only for a folder of audio files. While it's checked, Output name, Time window and Shared mic are disabled.
+- Speaker name (`--speaker`) — only for a single audio file, or with "Transcribe each file separately".
 - Output name (`--output-name`)
 - Time window — start and end as `HH:MM:SS` (`--start` / `--end`). Leave both blank to transcribe the whole session.
 - Model — q4 / turbo / large-v3 (`--model`)
@@ -117,6 +127,6 @@ A basic desktop window you can use instead of the CLI. It runs `transcribe.py` f
 - Mark possible mic bleed (`--show-bleed-markers` / `--hide-bleed-markers`)
 - Shared mic (`--shared-mic`) — several entries separated by `;`
 
-Everything else still comes from `settings/config.yaml`, including `vocabularies`. Advanced flags (`--language`, `--vocabulary`, `--test`, `--fresh`, thresholds, etc.) need the CLI. Cancel stops the run after a confirmation, and progress on completed tracks is saved (except in windowed runs), just like the CLI's Escape-then-y. When a run finishes, the window offers buttons to open the transcript or reveal it in Finder, and its log is saved next to the transcript as `<session-title>.log` (uncheck "Save log next to the transcript", or set `save_gui_log: false` in the config, to skip it).
+Everything else still comes from `settings/config.yaml`, including `vocabularies`. Advanced flags (`--language`, `--vocabulary`, `--test`, `--fresh`, thresholds, etc.) need the CLI. Cancel stops the run after a confirmation, and progress on completed tracks is saved (except in windowed runs), just like the CLI's Escape-then-y. When a run finishes, the window offers buttons to open the transcript or reveal it in Finder, and its log is saved next to the transcript as `<session-title>.log` (uncheck "Save log next to the transcript", or set `save_gui_log: false` in the config, to skip it). A separate-files run that wrote several transcripts has no single transcript to open: "Open folder" opens the output folder, the log is saved there as `batch-YYYYmmdd-HHMMSS.log`, failed files are listed in red, and the status reads `Done — K of N failed` when any failed.
 
-The GUI also opens from the dictation app's menu ("Transcribe session…").
+The GUI also opens from the dictation app's menu ("Transcribe audio…").

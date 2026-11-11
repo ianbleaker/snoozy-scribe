@@ -17,13 +17,14 @@ import time
 from collections import deque
 import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import customtkinter as ctk
 import yaml
 
 from snoozy_scribe import identity, paths
+from snoozy_scribe.audio_input import AUDIO_EXTENSIONS, InputError, InputKind, detect_input
 from snoozy_scribe.config import check_legacy_layout
 
 REPO_DIR = paths.REPO_DIR
@@ -41,6 +42,7 @@ MODELS = [
 
 WINDOW_WIDTH = 760
 PHASE_LABELS = {"vad": "Analyzing speech", "transcribe": "Transcribing"}
+INPUT_FILETYPES = " ".join(["*.zip", *(f"*{ext}" for ext in sorted(AUDIO_EXTENSIONS))])
 
 
 def _load_config() -> dict:
@@ -55,11 +57,12 @@ def _load_config() -> dict:
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(identity.APP_NAME)
-        self.geometry(f"{WINDOW_WIDTH}x720")
+        self.title(f"{identity.APP_NAME} — Transcribe audio")
+        self.geometry(f"{WINDOW_WIDTH}x860")
 
         config = _load_config()
         self._input_dir = paths.resolve(config.get("input_dir", "./data/input"))
+        default_output_dir = paths.resolve(config.get("output_dir", "./data/transcripts"))
         self._legacy_layout = check_legacy_layout()
         model_repos = [repo for _, repo in MODELS]
         default_model = config.get("whisper_model")
@@ -69,11 +72,16 @@ class App(ctk.CTk):
         self._cancelling = False
         self._result: dict | None = None
         self._output_path: Path | None = None
+        # Set when a --separate run finished with several transcripts.
+        self._batch_output_dir: Path | None = None
+        self._run_output_dir: Path | None = None
+        # The input's detected kind, or None when blank or unusable.
+        self._input_kind: InputKind | None = None
         self._run_start = 0.0
         # Windowed runs don't save partial output, so cancelling one loses it.
         self._windowed = False
         # Window height to restore when the log is expanded again.
-        self._expanded_height = 720
+        self._expanded_height = 860
 
         self.model_var = ctk.StringVar(
             value=default_model if default_model in model_repos else model_repos[0]
@@ -82,6 +90,7 @@ class App(ctk.CTk):
         self.inaudible_var = ctk.BooleanVar(value=bool(config.get("show_inaudible_placeholders", False)))
         self.bleed_var = ctk.BooleanVar(value=bool(config.get("show_bleed_markers", False)))
         self.save_log_var = ctk.BooleanVar(value=bool(config.get("save_gui_log", True)))
+        self.separate_var = ctk.BooleanVar(value=False)
 
         self.grid_columnconfigure(0, weight=1)
 
@@ -89,21 +98,33 @@ class App(ctk.CTk):
         form.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
         form.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(form, text="Craig export").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+        ctk.CTkLabel(form, text="Audio").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 2))
         self.input_entry = ctk.CTkEntry(form, placeholder_text="Blank = oldest .zip in input_dir")
-        self.input_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=(12, 6))
-        self.zip_button = ctk.CTkButton(form, text="Zip…", width=70, command=self._pick_zip)
-        self.zip_button.grid(row=0, column=2, padx=(0, 6), pady=(12, 6))
+        self.input_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=(12, 2))
+        self.input_entry.bind("<KeyRelease>", lambda _event: self._refresh_detected())
+        self.file_button = ctk.CTkButton(form, text="File…", width=70, command=self._pick_file)
+        self.file_button.grid(row=0, column=2, padx=(0, 6), pady=(12, 2))
         self.folder_button = ctk.CTkButton(form, text="Folder…", width=70, command=self._pick_folder)
-        self.folder_button.grid(row=0, column=3, padx=(0, 12), pady=(12, 6))
+        self.folder_button.grid(row=0, column=3, padx=(0, 12), pady=(12, 2))
+        self.detected_label = ctk.CTkLabel(form, text="", text_color="gray", anchor="w")
+        self.detected_label.grid(row=1, column=1, columnspan=3, sticky="w", pady=(0, 6))
 
-        ctk.CTkLabel(form, text="Output name").grid(row=1, column=0, sticky="w", padx=12, pady=6)
+        ctk.CTkLabel(form, text="Output folder").grid(row=2, column=0, sticky="w", padx=12, pady=6)
+        self.output_dir_entry = ctk.CTkEntry(form)
+        self.output_dir_entry.insert(0, str(default_output_dir))
+        self.output_dir_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(0, 6), pady=6)
+        self.output_dir_button = ctk.CTkButton(
+            form, text="Browse…", width=70, command=self._pick_output_dir
+        )
+        self.output_dir_button.grid(row=2, column=3, padx=(0, 12), pady=6)
+
+        ctk.CTkLabel(form, text="Output name").grid(row=3, column=0, sticky="w", padx=12, pady=6)
         self.output_entry = ctk.CTkEntry(form, placeholder_text="Blank = slugified session title")
-        self.output_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=6)
+        self.output_entry.grid(row=3, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=6)
 
-        ctk.CTkLabel(form, text="Time window").grid(row=2, column=0, sticky="w", padx=12, pady=6)
+        ctk.CTkLabel(form, text="Time window").grid(row=4, column=0, sticky="w", padx=12, pady=6)
         window_row = ctk.CTkFrame(form, fg_color="transparent")
-        window_row.grid(row=2, column=1, columnspan=3, sticky="w", pady=6)
+        window_row.grid(row=4, column=1, columnspan=3, sticky="w", pady=6)
         self.start_entry = ctk.CTkEntry(window_row, width=140, placeholder_text="Start (HH:MM:SS)")
         self.start_entry.pack(side="left")
         ctk.CTkLabel(window_row, text="to").pack(side="left", padx=8)
@@ -113,16 +134,28 @@ class App(ctk.CTk):
             side="left", padx=(12, 0)
         )
 
-        ctk.CTkLabel(form, text="Shared mic").grid(row=3, column=0, sticky="w", padx=12, pady=6)
+        ctk.CTkLabel(form, text="Shared mic").grid(row=5, column=0, sticky="w", padx=12, pady=6)
         self.shared_mic_entry = ctk.CTkEntry(
             form,
             placeholder_text="e.g. bob42@01:44:00=Bob,Carol — separate several with ;",
         )
-        self.shared_mic_entry.grid(row=3, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=6)
+        self.shared_mic_entry.grid(row=5, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=6)
 
-        ctk.CTkLabel(form, text="Model").grid(row=4, column=0, sticky="w", padx=12, pady=6)
+        self.separate_check = ctk.CTkCheckBox(
+            form,
+            text="Transcribe each file separately",
+            variable=self.separate_var,
+            command=self._apply_input_rules,
+        )
+        self.separate_check.grid(row=6, column=1, columnspan=3, sticky="w", pady=6)
+
+        ctk.CTkLabel(form, text="Speaker name").grid(row=7, column=0, sticky="w", padx=12, pady=6)
+        self.speaker_entry = ctk.CTkEntry(form, placeholder_text="Blank = Speaker")
+        self.speaker_entry.grid(row=7, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=6)
+
+        ctk.CTkLabel(form, text="Model").grid(row=8, column=0, sticky="w", padx=12, pady=6)
         model_row = ctk.CTkFrame(form, fg_color="transparent")
-        model_row.grid(row=4, column=1, columnspan=3, sticky="w", pady=6)
+        model_row.grid(row=8, column=1, columnspan=3, sticky="w", pady=6)
         self.model_radios = []
         for label, repo in MODELS:
             radio = ctk.CTkRadioButton(model_row, text=label, variable=self.model_var, value=repo)
@@ -132,19 +165,19 @@ class App(ctk.CTk):
         self.elapsed_check = ctk.CTkCheckBox(
             form, text="Elapsed timestamps (uncheck for wall-clock time)", variable=self.elapsed_var
         )
-        self.elapsed_check.grid(row=5, column=1, columnspan=3, sticky="w", pady=6)
+        self.elapsed_check.grid(row=9, column=1, columnspan=3, sticky="w", pady=6)
         self.inaudible_check = ctk.CTkCheckBox(
             form, text="Show [inaudible] placeholders", variable=self.inaudible_var
         )
-        self.inaudible_check.grid(row=6, column=1, columnspan=3, sticky="w", pady=6)
+        self.inaudible_check.grid(row=10, column=1, columnspan=3, sticky="w", pady=6)
         self.bleed_check = ctk.CTkCheckBox(
             form, text="Mark possible mic bleed", variable=self.bleed_var
         )
-        self.bleed_check.grid(row=7, column=1, columnspan=3, sticky="w", pady=6)
+        self.bleed_check.grid(row=11, column=1, columnspan=3, sticky="w", pady=6)
         self.save_log_check = ctk.CTkCheckBox(
             form, text="Save log next to the transcript", variable=self.save_log_var
         )
-        self.save_log_check.grid(row=8, column=1, columnspan=3, sticky="w", pady=(6, 12))
+        self.save_log_check.grid(row=12, column=1, columnspan=3, sticky="w", pady=(6, 12))
 
         controls = ctk.CTkFrame(self, fg_color="transparent")
         controls.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
@@ -199,12 +232,16 @@ class App(ctk.CTk):
         state = "normal" if enabled else "disabled"
         for widget in (
             self.input_entry,
-            self.zip_button,
+            self.file_button,
             self.folder_button,
+            self.output_dir_entry,
+            self.output_dir_button,
             self.output_entry,
             self.start_entry,
             self.end_entry,
             self.shared_mic_entry,
+            self.separate_check,
+            self.speaker_entry,
             self.elapsed_check,
             self.inaudible_check,
             self.bleed_check,
@@ -213,9 +250,59 @@ class App(ctk.CTk):
             *self.model_radios,
         ):
             widget.configure(state=state)
+        if enabled:
+            self._apply_input_rules()
         if self._legacy_layout:
             # transcribe.py would exit with the same instructions.
             self.start_button.configure(state="disabled")
+
+    def _input_path(self) -> Path | None:
+        text = self.input_entry.get().strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        # transcribe.py runs with cwd=REPO_DIR, so relative paths mean that.
+        return path if path.is_absolute() else REPO_DIR / path
+
+    def _refresh_detected(self) -> None:
+        path = self._input_path()
+        self._input_kind = None
+        if path is None:
+            text = ""
+        else:
+            try:
+                detected = detect_input(path)
+            except InputError as e:
+                text = str(e)
+            else:
+                self._input_kind = detected.kind
+                text = {
+                    InputKind.CRAIG_ZIP: "Craig export",
+                    InputKind.CRAIG_FOLDER: "Craig export",
+                    InputKind.SINGLE_FILE: "Single audio file",
+                    InputKind.LOOSE_FOLDER: f"Folder: {len(detected.audio_files)} audio files",
+                }[detected.kind]
+        self.detected_label.configure(text=f"Detected: {text}" if text else "")
+        self._apply_input_rules()
+
+    def _separate(self) -> bool:
+        return self._input_kind is InputKind.LOOSE_FOLDER and self.separate_var.get()
+
+    def _apply_input_rules(self) -> None:
+        """Enable only the fields that apply to the detected input."""
+        if self._proc is not None:
+            return
+        if self._input_kind is not InputKind.LOOSE_FOLDER:
+            self.separate_var.set(False)
+        separate = self._separate()
+
+        def enable(widget, on: bool) -> None:
+            widget.configure(state="normal" if on else "disabled")
+
+        enable(self.separate_check, self._input_kind is InputKind.LOOSE_FOLDER)
+        enable(self.speaker_entry, self._input_kind is InputKind.SINGLE_FILE or separate)
+        for widget in (self.output_entry, self.start_entry, self.end_entry, self.shared_mic_entry):
+            enable(widget, not separate)
 
     def _set_idle(self) -> None:
         self._set_form_enabled(True)
@@ -231,19 +318,23 @@ class App(ctk.CTk):
         self.progress_bar.set(0)
         self.status_label.configure(text="Starting…")
 
-    def _set_done(self) -> None:
+    def _set_done(self, status: str = "Done") -> None:
         self._set_form_enabled(True)
         self.cancel_button.configure(state="disabled")
-        self.open_transcript_button.configure(state="normal")
+        # A batch has no single transcript to open.
+        self.open_transcript_button.configure(
+            state="disabled" if self._batch_output_dir is not None else "normal"
+        )
         self.open_folder_button.configure(state="normal")
         self.progress_bar.set(1)
-        self.status_label.configure(text="Done")
+        self.status_label.configure(text=status)
 
     # --- pickers ----------------------------------------------------------
 
-    def _pick_zip(self) -> None:
+    def _pick_file(self) -> None:
         path = filedialog.askopenfilename(
-            initialdir=self._input_dir, filetypes=[("Craig export", "*.zip"), ("All files", "*")]
+            initialdir=self._input_dir,
+            filetypes=[("Audio or Craig export", INPUT_FILETYPES), ("All files", "*")],
         )
         if path:
             self._set_input(path)
@@ -253,9 +344,17 @@ class App(ctk.CTk):
         if path:
             self._set_input(path)
 
+    def _pick_output_dir(self) -> None:
+        current = self.output_dir_entry.get().strip()
+        path = filedialog.askdirectory(initialdir=current or str(REPO_DIR))
+        if path:
+            self.output_dir_entry.delete(0, "end")
+            self.output_dir_entry.insert(0, path)
+
     def _set_input(self, path: str) -> None:
         self.input_entry.delete(0, "end")
         self.input_entry.insert(0, path)
+        self._refresh_detected()
 
     # --- run --------------------------------------------------------------
 
@@ -265,20 +364,31 @@ class App(ctk.CTk):
         if input_path:
             argv.append(input_path)
         argv.append("--progress-events")
-        output_name = self.output_entry.get().strip()
-        if output_name:
-            argv += ["--output-name", output_name]
-        # Validation (format, start < end, within the recording) is left to
-        # transcribe.py, whose errors come back as an `error` event.
-        window_start = self.start_entry.get().strip()
-        if window_start:
-            argv += ["--start", window_start]
-        window_end = self.end_entry.get().strip()
-        if window_end:
-            argv += ["--end", window_end]
-        for shared_mic in self.shared_mic_entry.get().split(";"):
-            if shared_mic.strip():
-                argv += ["--shared-mic", shared_mic.strip()]
+        output_dir = self.output_dir_entry.get().strip()
+        if output_dir:
+            argv += ["--output-dir", output_dir]
+        separate = self._separate()
+        if separate:
+            argv.append("--separate")
+        speaker = self.speaker_entry.get().strip()
+        if speaker and (separate or self._input_kind is InputKind.SINGLE_FILE):
+            argv += ["--speaker", speaker]
+        if not separate:
+            # --separate rejects these; their entries are disabled meanwhile.
+            output_name = self.output_entry.get().strip()
+            if output_name:
+                argv += ["--output-name", output_name]
+            # Validation (format, start < end, within the recording) is left to
+            # transcribe.py, whose errors come back as an `error` event.
+            window_start = self.start_entry.get().strip()
+            if window_start:
+                argv += ["--start", window_start]
+            window_end = self.end_entry.get().strip()
+            if window_end:
+                argv += ["--end", window_end]
+            for shared_mic in self.shared_mic_entry.get().split(";"):
+                if shared_mic.strip():
+                    argv += ["--shared-mic", shared_mic.strip()]
         argv += ["--model", self.model_var.get()]
         argv.append("--elapsed-timestamps" if self.elapsed_var.get() else "--clock-timestamps")
         argv.append("--show-inaudible" if self.inaudible_var.get() else "--hide-inaudible")
@@ -290,14 +400,20 @@ class App(ctk.CTk):
         self._cancelling = False
         self._result = None
         self._output_path = None
-        self._windowed = bool(self.start_entry.get().strip() or self.end_entry.get().strip())
+        self._batch_output_dir = None
+        output_dir = self.output_dir_entry.get().strip()
+        self._run_output_dir = Path(output_dir).expanduser() if output_dir else None
+        self._windowed = not self._separate() and bool(
+            self.start_entry.get().strip() or self.end_entry.get().strip()
+        )
+        argv = self._build_argv()
         self._set_running()
         # stdin=DEVNULL keeps transcribe.py's _CancelWatcher off (it only arms
         # on a TTY stdin); otherwise launching gui.py from a terminal would put
         # that terminal into cbreak mode. Config paths resolve against the
         # repo root on their own; cwd=REPO_DIR covers relative argv paths.
         self._proc = subprocess.Popen(
-            self._build_argv(),
+            argv,
             cwd=REPO_DIR,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -354,7 +470,9 @@ class App(ctk.CTk):
             self.status_label.configure(text=f"{event['label']}…")
         elif phase == "done":
             self._result = event
-            self._output_path = Path(event["output_path"])
+            self._output_path = Path(event["output_path"]) if event.get("output_path") else None
+            if len(event.get("output_paths", [])) > 1:
+                self._batch_output_dir = self._run_output_dir or self._output_path.parent
         elif phase == "error":
             self._result = event
             # A user cancel also ends in an error event; that one isn't a failure.
@@ -368,9 +486,13 @@ class App(ctk.CTk):
             self.status_label.configure(text="Cancelled")
             self._set_idle()
         elif self._result is not None and self._result["phase"] == "done":
+            failed = self._result.get("failed", [])
+            for failure in failed:
+                self._log_append(f"{failure['file']} failed: {failure['message']}", "error")
             if self.save_log_var.get():
                 self._save_log()
-            self._set_done()
+            total = len(self._result.get("output_paths", [])) + len(failed)
+            self._set_done(f"Done — {len(failed)} of {total} failed" if failed else "Done")
         else:
             if self._result is None:
                 self._log_append(f"transcribe.py exited with code {returncode}", "error")
@@ -434,7 +556,9 @@ class App(ctk.CTk):
             subprocess.run(["open", str(self._output_path)])
 
     def _open_folder(self) -> None:
-        if self._output_path is not None:
+        if self._batch_output_dir is not None:
+            subprocess.run(["open", str(self._batch_output_dir)])
+        elif self._output_path is not None:
             subprocess.run(["open", "-R", str(self._output_path)])
 
     # --- log pane ---------------------------------------------------------
@@ -471,9 +595,14 @@ class App(ctk.CTk):
         self.log.configure(state="disabled")
 
     def _save_log(self) -> None:
-        # Kept next to the transcript (and its .errors.md), as `<name>.log`.
-        assert self._output_path is not None
-        log_path = self._output_path.with_suffix(".log")
+        # Kept next to the transcript (and its .errors.md), as `<name>.log`;
+        # a batch's goes in its output folder as `batch-<timestamp>.log`.
+        if self._batch_output_dir is not None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            log_path = self._batch_output_dir / f"batch-{stamp}.log"
+        else:
+            assert self._output_path is not None
+            log_path = self._output_path.with_suffix(".log")
         try:
             log_path.write_text(self.log.get("1.0", "end-1c") + "\n")
         except OSError as e:

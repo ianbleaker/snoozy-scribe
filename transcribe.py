@@ -1,4 +1,4 @@
-"""Transcribe a Craig-recorded Discord TTRPG session into a Markdown file."""
+"""Transcribe audio (a Craig export, an audio file, or a folder of audio files) into Markdown."""
 
 from __future__ import annotations
 
@@ -22,8 +22,9 @@ import time
 import tty
 import unicodedata
 import zipfile
-from collections.abc import Callable
-from datetime import datetime, timedelta
+from collections.abc import Callable, Collection
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -36,6 +37,7 @@ from mlx_whisper.audio import HOP_LENGTH
 from mlx_whisper.tokenizer import LANGUAGES
 
 from snoozy_scribe import identity, paths, silero_onnx
+from snoozy_scribe.audio_input import AUDIO_EXTENSIONS, InputError, InputKind, detect_input
 from snoozy_scribe.config import check_legacy_layout, load_config
 from snoozy_scribe.models import resolve_model_path
 from snoozy_scribe.text_filters import (
@@ -54,8 +56,6 @@ from snoozy_scribe.vocabulary import (
 )
 
 VAD_SAMPLE_RATE = 16000
-
-AUDIO_EXTENSIONS = {".flac", ".wav", ".mp3", ".m4a", ".ogg", ".aac"}
 
 # Arbitrary fixed epoch used as merge_tracks()'s timestamp base in "elapsed"
 # timestamp mode, so the first segment lands at 00:00:00 instead of the real
@@ -245,12 +245,12 @@ def write_partial_meta(
     (partial_dir / "_meta.json").write_text(json.dumps(meta))
 
 
-def prune_partials(output_dir: Path, max_age_days: float, keep: str | None = None) -> list[str]:
+def prune_partials(output_dir: Path, max_age_days: float, keep: Collection[str] = ()) -> list[str]:
     """Delete `.partial/<slug>/` dirs unused for at least `max_age_days`.
 
     Age comes from `_meta.json`'s mtime, since every full run rewrites it
     (falling back to the directory's own mtime if it's missing).
-    `max_age_days=0` removes every dir. `keep` names a slug never to remove
+    `max_age_days=0` removes every dir. `keep` names slugs never to remove
     (the current run's). Returns the removed slugs.
     """
     root = output_dir / ".partial"
@@ -259,7 +259,7 @@ def prune_partials(output_dir: Path, max_age_days: float, keep: str | None = Non
     cutoff = time.time() - max_age_days * 86400
     removed = []
     for slug_dir in sorted(root.iterdir()):
-        if not slug_dir.is_dir() or slug_dir.name == keep:
+        if not slug_dir.is_dir() or slug_dir.name in keep:
             continue
         meta_path = slug_dir / "_meta.json"
         last_used = (meta_path if meta_path.exists() else slug_dir).stat().st_mtime
@@ -336,6 +336,23 @@ class TrackPartial(NamedTuple):
     last_region_text: str
 
 
+FINGERPRINT_BYTES = 1024 * 1024
+
+
+def audio_fingerprint(audio_path: Path) -> str:
+    """sha256 of the file's first MiB plus its size.
+
+    The cache root is shared by every input, including generically named
+    files (`Recording 1.m4a`), and same-length WAVs share a size, so size
+    alone can't tell two recordings apart.
+    """
+    digest = hashlib.sha256()
+    with audio_path.open("rb") as audio_file:
+        digest.update(audio_file.read(FINGERPRINT_BYTES))
+    digest.update(str(audio_path.stat().st_size).encode())
+    return digest.hexdigest()
+
+
 def write_track_partial(
     partial_dir: Path,
     username: str,
@@ -354,6 +371,7 @@ def write_track_partial(
     stat = audio_path.stat()
     data = {
         "audio_size": stat.st_size,
+        "audio_fingerprint": audio_fingerprint(audio_path),
         "language": progress.language,
         "segments": progress.segments,
         "regions": speech_regions[: progress.regions_done * 2],
@@ -392,7 +410,11 @@ def load_track_partial(
 
     stat = audio_path.stat()
     try:
-        if data["audio_size"] != stat.st_size:
+        # Partials written before the fingerprint existed are trusted on size
+        # alone; discarding them would throw away hours of Craig caches.
+        if data["audio_size"] != stat.st_size or (
+            "audio_fingerprint" in data and data["audio_fingerprint"] != audio_fingerprint(audio_path)
+        ):
             warn("stale (audio file changed)")
             return None
 
@@ -532,6 +554,38 @@ def _probe_duration(audio_path: Path) -> float:
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"failed to probe duration of {audio_path}: {e.stderr.decode()}") from e
     return float(out.decode().strip())
+
+
+def _probe_creation_time(audio_path: Path) -> datetime | None:
+    """Return the container's `creation_time` tag via `ffprobe`, if it has one."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format_tags=creation_time",
+        "-of", "csv=p=0",
+        str(audio_path),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, check=True).stdout.decode().strip()
+        stamp = datetime.fromisoformat(out.replace("Z", "+00:00")) if out else None
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+    if stamp is not None and stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
+
+
+def recording_start(audio_path: Path) -> datetime:
+    """Approximate when a non-Craig recording started, in local time.
+
+    Uses the container's `creation_time` tag when present; otherwise the
+    file's mtime minus its duration, since a recorder writes the file when
+    the recording ends.
+    """
+    stamp = _probe_creation_time(audio_path)
+    if stamp is None:
+        mtime = datetime.fromtimestamp(audio_path.stat().st_mtime, tz=timezone.utc)
+        stamp = mtime - timedelta(seconds=_probe_duration(audio_path))
+    return stamp.astimezone()
 
 
 def _parse_hms(value: str) -> float:
@@ -1689,6 +1743,615 @@ def _config_number(config: dict, key: str, default: float) -> float:
     return value
 
 
+@dataclass
+class AudioSource:
+    """One transcription unit: the tracks to transcribe and merge into one
+    transcript, plus what the transcript's header needs."""
+
+    title: str
+    # Track key -> audio path. The key names the track's partial file and is
+    # the name speaker_map and --shared-mic match against.
+    tracks: dict[str, Path]
+    session_start: datetime
+    # Set only for a Craig .zip input, which moves to processed/ afterwards.
+    zip_path: Path | None = None
+    # Track key -> display name, bypassing speaker_map.
+    speaker_overrides: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class RunSettings:
+    """Everything main() resolves from args and config before the input."""
+
+    model_repo: str
+    model_dir: Path
+    language: str | None
+    compression_ratio_threshold: float
+    logprob_threshold: float
+    best_of: int | None
+    input_dir: Path
+    # Config output_dir: the partial cache's root, whatever --output-dir says.
+    output_dir: Path
+    # Where transcript files go: --output-dir if given, else output_dir.
+    transcript_dir: Path
+    partial_max_age_days: float
+    speaker_map: dict[str, str]
+    vad_min_silence_ms: float
+    vad_min_speech_ms: float
+    merge_gap_ms: float
+    timestamp_format: str
+    line_format: str
+    filler_words: list[str]
+    backchannel_phrases: list[str]
+    collapse_laughter: bool
+    laughter_run_gap_ms: float
+    hallucination_patterns: list
+    show_inaudible_placeholders: bool
+    show_bleed_markers: bool
+    bleed_thresholds: dict[str, float]
+    timestamp_mode: str
+    vocabulary: dict
+    initial_prompt: str
+    windowed: bool
+    window_start_arg: float | None
+    window_end_arg: float | None
+    test_seconds: int | None
+    shared_mic_specs: list[tuple[str, float, float, str]]
+    fresh: bool
+    verbose: bool
+    output_name: str | None
+
+
+def craig_source(input_path: Path, tmp_dir: str | None, title: str | None) -> AudioSource:
+    """Build an AudioSource from a Craig export, extracting a .zip into `tmp_dir`."""
+    is_zip = input_path.suffix.lower() == ".zip"
+    if is_zip:
+        print("Extracting zip...")
+        _progress_events.step("Extracting zip")
+        craig_folder = extract_zip(input_path, Path(tmp_dir))
+    else:
+        craig_folder = input_path
+    print()
+    if is_zip and not (craig_folder / "info.txt").is_file():
+        sys.exit(
+            f"error: {input_path.name} is not a Craig export (no info.txt). "
+            "Unzip it and pick the folder or files instead."
+        )
+
+    print("PARSING MANIFEST...")
+    _progress_events.step("Reading manifest")
+    session_start, usernames = parse_manifest(craig_folder)
+    print(f"  Parsed manifest: {len(usernames)} speakers, session started {session_start}")
+    return AudioSource(
+        title=title or (input_path.resolve().stem if is_zip else input_path.resolve().name),
+        tracks=match_tracks(craig_folder, usernames),
+        session_start=session_start,
+        zip_path=input_path if is_zip else None,
+    )
+
+
+def file_source(audio_path: Path, title: str | None, speaker: str | None) -> AudioSource:
+    """Build an AudioSource from one audio file, keyed on its stem.
+
+    The speaker defaults to the literal "Speaker" rather than going through
+    speaker_map, since a file stem is usually an event name, not a person.
+    """
+    print("READING AUDIO...")
+    _progress_events.step("Reading audio")
+    session_start = recording_start(audio_path)
+    print(f"  {audio_path.name}, recording started about {session_start:%Y-%m-%d %H:%M:%S %Z}")
+    key = audio_path.stem
+    return AudioSource(
+        title=title or key,
+        tracks={key: audio_path},
+        session_start=session_start,
+        speaker_overrides={key: speaker or "Speaker"},
+    )
+
+
+def unique_stems(audio_files: list[Path]) -> dict[Path, str]:
+    """Name each file by its stem, appending the extension (`a-wav`, `a-m4a`)
+    to stems that collide, so track keys, titles and cache slugs stay unique."""
+    counts: dict[str, int] = {}
+    for path in audio_files:
+        counts[path.stem] = counts.get(path.stem, 0) + 1
+    return {
+        path: f"{path.stem}-{path.suffix.lstrip('.').lower()}" if counts[path.stem] > 1 else path.stem
+        for path in audio_files
+    }
+
+
+def folder_source(folder: Path, audio_files: list[Path], title: str | None) -> AudioSource:
+    """Build a merged AudioSource from a folder of audio files, one track per
+    file keyed on its stem. Assumes every file started recording at the same
+    moment, as Craig's tracks do; nothing checks that."""
+    print("READING AUDIO...")
+    _progress_events.step("Reading audio")
+    keys = unique_stems(audio_files)
+    starts = {path: recording_start(path) for path in audio_files}
+    for path in audio_files:
+        print(f"  {path.name}, recording started about {starts[path]:%Y-%m-%d %H:%M:%S %Z}")
+    return AudioSource(
+        title=title or folder.resolve().name,
+        tracks={keys[path]: path for path in audio_files},
+        session_start=min(starts.values()),
+    )
+
+
+def prune_stale_partials(settings: RunSettings, keep: Collection[str]) -> None:
+    """Apply `partial_max_age_days` to the cache, sparing the slugs in `keep`."""
+    if settings.windowed or settings.partial_max_age_days <= 0:
+        return
+    pruned = prune_partials(settings.output_dir, settings.partial_max_age_days, keep=keep)
+    if pruned:
+        print(
+            f"Pruned {len(pruned)} cached session(s) unused for "
+            f"{settings.partial_max_age_days:g}+ days: {', '.join(pruned)}"
+        )
+
+
+def resolve_whisper_model(settings: RunSettings) -> Path:
+    """Resolve (downloading on first run) the Whisper model, once per process."""
+    print("RESOLVING MODEL...")
+    print(f"  {settings.model_repo}")
+
+    def announce_download() -> None:
+        print("  Downloading model (first run)...")
+        _progress_events.step("Downloading Whisper model (first run)")
+
+    model_path = resolve_model_path(settings.model_repo, settings.model_dir, on_download=announce_download)
+    print()
+    return model_path
+
+
+def transcribe_audio(
+    source: AudioSource,
+    settings: RunSettings,
+    model_path: Path,
+    cancel_watcher: _CancelWatcher,
+    exit_stack: contextlib.ExitStack,
+    prune: bool = True,
+) -> Path:
+    """Transcribe, merge and write one AudioSource; return the transcript path.
+
+    `prune` applies `partial_max_age_days` first; a batch prunes once up
+    front instead, so one file's run can't remove a later file's cache."""
+    slug = _slugify(source.title)
+    partial_dir = partial_dir_for(settings.output_dir, slug)
+    # Never discard the cache here: rebuilding it can take an hour, and the
+    # usual cause is a forgotten flag (e.g. the cache was built with --model).
+    if not settings.windowed and not settings.fresh and partial_dir.exists():
+        mismatches = meta_mismatches(
+            load_partial_meta(partial_dir),
+            settings.model_repo,
+            settings.vad_min_silence_ms,
+            settings.vad_min_speech_ms,
+            settings.initial_prompt,
+            settings.language,
+            settings.compression_ratio_threshold,
+            settings.logprob_threshold,
+            settings.best_of,
+        )
+        if mismatches:
+            details = "\n".join(f"  - {line}" for line in mismatches)
+            sys.exit(
+                f"error: saved partial output in {partial_dir} doesn't match this run's config:\n"
+                f"{details}\n"
+                "Rerun with the saved settings (e.g. --model <saved model_repo>) to reuse it, "
+                "or pass --fresh (or delete that directory) to discard it and retranscribe every track."
+            )
+    if prune:
+        prune_stale_partials(settings, keep={slug})
+
+    matched = dict(source.tracks)
+    shared_spans: dict[str, list[tuple[float, float, str]]] = {}
+    for username, span_start, span_end, label in settings.shared_mic_specs:
+        if username not in matched:
+            sys.exit(
+                f"error: --shared-mic track {username!r} not in this recording "
+                f"(tracks: {', '.join(matched)})"
+            )
+        for other_start, other_end, _ in shared_spans.get(username, []):
+            if span_start < other_end and other_start < span_end:
+                sys.exit(f"error: --shared-mic spans on track {username!r} overlap")
+        shared_spans.setdefault(username, []).append((span_start, span_end, label))
+    warned_speakers: set[str] = set()
+
+    def speaker_name(track_key: str) -> str:
+        if track_key in source.speaker_overrides:
+            return source.speaker_overrides[track_key]
+        return resolve_speaker(track_key, settings.speaker_map, warned_speakers)
+
+    for username in matched:
+        speaker_name(username)
+    print()
+
+    window_start = 0.0
+    filename_suffix = ""
+    if settings.windowed:
+        # Craig tracks end when that speaker's recording stops, so they
+        # can differ by hours. The window may run to the end of the
+        # longest one; shorter tracks are cropped to whatever part of the
+        # window they cover, and dropped if they end before it starts.
+        durations = {username: _probe_duration(path) for username, path in matched.items()}
+        session_duration = max(durations.values())
+        if settings.test_seconds is not None:
+            if settings.window_start_arg is not None:
+                window_start = settings.window_start_arg
+            else:
+                # A random test window stays within the shortest track so
+                # every speaker has audio in it.
+                window_start = random.uniform(0, max(0.0, min(durations.values()) - settings.test_seconds))
+            window_end = window_start + settings.test_seconds
+        else:
+            window_start = settings.window_start_arg if settings.window_start_arg is not None else 0.0
+            window_end = settings.window_end_arg if settings.window_end_arg is not None else session_duration
+        window_label = (
+            f"{timedelta(seconds=round(window_start))}-{timedelta(seconds=round(window_end))}"
+        )
+        if window_end <= window_start:
+            sys.exit(f"error: requested window ({window_label}) ends before it starts")
+        if window_end > session_duration:
+            sys.exit(
+                f"error: requested window ({window_label}) runs past the end of the "
+                f"recording ({timedelta(seconds=round(session_duration))})"
+            )
+        _progress_events.step("Cropping tracks to the window")
+        crop_dir = Path(exit_stack.enter_context(tempfile.TemporaryDirectory()))
+        dropped = [username for username in matched if durations[username] <= window_start]
+        matched = {
+            username: crop_track(path, window_start, window_end - window_start, crop_dir, username)
+            for username, path in matched.items()
+            if username not in dropped
+        }
+        for username in dropped:
+            print(
+                f"  Skipping {username}: track ends at "
+                f"{timedelta(seconds=round(durations[username]))}, before the window starts"
+            )
+        filename_suffix = f"-{_window_stamp(window_start)}-{_window_stamp(window_end)}"
+        if settings.test_seconds is not None:
+            print(f"Test mode: using window {window_label} ({settings.test_seconds}s)")
+        else:
+            print(f"Windowed run: transcribing {window_label} only")
+        print()
+
+    print("ANALYZING SPEECH (VAD)...")
+    track_regions: dict[str, list[float]] = {}
+    # Index 0 is window_start in windowed runs (tracks are cropped), else 0.
+    track_envelopes: dict[str, np.ndarray] = {}
+    total_raw_s = 0.0
+    total_speech_s = 0.0
+    vad_total = len(matched)
+    track_durations = {username: _probe_duration(path) for username, path in matched.items()}
+    vad_start = time.monotonic()
+    with tqdm.tqdm(
+        total=round(sum(track_durations.values())), unit="s", leave=False, desc="Analyzing speech"
+    ) as vad_progress:
+        completed_s = 0.0
+        for i, (username, audio_path) in enumerate(matched.items(), start=1):
+            if cancel_watcher.cancelled.is_set():
+                raise TranscriptionCancelled()
+            vad_progress.write(f"  VAD track {i}/{vad_total} ({username})...")
+            # Each track is decoded in full before VAD reports any progress.
+            _progress_events.step(f"Analyzing speech — decoding audio ({username})")
+            track_duration = track_durations[username]
+
+            def _on_vad_progress(
+                pct: float, _base=completed_s, _dur=track_duration, _track=username
+            ) -> None:
+                vad_progress.n = round(_base + _dur * pct / 100)
+                vad_progress.refresh()
+                _progress_events.progress("vad", vad_progress.n, vad_progress.total, _track)
+
+            track_start = time.monotonic()
+            regions, duration, envelope = detect_speech_regions(
+                audio_path,
+                settings.vad_min_silence_ms,
+                settings.vad_min_speech_ms,
+                _on_vad_progress,
+            )
+            track_elapsed = time.monotonic() - track_start
+            track_regions[username] = regions
+            track_envelopes[username] = envelope
+            track_speech_s = speech_seconds(regions)
+            total_raw_s += duration
+            total_speech_s += track_speech_s
+            completed_s += track_duration
+            vad_progress.n = round(completed_s)
+            vad_progress.refresh()
+            _progress_events.progress("vad", vad_progress.n, vad_progress.total, username)
+            vad_progress.write(
+                f"    -> {_format_duration(track_speech_s)} speech / "
+                f"{_format_duration(duration)} raw ({track_speech_s / duration * 100:.0f}%) "
+                f"in {_format_duration(track_elapsed)}"
+            )
+    vad_elapsed = time.monotonic() - vad_start
+    speech_pct = (total_speech_s / total_raw_s * 100) if total_raw_s else 0.0
+    print(
+        f"VAD completed: {_format_duration(total_speech_s)} speech / "
+        f"{_format_duration(total_raw_s)} raw audio ({speech_pct:.0f}%) to transcribe "
+        f"in {_format_duration(vad_elapsed)}"
+    )
+    print()
+
+    print("TRANSCRIBING TRACKS...")
+    total_frames = sum(speech_frames(regions) for regions in track_regions.values())
+    transcripts = {}
+    total = len(matched)
+    total_segments = 0
+
+    if not settings.windowed:
+        if settings.fresh and partial_dir.exists():
+            shutil.rmtree(partial_dir)
+            print("  Ignoring saved partial output (--fresh).")
+        write_partial_meta(
+            partial_dir,
+            settings.model_repo,
+            settings.vad_min_silence_ms,
+            settings.vad_min_speech_ms,
+            settings.initial_prompt,
+            settings.language,
+            settings.compression_ratio_threshold,
+            settings.logprob_threshold,
+            settings.best_of,
+        )
+
+    transcribe_start = time.monotonic()
+    with tqdm.tqdm(
+        total=total_frames,
+        unit="frames",
+        desc="Transcribing",
+        disable=total_frames == 0,
+        leave=False,
+    ) as progress:
+        if _progress_events.enabled:
+            # Every transcription progress tick (mlx_whisper's own, via
+            # _ForwardingPbar, and the resume path's) lands in
+            # progress.update(), so hooking it here covers them all.
+            # `username` is read at call time, i.e. the loop's current track.
+            _tqdm_update = progress.update
+
+            def _update_and_emit(n: float = 1) -> bool | None:
+                result = _tqdm_update(n)
+                _progress_events.progress("transcribe", progress.n, progress.total, username)
+                return result
+
+            progress.update = _update_and_emit
+        for i, (username, audio_path) in enumerate(matched.items(), start=1):
+            if cancel_watcher.cancelled.is_set():
+                raise TranscriptionCancelled()
+            track_start = time.monotonic()
+            regions = track_regions[username]
+            region_count = len(regions) // 2
+            partial = (
+                None
+                if settings.windowed
+                else load_track_partial(partial_dir, username, audio_path, regions, progress)
+            )
+            if partial is not None and partial.regions_done >= region_count:
+                segments, detected_language = partial.segments, partial.language
+                progress.write(
+                    f"  Resuming track {i}/{total} ({username}) (from saved partial)..."
+                )
+                progress.update(speech_frames(regions))
+            else:
+                if partial is not None:
+                    progress.write(
+                        f"  Resuming track {i}/{total} ({username}) at region "
+                        f"{partial.regions_done + 1}/{region_count} (from saved partial)..."
+                    )
+                    progress.update(speech_frames(regions[: partial.regions_done * 2]))
+                else:
+                    progress.write(f"  Transcribing track {i}/{total} ({username})...")
+                _progress_events.step(f"Transcribing — decoding audio ({username})")
+
+                def save_progress(
+                    track_progress: TrackPartial,
+                    username: str = username,
+                    audio_path: Path = audio_path,
+                    regions: list[float] = regions,
+                ) -> None:
+                    write_track_partial(
+                        partial_dir, username, audio_path, track_progress, regions
+                    )
+
+                segments, detected_language = transcribe_track(
+                    audio_path,
+                    model_path,
+                    regions,
+                    progress,
+                    settings.initial_prompt,
+                    settings.language,
+                    settings.compression_ratio_threshold,
+                    settings.logprob_threshold,
+                    settings.best_of,
+                    cancel_watcher.cancelled,
+                    resume=partial,
+                    checkpoint=None if settings.windowed else save_progress,
+                )
+                if not settings.windowed:
+                    save_progress(
+                        TrackPartial(segments, detected_language, region_count, "")
+                    )
+            track_elapsed = time.monotonic() - track_start
+            if detected_language:
+                progress.write(
+                    f"    Detected language: "
+                    f"{LANGUAGES.get(detected_language, detected_language).title()}"
+                )
+            progress.write(
+                f"    -> {len(segments)} segments in {_format_duration(track_elapsed)}"
+            )
+            total_segments += len(segments)
+            transcripts[username] = [
+                (
+                    offset + window_start,
+                    end + window_start,
+                    apply_vocabulary(text, settings.vocabulary),
+                    compression_ratio,
+                    avg_logprob,
+                )
+                for offset, end, text, compression_ratio, avg_logprob in segments
+            ]
+    transcribe_elapsed = time.monotonic() - transcribe_start
+    print(
+        f"Transcription completed: {total_segments} segments "
+        f"in {_format_duration(transcribe_elapsed)}"
+    )
+    print()
+
+    print("MERGING TRACKS...")
+    transcripts, bleed_stats = dedup_bleed(
+        transcripts,
+        track_envelopes,
+        window_start,
+        {u: speaker_name(u) for u in transcripts},
+        settings.bleed_thresholds["bleed_level_gap_db"],
+        settings.bleed_thresholds["bleed_min_correlation"],
+        settings.bleed_thresholds["bleed_text_similarity"],
+        settings.bleed_thresholds["bleed_max_offset_s"],
+        settings.show_bleed_markers,
+        settings.verbose,
+    )
+    timestamp_base = _ELAPSED_TIMESTAMP_EPOCH if settings.timestamp_mode == "elapsed" else source.session_start
+    merged, flagged_lines, merge_stats, shared_labels, pruned_lines = merge_tracks(
+        timestamp_base,
+        transcripts,
+        settings.merge_gap_ms / 1000,
+        settings.filler_words,
+        settings.compression_ratio_threshold,
+        settings.logprob_threshold,
+        settings.show_inaudible_placeholders,
+        settings.hallucination_patterns,
+        shared_spans,
+        settings.backchannel_phrases,
+        settings.collapse_laughter,
+        settings.laughter_run_gap_ms / 1000,
+    )
+    merge_stats.update(bleed_stats)
+    print(f"  {merge_stats['segments_total']} segments")
+    print(f"  {merge_stats['bleed_deduped']} bleed duplicate(s) dropped")
+    print(f"  {merge_stats['bleed_ambiguous']} possible bleed pair(s) kept")
+    print(f"  {merge_stats['hallucination_stripped']} hallucination phrase(s) stripped")
+    print(f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed")
+    print(f"  {merge_stats['filler_dropped']} filler word(s) dropped")
+    print(f"  {merge_stats['crosstalk_dropped']} crosstalk backchannel(s) dropped")
+    print(f"  {merge_stats['laughter_dropped']} laugh line(s) dropped")
+    print(f"  {merge_stats['laughter_runs_collapsed']} laughter run(s) collapsed")
+    print(f"  {merge_stats['repeat_deduped']} repeat(s) deduped")
+    print(f"  {merge_stats['empty_dropped']} empty segment(s) dropped")
+    print(f"  {merge_stats['flagged_for_review']} line(s) flagged for review")
+    print("Merging completed")
+    # A --shared-mic label is already a display name, not a Discord username.
+    resolved = [
+        (
+            timestamp,
+            speaker if speaker in shared_labels else speaker_name(speaker),
+            text,
+        )
+        for timestamp, speaker, text in merged
+    ]
+    resolved_flagged = [
+        (
+            timestamp,
+            speaker if speaker in shared_labels else speaker_name(speaker),
+            text,
+        )
+        for timestamp, speaker, text in flagged_lines
+    ]
+    resolved_pruned = [
+        (
+            timestamp,
+            speaker if speaker in shared_labels else speaker_name(speaker),
+            text,
+        )
+        for timestamp, speaker, text in pruned_lines
+    ]
+    print()
+
+    print("WRITING TRANSCRIPT...")
+    output_path = write_transcript(
+        resolved,
+        resolved_flagged,
+        resolved_pruned,
+        source.title,
+        settings.transcript_dir,
+        settings.timestamp_format,
+        settings.line_format,
+        merge_stats,
+        source.session_start,
+        filename_suffix=filename_suffix,
+        output_name=settings.output_name,
+    )
+    if source.zip_path is not None and not settings.windowed:
+        mark_zip_processed(source.zip_path, settings.input_dir)
+    return output_path
+
+
+def transcribe_separately(
+    audio_files: list[Path],
+    speaker: str | None,
+    settings: RunSettings,
+    cancel_watcher: _CancelWatcher,
+    exit_stack: contextlib.ExitStack,
+) -> None:
+    """--separate: transcribe each file into its own transcript, in this
+    process so the model loads once. A failed file is reported and skipped;
+    cancelling stops the batch. Exits 1 if any file failed."""
+    titles = unique_stems(audio_files)
+    prune_stale_partials(settings, keep={_slugify(title) for title in titles.values()})
+    model_path = resolve_whisper_model(settings)
+    output_paths: list[Path] = []
+    failed: list[dict[str, str]] = []
+    total = len(audio_files)
+    for i, audio_path in enumerate(audio_files, start=1):
+        print(_rule("-"))
+        print(f"FILE {i}/{total}: {audio_path.name}")
+        print()
+        _progress_events.step(f"File {i}/{total}: {audio_path.name}")
+        try:
+            source = file_source(audio_path, titles[audio_path], speaker)
+            output_path = transcribe_audio(
+                source, settings, model_path, cancel_watcher, exit_stack, prune=False
+            )
+        except TranscriptionCancelled:
+            raise
+        except (Exception, SystemExit) as e:
+            # A per-file sys.exit("error: ...") (e.g. a cache built with other
+            # settings) fails that file, not the batch.
+            if isinstance(e, SystemExit) and not isinstance(e.code, str):
+                raise
+            message = (e.code if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}").strip()
+            print(f"!! {audio_path.name} failed: {message}")
+            print()
+            failed.append({"file": audio_path.name, "message": message})
+            continue
+        print(f"Wrote transcript to {output_path}")
+        print()
+        output_paths.append(output_path)
+
+    print(_rule("-"))
+    print(f"Transcribed {len(output_paths)} of {total} file(s).")
+    for failure in failed:
+        print(f"  failed: {failure['file']} ({failure['message']})")
+    print()
+    if not output_paths:
+        _progress_events.emit(phase="error", message=f"All {total} files failed")
+        print(_rule())
+        sys.exit(1)
+    resolved_paths = [str(path.resolve()) for path in output_paths]
+    _progress_events.emit(
+        phase="done",
+        output_path=resolved_paths[-1],
+        output_paths=resolved_paths,
+        failed=failed,
+    )
+    print(_rule())
+    if failed:
+        sys.exit(1)
+
+
 def main() -> None:
     start_time = time.monotonic()
 
@@ -1714,21 +2377,29 @@ def main() -> None:
         sys.exit(1)
 
     parser = argparse.ArgumentParser(
-        description="Transcribe a Craig-recorded Discord TTRPG session into Markdown."
+        description="Transcribe audio (a Craig export, an audio file, or a folder of audio files) into Markdown."
     )
     parser.add_argument(
-        "craig_folder",
+        "input",
         type=Path,
         nargs="?",
         default=None,
-        help="Path to the Craig export folder or .zip file. If omitted, the oldest "
-        "*.zip in input_dir is picked up automatically.",
+        help="Craig .zip/folder, an audio file, or a folder of audio files. If "
+        "omitted, the oldest *.zip in input_dir is picked up automatically.",
     )
     parser.add_argument(
         "--config",
         type=Path,
         default=paths.DEFAULT_CONFIG_PATH,
         help="Path to config.yaml (default: settings/config.yaml)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Write transcript files here instead of the config `output_dir`. "
+        "The segment cache stays under the config `output_dir`/.partial/.",
     )
     parser.add_argument("--model", help="Override the configured whisper_model")
     parser.add_argument(
@@ -1768,6 +2439,18 @@ def main() -> None:
         "default (a single resample per retry). Overrides the config `best_of` key.",
     )
     parser.add_argument("--title", help="Override the session title")
+    parser.add_argument(
+        "--separate",
+        action="store_true",
+        help="With a folder of audio files, transcribe each file into its own "
+        "transcript instead of merging them into one.",
+    )
+    parser.add_argument(
+        "--speaker",
+        metavar="NAME",
+        help="Speaker name for a single audio file's lines (default: Speaker). "
+        "Not passed through speaker_map.",
+    )
     parser.add_argument(
         "--output-name",
         help="Override the transcript filename stem (e.g. `--output-name foo` "
@@ -1943,8 +2626,19 @@ def main() -> None:
     if args.prune_cache is not None:
         if args.prune_cache < 0:
             sys.exit("error: --prune-cache DAYS must be 0 or more")
-        if args.craig_folder is not None or windowed or args.fresh or args.shared_mic:
+        if args.input is not None or windowed or args.fresh or args.shared_mic or args.output_dir:
             sys.exit("error: --prune-cache only prunes and exits; drop the other arguments")
+    if args.separate:
+        for flag, value in (
+            ("--title", args.title),
+            ("--output-name", args.output_name),
+            ("--start", args.start),
+            ("--end", args.end),
+            ("--test", args.test),
+            ("--shared-mic", args.shared_mic),
+        ):
+            if value is not None:
+                sys.exit(f"error: {flag} can't be combined with --separate, which writes one transcript per file")
     if windowed and args.fresh:
         sys.exit("error: --fresh doesn't apply to windowed runs, which never use saved partial output")
     global _saves_partials
@@ -2093,7 +2787,45 @@ def main() -> None:
         enrich_fields = {f.strip() for f in args.enrich_vocabulary.split(",")}
     initial_prompt = build_combined_prompt(parsed_vocabularies, enrich_fields)
 
-    if args.craig_folder is None:
+    settings = RunSettings(
+        model_repo=model_repo,
+        model_dir=model_dir,
+        language=language,
+        compression_ratio_threshold=compression_ratio_threshold,
+        logprob_threshold=logprob_threshold,
+        best_of=best_of,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        transcript_dir=args.output_dir.expanduser().resolve() if args.output_dir else output_dir,
+        partial_max_age_days=partial_max_age_days,
+        speaker_map=speaker_map,
+        vad_min_silence_ms=vad_min_silence_ms,
+        vad_min_speech_ms=vad_min_speech_ms,
+        merge_gap_ms=merge_gap_ms,
+        timestamp_format=timestamp_format,
+        line_format=line_format,
+        filler_words=filler_words,
+        backchannel_phrases=backchannel_phrases,
+        collapse_laughter=collapse_laughter,
+        laughter_run_gap_ms=laughter_run_gap_ms,
+        hallucination_patterns=hallucination_patterns,
+        show_inaudible_placeholders=show_inaudible_placeholders,
+        show_bleed_markers=show_bleed_markers,
+        bleed_thresholds=bleed_thresholds,
+        timestamp_mode=timestamp_mode,
+        vocabulary=vocabulary,
+        initial_prompt=initial_prompt,
+        windowed=windowed,
+        window_start_arg=window_start_arg,
+        window_end_arg=window_end_arg,
+        test_seconds=args.test,
+        shared_mic_specs=shared_mic_specs,
+        fresh=args.fresh,
+        verbose=args.verbose,
+        output_name=args.output_name,
+    )
+
+    if args.input is None:
         found_zip = find_default_zip(input_dir)
         if found_zip is None:
             sys.exit(
@@ -2102,48 +2834,19 @@ def main() -> None:
             )
         resolved_input_path = found_zip
     else:
-        resolved_input_path = args.craig_folder
+        resolved_input_path = args.input
 
     print(f"Input: {resolved_input_path.name}")
+    try:
+        detected = detect_input(resolved_input_path)
+    except InputError as e:
+        sys.exit(f"error: {e}")
+    if args.separate and detected.kind is not InputKind.LOOSE_FOLDER:
+        sys.exit("error: --separate only applies to a folder of audio files")
+    if args.speaker is not None and detected.kind is not InputKind.SINGLE_FILE and not args.separate:
+        sys.exit("error: --speaker only applies to a single audio file or --separate")
 
-    is_zip = resolved_input_path.suffix == ".zip"
-    session_title = args.title or (
-        resolved_input_path.resolve().stem if is_zip else resolved_input_path.resolve().name
-    )
-
-    slug = _slugify(session_title)
-    partial_dir = partial_dir_for(output_dir, slug)
-    # Checked before extraction and VAD so a mismatch costs nothing. Never
-    # discard the cache here: rebuilding it can take an hour, and the usual
-    # cause is a forgotten flag (e.g. the cache was built with --model).
-    if not windowed and not args.fresh and partial_dir.exists():
-        mismatches = meta_mismatches(
-            load_partial_meta(partial_dir),
-            model_repo,
-            vad_min_silence_ms,
-            vad_min_speech_ms,
-            initial_prompt,
-            language,
-            compression_ratio_threshold,
-            logprob_threshold,
-            best_of,
-        )
-        if mismatches:
-            details = "\n".join(f"  - {line}" for line in mismatches)
-            sys.exit(
-                f"error: saved partial output in {partial_dir} doesn't match this run's config:\n"
-                f"{details}\n"
-                "Rerun with the saved settings (e.g. --model <saved model_repo>) to reuse it, "
-                "or pass --fresh (or delete that directory) to discard it and retranscribe every track."
-            )
-    if not windowed and partial_max_age_days > 0:
-        pruned = prune_partials(output_dir, partial_max_age_days, keep=slug)
-        if pruned:
-            print(
-                f"Pruned {len(pruned)} cached session(s) unused for "
-                f"{partial_max_age_days:g}+ days: {', '.join(pruned)}"
-            )
-
+    is_zip = detected.kind is InputKind.CRAIG_ZIP
     extraction_ctx = tempfile.TemporaryDirectory() if is_zip else contextlib.nullcontext()
     with (
         extraction_ctx as tmp_dir,
@@ -2153,365 +2856,17 @@ def main() -> None:
         if cancel_watcher.enabled:
             print("(press Escape, then y, to cancel — progress on completed tracks is saved)")
             print()
-        if is_zip:
-            print("Extracting zip...")
-            _progress_events.step("Extracting zip")
-            craig_folder = extract_zip(resolved_input_path, Path(tmp_dir))
+        if args.separate:
+            transcribe_separately(detected.audio_files, args.speaker, settings, cancel_watcher, exit_stack)
+            return
+        if detected.kind is InputKind.SINGLE_FILE:
+            source = file_source(detected.path, args.title, args.speaker)
+        elif detected.kind is InputKind.LOOSE_FOLDER:
+            source = folder_source(detected.path, detected.audio_files, args.title)
         else:
-            craig_folder = resolved_input_path
-        print()
-
-        print("PARSING MANIFEST...")
-        _progress_events.step("Reading manifest")
-        session_start, usernames = parse_manifest(craig_folder)
-        print(f"  Parsed manifest: {len(usernames)} speakers, session started {session_start}")
-        shared_spans: dict[str, list[tuple[float, float, str]]] = {}
-        for username, span_start, span_end, label in shared_mic_specs:
-            if username not in usernames:
-                sys.exit(
-                    f"error: --shared-mic track {username!r} not in this recording "
-                    f"(tracks: {', '.join(usernames)})"
-                )
-            for other_start, other_end, _ in shared_spans.get(username, []):
-                if span_start < other_end and other_start < span_end:
-                    sys.exit(f"error: --shared-mic spans on track {username!r} overlap")
-            shared_spans.setdefault(username, []).append((span_start, span_end, label))
-        matched = match_tracks(craig_folder, usernames)
-        warned_speakers: set[str] = set()
-        for username in matched:
-            resolve_speaker(username, speaker_map, warned_speakers)
-        print()
-
-        window_start = 0.0
-        filename_suffix = ""
-        if windowed:
-            # Craig tracks end when that speaker's recording stops, so they
-            # can differ by hours. The window may run to the end of the
-            # longest one; shorter tracks are cropped to whatever part of the
-            # window they cover, and dropped if they end before it starts.
-            durations = {username: _probe_duration(path) for username, path in matched.items()}
-            session_duration = max(durations.values())
-            if args.test is not None:
-                if window_start_arg is not None:
-                    window_start = window_start_arg
-                else:
-                    # A random test window stays within the shortest track so
-                    # every speaker has audio in it.
-                    window_start = random.uniform(0, max(0.0, min(durations.values()) - args.test))
-                window_end = window_start + args.test
-            else:
-                window_start = window_start_arg if window_start_arg is not None else 0.0
-                window_end = window_end_arg if window_end_arg is not None else session_duration
-            window_label = (
-                f"{timedelta(seconds=round(window_start))}-{timedelta(seconds=round(window_end))}"
-            )
-            if window_end <= window_start:
-                sys.exit(f"error: requested window ({window_label}) ends before it starts")
-            if window_end > session_duration:
-                sys.exit(
-                    f"error: requested window ({window_label}) runs past the end of the "
-                    f"recording ({timedelta(seconds=round(session_duration))})"
-                )
-            _progress_events.step("Cropping tracks to the window")
-            crop_dir = Path(exit_stack.enter_context(tempfile.TemporaryDirectory()))
-            dropped = [username for username in matched if durations[username] <= window_start]
-            matched = {
-                username: crop_track(path, window_start, window_end - window_start, crop_dir, username)
-                for username, path in matched.items()
-                if username not in dropped
-            }
-            for username in dropped:
-                print(
-                    f"  Skipping {username}: track ends at "
-                    f"{timedelta(seconds=round(durations[username]))}, before the window starts"
-                )
-            filename_suffix = f"-{_window_stamp(window_start)}-{_window_stamp(window_end)}"
-            if args.test is not None:
-                print(f"Test mode: using window {window_label} ({args.test}s)")
-            else:
-                print(f"Windowed run: transcribing {window_label} only")
-            print()
-
-        print("ANALYZING SPEECH (VAD)...")
-        track_regions: dict[str, list[float]] = {}
-        # Index 0 is window_start in windowed runs (tracks are cropped), else 0.
-        track_envelopes: dict[str, np.ndarray] = {}
-        total_raw_s = 0.0
-        total_speech_s = 0.0
-        vad_total = len(matched)
-        track_durations = {username: _probe_duration(path) for username, path in matched.items()}
-        vad_start = time.monotonic()
-        with tqdm.tqdm(
-            total=round(sum(track_durations.values())), unit="s", leave=False, desc="Analyzing speech"
-        ) as vad_progress:
-            completed_s = 0.0
-            for i, (username, audio_path) in enumerate(matched.items(), start=1):
-                if cancel_watcher.cancelled.is_set():
-                    raise TranscriptionCancelled()
-                vad_progress.write(f"  VAD track {i}/{vad_total} ({username})...")
-                # Each track is decoded in full before VAD reports any progress.
-                _progress_events.step(f"Analyzing speech — decoding audio ({username})")
-                track_duration = track_durations[username]
-
-                def _on_vad_progress(
-                    pct: float, _base=completed_s, _dur=track_duration, _track=username
-                ) -> None:
-                    vad_progress.n = round(_base + _dur * pct / 100)
-                    vad_progress.refresh()
-                    _progress_events.progress("vad", vad_progress.n, vad_progress.total, _track)
-
-                track_start = time.monotonic()
-                regions, duration, envelope = detect_speech_regions(
-                    audio_path,
-                    vad_min_silence_ms,
-                    vad_min_speech_ms,
-                    _on_vad_progress,
-                )
-                track_elapsed = time.monotonic() - track_start
-                track_regions[username] = regions
-                track_envelopes[username] = envelope
-                track_speech_s = speech_seconds(regions)
-                total_raw_s += duration
-                total_speech_s += track_speech_s
-                completed_s += track_duration
-                vad_progress.n = round(completed_s)
-                vad_progress.refresh()
-                _progress_events.progress("vad", vad_progress.n, vad_progress.total, username)
-                vad_progress.write(
-                    f"    -> {_format_duration(track_speech_s)} speech / "
-                    f"{_format_duration(duration)} raw ({track_speech_s / duration * 100:.0f}%) "
-                    f"in {_format_duration(track_elapsed)}"
-                )
-        vad_elapsed = time.monotonic() - vad_start
-        speech_pct = (total_speech_s / total_raw_s * 100) if total_raw_s else 0.0
-        print(
-            f"VAD completed: {_format_duration(total_speech_s)} speech / "
-            f"{_format_duration(total_raw_s)} raw audio ({speech_pct:.0f}%) to transcribe "
-            f"in {_format_duration(vad_elapsed)}"
-        )
-        print()
-
-        print("RESOLVING MODEL...")
-        print(f"  {model_repo}")
-
-        def announce_download() -> None:
-            print("  Downloading model (first run)...")
-            _progress_events.step("Downloading Whisper model (first run)")
-
-        model_path = resolve_model_path(model_repo, model_dir, on_download=announce_download)
-        print()
-
-        print("TRANSCRIBING TRACKS...")
-        total_frames = sum(speech_frames(regions) for regions in track_regions.values())
-        transcripts = {}
-        total = len(matched)
-        total_segments = 0
-
-        if not windowed:
-            if args.fresh and partial_dir.exists():
-                shutil.rmtree(partial_dir)
-                print("  Ignoring saved partial output (--fresh).")
-            write_partial_meta(
-                partial_dir,
-                model_repo,
-                vad_min_silence_ms,
-                vad_min_speech_ms,
-                initial_prompt,
-                language,
-                compression_ratio_threshold,
-                logprob_threshold,
-                best_of,
-            )
-
-        transcribe_start = time.monotonic()
-        with tqdm.tqdm(
-            total=total_frames,
-            unit="frames",
-            desc="Transcribing",
-            disable=total_frames == 0,
-            leave=False,
-        ) as progress:
-            if _progress_events.enabled:
-                # Every transcription progress tick (mlx_whisper's own, via
-                # _ForwardingPbar, and the resume path's) lands in
-                # progress.update(), so hooking it here covers them all.
-                # `username` is read at call time, i.e. the loop's current track.
-                _tqdm_update = progress.update
-
-                def _update_and_emit(n: float = 1) -> bool | None:
-                    result = _tqdm_update(n)
-                    _progress_events.progress("transcribe", progress.n, progress.total, username)
-                    return result
-
-                progress.update = _update_and_emit
-            for i, (username, audio_path) in enumerate(matched.items(), start=1):
-                if cancel_watcher.cancelled.is_set():
-                    raise TranscriptionCancelled()
-                track_start = time.monotonic()
-                regions = track_regions[username]
-                region_count = len(regions) // 2
-                partial = (
-                    None
-                    if windowed
-                    else load_track_partial(partial_dir, username, audio_path, regions, progress)
-                )
-                if partial is not None and partial.regions_done >= region_count:
-                    segments, detected_language = partial.segments, partial.language
-                    progress.write(
-                        f"  Resuming track {i}/{total} ({username}) (from saved partial)..."
-                    )
-                    progress.update(speech_frames(regions))
-                else:
-                    if partial is not None:
-                        progress.write(
-                            f"  Resuming track {i}/{total} ({username}) at region "
-                            f"{partial.regions_done + 1}/{region_count} (from saved partial)..."
-                        )
-                        progress.update(speech_frames(regions[: partial.regions_done * 2]))
-                    else:
-                        progress.write(f"  Transcribing track {i}/{total} ({username})...")
-                    _progress_events.step(f"Transcribing — decoding audio ({username})")
-
-                    def save_progress(
-                        track_progress: TrackPartial,
-                        username: str = username,
-                        audio_path: Path = audio_path,
-                        regions: list[float] = regions,
-                    ) -> None:
-                        write_track_partial(
-                            partial_dir, username, audio_path, track_progress, regions
-                        )
-
-                    segments, detected_language = transcribe_track(
-                        audio_path,
-                        model_path,
-                        regions,
-                        progress,
-                        initial_prompt,
-                        language,
-                        compression_ratio_threshold,
-                        logprob_threshold,
-                        best_of,
-                        cancel_watcher.cancelled,
-                        resume=partial,
-                        checkpoint=None if windowed else save_progress,
-                    )
-                    if not windowed:
-                        save_progress(
-                            TrackPartial(segments, detected_language, region_count, "")
-                        )
-                track_elapsed = time.monotonic() - track_start
-                if detected_language:
-                    progress.write(
-                        f"    Detected language: "
-                        f"{LANGUAGES.get(detected_language, detected_language).title()}"
-                    )
-                progress.write(
-                    f"    -> {len(segments)} segments in {_format_duration(track_elapsed)}"
-                )
-                total_segments += len(segments)
-                transcripts[username] = [
-                    (
-                        offset + window_start,
-                        end + window_start,
-                        apply_vocabulary(text, vocabulary),
-                        compression_ratio,
-                        avg_logprob,
-                    )
-                    for offset, end, text, compression_ratio, avg_logprob in segments
-                ]
-        transcribe_elapsed = time.monotonic() - transcribe_start
-        print(
-            f"Transcription completed: {total_segments} segments "
-            f"in {_format_duration(transcribe_elapsed)}"
-        )
-        print()
-
-        print("MERGING TRACKS...")
-        transcripts, bleed_stats = dedup_bleed(
-            transcripts,
-            track_envelopes,
-            window_start,
-            {u: resolve_speaker(u, speaker_map, warned_speakers) for u in transcripts},
-            bleed_thresholds["bleed_level_gap_db"],
-            bleed_thresholds["bleed_min_correlation"],
-            bleed_thresholds["bleed_text_similarity"],
-            bleed_thresholds["bleed_max_offset_s"],
-            show_bleed_markers,
-            args.verbose,
-        )
-        timestamp_base = _ELAPSED_TIMESTAMP_EPOCH if timestamp_mode == "elapsed" else session_start
-        merged, flagged_lines, merge_stats, shared_labels, pruned_lines = merge_tracks(
-            timestamp_base,
-            transcripts,
-            merge_gap_ms / 1000,
-            filler_words,
-            compression_ratio_threshold,
-            logprob_threshold,
-            show_inaudible_placeholders,
-            hallucination_patterns,
-            shared_spans,
-            backchannel_phrases,
-            collapse_laughter,
-            laughter_run_gap_ms / 1000,
-        )
-        merge_stats.update(bleed_stats)
-        print(f"  {merge_stats['segments_total']} segments")
-        print(f"  {merge_stats['bleed_deduped']} bleed duplicate(s) dropped")
-        print(f"  {merge_stats['bleed_ambiguous']} possible bleed pair(s) kept")
-        print(f"  {merge_stats['hallucination_stripped']} hallucination phrase(s) stripped")
-        print(f"  {merge_stats['repetition_collapsed']} repetition hallucination(s) collapsed")
-        print(f"  {merge_stats['filler_dropped']} filler word(s) dropped")
-        print(f"  {merge_stats['crosstalk_dropped']} crosstalk backchannel(s) dropped")
-        print(f"  {merge_stats['laughter_dropped']} laugh line(s) dropped")
-        print(f"  {merge_stats['laughter_runs_collapsed']} laughter run(s) collapsed")
-        print(f"  {merge_stats['repeat_deduped']} repeat(s) deduped")
-        print(f"  {merge_stats['empty_dropped']} empty segment(s) dropped")
-        print(f"  {merge_stats['flagged_for_review']} line(s) flagged for review")
-        print("Merging completed")
-        # A --shared-mic label is already a display name, not a Discord username.
-        resolved = [
-            (
-                timestamp,
-                speaker if speaker in shared_labels else resolve_speaker(speaker, speaker_map, warned_speakers),
-                text,
-            )
-            for timestamp, speaker, text in merged
-        ]
-        resolved_flagged = [
-            (
-                timestamp,
-                speaker if speaker in shared_labels else resolve_speaker(speaker, speaker_map, warned_speakers),
-                text,
-            )
-            for timestamp, speaker, text in flagged_lines
-        ]
-        resolved_pruned = [
-            (
-                timestamp,
-                speaker if speaker in shared_labels else resolve_speaker(speaker, speaker_map, warned_speakers),
-                text,
-            )
-            for timestamp, speaker, text in pruned_lines
-        ]
-        print()
-
-        print("WRITING TRANSCRIPT...")
-        output_path = write_transcript(
-            resolved,
-            resolved_flagged,
-            resolved_pruned,
-            session_title,
-            output_dir,
-            timestamp_format,
-            line_format,
-            merge_stats,
-            session_start,
-            filename_suffix=filename_suffix,
-            output_name=args.output_name,
-        )
-        if is_zip and not windowed:
-            mark_zip_processed(resolved_input_path, input_dir)
+            source = craig_source(resolved_input_path, tmp_dir, args.title)
+        model_path = resolve_whisper_model(settings)
+        output_path = transcribe_audio(source, settings, model_path, cancel_watcher, exit_stack)
 
     elapsed = time.monotonic() - start_time
     print(f"Wrote transcript to {output_path} ({_format_duration(elapsed)})")
