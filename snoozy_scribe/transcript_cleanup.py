@@ -80,19 +80,26 @@ def only_deletes_words(original: str, new: str) -> bool:
 
 
 def changed_spans(original: str, new: str) -> str:
-    """The changed word spans of a rewrite, e.g. "`um, so` → `So`; `the the` → `the`".
+    """The changed word spans of a rewrite, each with one unchanged word of
+    context per side, e.g. "`lose, um, I` → `lose, I`; `we just, we're doing` → `we just are doing`".
 
-    Words split on whitespace, so punctuation and case changes show up; an
-    empty side is shown as ∅.
+    Words split on whitespace, so punctuation and case changes show up. The
+    context word says which of several identical fillers went; an empty side
+    (only possible with no context) is shown as ∅.
     """
     a, b = original.split(), new.split()
     spans = []
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
         if tag == "equal":
             continue
-        old = f"`{' '.join(a[i1:i2])}`" if i2 > i1 else "∅"
-        new_span = f"`{' '.join(b[j1:j2])}`" if j2 > j1 else "∅"
-        spans.append(f"{old} → {new_span}")
+        # Neighbouring opcodes are "equal", so the context word is the same on both sides.
+        before = a[i1 - 1 : i1]
+        after = a[i2 : i2 + 1]
+        old = before + a[i1:i2] + after
+        new_words = before + b[j1:j2] + after
+        old_span = f"`{' '.join(old)}`" if old else "∅"
+        new_span = f"`{' '.join(new_words)}`" if new_words else "∅"
+        spans.append(f"{old_span} → {new_span}")
     return "; ".join(spans)
 
 
