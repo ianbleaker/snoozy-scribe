@@ -12,6 +12,8 @@ from pathlib import Path
 
 APP_NAME = "snoozy-scribe"
 BUNDLE_ID = "local.snoozy-scribe.gui"
+# Launch at login used to be a hand-written LaunchAgent with this label; the
+# app now registers itself with SMAppService and removes the old agent.
 LAUNCH_AGENT_LABEL = "local.snoozy-scribe.dictate"
 # The identity before the rename, so the app and setup.sh can clean up an
 # install of the old name.
@@ -28,7 +30,6 @@ LOG_PATH_SUFFIX = f"/Library/Logs/{APP_NAME}.log"
 _SHELL_VARS = (
     "APP_NAME",
     "BUNDLE_ID",
-    "LAUNCH_AGENT_LABEL",
     "LEGACY_APP_NAME",
     "LEGACY_BUNDLE_ID",
     "LOG_PATH_SUFFIX",

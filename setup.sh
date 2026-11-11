@@ -82,7 +82,8 @@ eval "$(.venv/bin/python -m snoozy_scribe.identity --shell)"
 INSTALLED="$HOME/Applications/$APP_NAME.app"
 
 # The app's old name: remove its build and install, and clear its permission
-# grants. The new app moves an old Launch at login item over on first launch.
+# grants. The new app moves an old Launch at login LaunchAgent to a login
+# item on first launch.
 rm -rf "$LEGACY_APP_NAME.app"
 LEGACY_INSTALLED="$HOME/Applications/$LEGACY_APP_NAME.app"
 if [ -d "$LEGACY_INSTALLED" ]; then
@@ -194,9 +195,7 @@ fi
 if [ -d "/Applications/$APP_NAME.app" ]; then
     echo
     echo "warning: an old copy is at /Applications/$APP_NAME.app. Delete it and use $INSTALLED." >&2
-    if [ -f "$HOME/Library/LaunchAgents/$LAUNCH_AGENT_LABEL.plist" ]; then
-        echo "Launch at login is on: toggle it off and on in the menu so it opens the ~/Applications copy." >&2
-    fi
+    echo "If you turned Launch at login on from that copy, toggle it off and on from $INSTALLED." >&2
 fi
 
 # 14.
