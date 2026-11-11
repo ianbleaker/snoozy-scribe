@@ -8,6 +8,7 @@ listing every drop and rewrite.
 
 from __future__ import annotations
 
+import difflib
 import re
 from collections import Counter
 from pathlib import Path
@@ -76,6 +77,30 @@ def only_deletes_words(original: str, new: str) -> bool:
     """
     remaining = iter(_words(original))
     return all(word in remaining for word in _words(new))
+
+
+def changed_spans(original: str, new: str) -> str:
+    """The changed word spans of a rewrite, each with one unchanged word of
+    context per side, e.g. "`lose, um, I` → `lose, I`; `we just, we're doing` → `we just are doing`".
+
+    Words split on whitespace, so punctuation and case changes show up. The
+    context word says which of several identical fillers went; an empty side
+    (only possible with no context) is shown as ∅.
+    """
+    a, b = original.split(), new.split()
+    spans = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        # Neighbouring opcodes are "equal", so the context word is the same on both sides.
+        before = a[i1 - 1 : i1]
+        after = a[i2 : i2 + 1]
+        old = before + a[i1:i2] + after
+        new_words = before + b[j1:j2] + after
+        old_span = f"`{' '.join(old)}`" if old else "∅"
+        new_span = f"`{' '.join(new_words)}`" if new_words else "∅"
+        spans.append(f"{old_span} → {new_span}")
+    return "; ".join(spans)
 
 
 def apply_reply(
@@ -150,7 +175,8 @@ def clean_transcript(
     stats["lines_sent"] = len(sendable)
     new_body: list[str | None] = list(body)
     dropped: list[str] = []
-    rewritten: list[tuple[str, str]] = []
+    # (timestamp, speaker, original text, new text)
+    rewritten: list[tuple[str, str, str, str]] = []
 
     chunks = [sendable[i : i + chunk_lines] for i in range(0, len(sendable), chunk_lines)]
     for chunk in tqdm.tqdm(chunks, desc="Cleaning", unit="chunk"):
@@ -170,7 +196,7 @@ def clean_transcript(
                 new_body[index] = None
             elif new != text:
                 new_line = original_line[: match.start("text")] + prefix + new
-                rewritten.append((original_line, new_line))
+                rewritten.append((match.group("ts"), match.group("speaker"), text, new))
                 new_body[index] = new_line
 
     cleaned_path = path.with_name(f"{path.stem}-cleaned.md")
@@ -204,8 +230,8 @@ def clean_transcript(
     changes += dropped or ["(none)"]
     changes += ["", "## Rewritten", ""]
     if rewritten:
-        for original_line, new_line in rewritten:
-            changes += [original_line, f"→ {new_line}", ""]
+        changes += [f"[{ts}] {speaker}: {changed_spans(original, new)}" for ts, speaker, original, new in rewritten]
+        changes.append("")
     else:
         changes += ["(none)", ""]
     changes_path.write_text("\n".join(changes).rstrip("\n") + "\n")
