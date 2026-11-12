@@ -53,13 +53,15 @@ If scripting it fails, create it by hand: Keychain Access → Certificate Assist
 ```sh
 python3 -m venv /tmp/lockvenv
 /tmp/lockvenv/bin/pip install -r requirements.txt -c requirements.lock
-/tmp/lockvenv/bin/pip uninstall -y torch sympy mpmath networkx setuptools
+/tmp/lockvenv/bin/pip uninstall -y torch sympy mpmath networkx setuptools numba llvmlite scipy
 /tmp/lockvenv/bin/pip freeze > requirements.lock
 ```
 
+numba, llvmlite and scipy come out too: mlx-whisper only uses them for word timestamps, which we never request, and `snoozy_scribe/whisper_stubs.py` stands in for them at import (about 250MB saved). Requesting `word_timestamps=True` would raise.
+
 Jinja2 and MarkupSafe stay in the lock: transformers (pulled in by mlx-lm) needs jinja2 to render the dictation cleanup model's chat template.
 
-Then rebuild `.venv` from the lock: `rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install --no-deps -r requirements.lock`. `pip check` will report `mlx-whisper ... requires torch, which is not installed` — that's expected.
+Then rebuild `.venv` from the lock: `rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install --no-deps -r requirements.lock`. `pip check` will report that mlx-whisper requires torch, numba and scipy, which are not installed — that's expected.
 
 ## Testing dictation without the app
 

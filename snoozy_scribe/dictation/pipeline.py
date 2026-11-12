@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from snoozy_scribe import whisper_stubs  # noqa: F401  (must precede mlx_whisper)
+
 import mlx_whisper
 import numpy as np
 

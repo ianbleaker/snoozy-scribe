@@ -16,7 +16,6 @@ httpx==0.28.1
 huggingface_hub==1.32.0
 idna==3.20
 Jinja2==3.1.6
-llvmlite==0.49.0
 markdown-it-py==4.2.0
 MarkupSafe==3.0.4
 mdurl==0.1.2
@@ -25,7 +24,6 @@ mlx-lm==0.32.2
 mlx-metal==0.32.2
 mlx-whisper==0.4.3
 more-itertools==11.1.0
-numba==0.67.0
 numpy==2.5.3
 onnxruntime==1.30.0
 packaging==26.3
@@ -45,7 +43,6 @@ requests==2.34.2
 rich==15.0.0
 rumps==0.4.0
 safetensors==0.8.0
-scipy==1.18.1
 sentencepiece==0.2.2
 shellingham==1.5.4
 sounddevice==0.5.6
