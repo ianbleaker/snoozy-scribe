@@ -747,6 +747,36 @@ def migrate_launch_agents() -> None:
     log.info("moved Launch at login from LaunchAgent %s to SMAppService", ", ".join(found))
 
 
+def probe_selection(seconds: float = 60) -> None:
+    """Watch the frontmost app's selection, printing each change, to check the reader per app."""
+    import time
+
+    import ApplicationServices
+
+    if not ApplicationServices.AXIsProcessTrusted():
+        print("This terminal app has no Accessibility permission, so every read will be None.")
+        print("Grant it in System Settings > Privacy & Security > Accessibility, then rerun.\n")
+    print(f"Watching for {seconds:.0f} s. Switch to an app and select some text (Ctrl+C stops).\n")
+    last = object()
+    end = time.monotonic() + seconds
+    try:
+        while time.monotonic() < end:
+            app = frontmost_context()["app"]
+            sel = focused_selection()
+            current = (app, sel and sel["text"], sel and sel["editable"])
+            if current != last:
+                last = current
+                if sel is None:
+                    print(f"{app}: no selection read")
+                else:
+                    text = sel["text"].replace("\n", " ")
+                    text = text if len(text) <= 60 else text[:57] + "..."
+                    print(f"{app}: editable={sel['editable']}  {text!r}")
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"{identity.APP_NAME} menu-bar dictation app.")
     parser.add_argument("--once", metavar="WAV", help="Transcribe WAV with no UI and print the result")
@@ -754,14 +784,13 @@ def main() -> None:
         "--print-context", action="store_true", help="Wait 3 s, then print the frontmost app and window"
     )
     parser.add_argument(
-        "--print-selection", action="store_true", help="Wait 3 s, then print the frontmost app's selected text"
+        "--print-selection",
+        action="store_true",
+        help="For 60 s, print the frontmost app's selected text whenever it changes (Ctrl+C stops)",
     )
     args = parser.parse_args()
     if args.print_selection:
-        import time
-
-        time.sleep(3)
-        print(focused_selection())
+        probe_selection()
         return
     if args.print_context:
         import time
