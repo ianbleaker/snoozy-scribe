@@ -696,6 +696,8 @@ class DictateApp(rumps.App):
 def run_once(wav_path: str) -> None:
     """Run the dictation pipeline on a file with no UI, for testing."""
     import numpy as np
+
+    from snoozy_scribe import whisper_stubs  # noqa: F401  (must precede mlx_whisper)
     from mlx_whisper.audio import load_audio
 
     from snoozy_scribe.dictation import pipeline

@@ -29,6 +29,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 import mlx.core as mx
+
+from snoozy_scribe import whisper_stubs  # noqa: F401  (must precede mlx_whisper)
+
 import mlx_whisper
 import numpy as np
 import tqdm
