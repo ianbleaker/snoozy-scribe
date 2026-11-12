@@ -39,7 +39,7 @@ import yaml
 from mlx_whisper.audio import HOP_LENGTH
 from mlx_whisper.tokenizer import LANGUAGES
 
-from snoozy_scribe import identity, paths, silero_onnx
+from snoozy_scribe import identity, paths, silero
 from snoozy_scribe.audio_input import AUDIO_EXTENSIONS, InputError, InputKind, detect_input
 from snoozy_scribe.config import check_legacy_layout, load_config
 from snoozy_scribe.models import resolve_model_path
@@ -688,10 +688,10 @@ def detect_speech_regions(
     """
     global _vad_model
     if _vad_model is None:
-        _vad_model = silero_onnx.SileroVADSequence()
+        _vad_model = silero.SileroVADSequence()
 
     wav = _decode_audio_mono16k(audio_path)
-    timestamps = silero_onnx.get_speech_timestamps(
+    timestamps = silero.get_speech_timestamps(
         wav,
         _vad_model,
         min_silence_duration_ms=min_silence_ms,

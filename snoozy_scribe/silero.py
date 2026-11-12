@@ -1,13 +1,21 @@
-"""Torch-free Silero VAD: the batched ("sequence") ONNX model run through onnxruntime.
+"""Torch-free Silero VAD: the batched ("sequence") model run in numpy.
 
 Vendored from Silero VAD 6.2.3 (https://github.com/snakers4/silero-vad),
-MIT-licensed; the license is at snoozy_scribe/vendor/silero_vad/LICENSE. Copied from
-upstream:
+MIT-licensed; the license is at snoozy_scribe/vendor/silero_vad/LICENSE.
+
+The weights in `vendor/silero_vad/silero_vad_16k_sequence.npz` are the
+initializers of upstream's `silero_vad_16k_sequence.onnx` (sha256
+9ccdacc4719d8aa7e45a77536bfabec45a03ba1f2fad5e241ab4060b24238a85), unchanged
+except that the LSTM's `W`/`R`/`B` are renamed `lstm.W`/`lstm.R`/`lstm.B`.
+`SileroVADSequence` re-implements that ONNX graph in numpy: per-frame STFT
+magnitude, four Conv1d+ReLU encoder layers, an LSTM across frames, then a
+1x1 conv and sigmoid.
+
+Copied from upstream:
 
 - `frame_blocks` (silero_vad/sequence_vad.py), verbatim.
-- `SileroVADSequence` session setup and `audio_forward` block loop
-  (silero_vad/sequence_vad.py), as `speech_probs`, fixed to 16kHz and with a
-  per-block progress callback added.
+- The `audio_forward` block loop (silero_vad/sequence_vad.py), as
+  `speech_probs`, fixed to 16kHz and with a per-block progress callback added.
 - `get_speech_timestamps_from_probs` (silero_vad/utils_vad.py), verbatim
   minus the matplotlib `visualize_probs` option.
 
@@ -22,14 +30,22 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
-import onnxruntime as ort
 
-MODEL_PATH = Path(__file__).resolve().parent / "vendor" / "silero_vad" / "silero_vad_16k_sequence.onnx"
+MODEL_PATH = Path(__file__).resolve().parent / "vendor" / "silero_vad" / "silero_vad_16k_sequence.npz"
 SAMPLING_RATE = 16000
 FRAME_SAMPLES = 512
 CONTEXT_SAMPLES = 64
-# Max frames per ONNX call. 512 frames ~= 16.4 s at 16 kHz.
+# Max frames per block. 512 frames ~= 16.4 s at 16 kHz.
 MAX_FRAMES = 512
+HIDDEN_SIZE = 128
+# STFT: reflect-pad each 576-sample frame by 128 each side, then a 256-tap
+# conv with stride 128 whose 258 output channels are 129 real then 129
+# imaginary bins. The first of its 5 time steps is dropped.
+STFT_PAD = 128
+STFT_HOP = 128
+STFT_BINS = 129
+# (stride, padding) of encoder.0-3; together they reduce 4 STFT steps to 1.
+ENCODER_LAYERS = ((1, 1), (2, 1), (2, 1), (1, 1))
 
 
 def frame_blocks(audio: np.ndarray,
@@ -61,18 +77,71 @@ def frame_blocks(audio: np.ndarray,
         yield np.concatenate((contexts, frames), axis=1)
 
 
+def _conv1d(x: np.ndarray, weight: np.ndarray, bias: np.ndarray | None,
+            stride: int, padding: int) -> np.ndarray:
+    """ONNX/torch Conv1d (no dilation or groups): `x` is (N, C, T), `weight` (O, C, K)."""
+    if padding:
+        x = np.pad(x, ((0, 0), (0, 0), (padding, padding)))
+    kernel = weight.shape[2]
+    steps = (x.shape[2] - kernel) // stride + 1
+    # (N, C, steps, K): every receptive field, gathered per kernel tap.
+    windows = np.stack(
+        [x[:, :, k: k + stride * (steps - 1) + 1: stride] for k in range(kernel)],
+        axis=-1,
+    )
+    out = np.einsum("nctk,ock->not", windows, weight, optimize=True)
+    if bias is not None:
+        out += bias[None, :, None]
+    return out
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
 class SileroVADSequence:
-    """Loads the sequence ONNX model and computes per-frame speech probabilities."""
+    """Loads the sequence model's weights and computes per-frame speech probabilities."""
 
     def __init__(self, path: str | Path = MODEL_PATH):
-        options = ort.SessionOptions()
-        options.inter_op_num_threads = 1
-        options.intra_op_num_threads = 1
-        self.session = ort.InferenceSession(
-            str(path),
-            sess_options=options,
-            providers=["CPUExecutionProvider"],
-        )
+        with np.load(path, allow_pickle=False) as weights:
+            self.weights = {name: weights[name].astype(np.float32) for name in weights.files}
+        w = self.weights
+        # ONNX LSTM layout: gates stacked i, o, f, c; B is input bias then recurrent bias.
+        self._lstm_input = np.ascontiguousarray(w["lstm.W"][0].T)
+        self._lstm_recurrent = np.ascontiguousarray(w["lstm.R"][0].T)
+        self._lstm_bias = w["lstm.B"][0, : 4 * HIDDEN_SIZE] + w["lstm.B"][0, 4 * HIDDEN_SIZE:]
+        self._output_weight = w["output.weight"][0, :, 0]
+        self._output_bias = w["output.bias"][0]
+
+    def _encode(self, block: np.ndarray) -> np.ndarray:
+        """(frames, 576) audio block -> (frames, 128) encoder features."""
+        padded = np.pad(block, ((0, 0), (STFT_PAD, STFT_PAD)), mode="reflect")
+        spectrum = _conv1d(padded[:, None, :], self.weights["stft.forward_basis_buffer"],
+                           None, STFT_HOP, 0)
+        real = spectrum[:, :STFT_BINS, 1:]
+        imaginary = spectrum[:, STFT_BINS:, 1:]
+        x = np.sqrt(real ** 2 + imaginary ** 2)
+        for i, (stride, padding) in enumerate(ENCODER_LAYERS):
+            x = _conv1d(x, self.weights[f"encoder.{i}.weight"],
+                        self.weights[f"encoder.{i}.bias"], stride, padding)
+            np.maximum(x, 0, out=x)
+        return x[:, :, 0]
+
+    def _lstm(self, features: np.ndarray, hidden: np.ndarray, cell: np.ndarray):
+        """Run the LSTM across frames; returns (outputs, hidden, cell)."""
+        h = HIDDEN_SIZE
+        input_gates = features @ self._lstm_input + self._lstm_bias
+        outputs = np.empty((features.shape[0], h), dtype=np.float32)
+        for t in range(features.shape[0]):
+            gates = input_gates[t] + hidden @ self._lstm_recurrent
+            input_gate = _sigmoid(gates[:h])
+            output_gate = _sigmoid(gates[h: 2 * h])
+            forget_gate = _sigmoid(gates[2 * h: 3 * h])
+            candidate = np.tanh(gates[3 * h:])
+            cell = forget_gate * cell + input_gate * candidate
+            hidden = output_gate * np.tanh(cell)
+            outputs[t] = hidden
+        return outputs, hidden, cell
 
     def speech_probs(
         self,
@@ -81,27 +150,26 @@ class SileroVADSequence:
     ) -> np.ndarray:
         """Return a 1-D float32 array of per-frame speech probabilities.
 
-        Runs the model as a single ONNX call per block of up to `MAX_FRAMES`
-        frames. `progress_callback`, if given, is called after each block with
-        the cumulative percent (0-100) of frames processed.
+        Runs the model one block of up to `MAX_FRAMES` frames at a time,
+        carrying LSTM state across blocks. `progress_callback`, if given, is
+        called after each block with the cumulative percent (0-100) of frames
+        processed.
         """
         frame_count = (audio.size + FRAME_SAMPLES - 1) // FRAME_SAMPLES
-        hidden = np.zeros((1, 1, 128), dtype=np.float32)
-        cell = np.zeros((1, 1, 128), dtype=np.float32)
+        hidden = np.zeros(HIDDEN_SIZE, dtype=np.float32)
+        cell = np.zeros(HIDDEN_SIZE, dtype=np.float32)
         probabilities = []
         frames_done = 0
         for block in frame_blocks(audio, FRAME_SAMPLES, CONTEXT_SAMPLES, MAX_FRAMES):
-            values, hidden, cell = self.session.run(
-                ["speech_probs", "hn", "cn"],
-                {"input": block, "h": hidden, "c": cell},
-            )
-            probabilities.append(values)
+            outputs, hidden, cell = self._lstm(self._encode(block), hidden, cell)
+            logits = np.maximum(outputs, 0) @ self._output_weight + self._output_bias
+            probabilities.append(_sigmoid(logits).astype(np.float32))
             frames_done += block.shape[0]
             if progress_callback is not None and frame_count:
                 progress_callback(min(frames_done, frame_count) / frame_count * 100)
         if not probabilities:
             return np.zeros(0, dtype=np.float32)
-        return np.concatenate(probabilities).reshape(-1)
+        return np.concatenate(probabilities)
 
 
 def get_speech_timestamps_from_probs(speech_probs: List[float],
