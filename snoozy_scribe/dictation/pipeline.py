@@ -25,6 +25,17 @@ MIN_CLIP_SECONDS = 0.3
 
 DEFAULT_INLINE_FILLERS = ["um", "uh", "er", "erm", "ah", "hmm", "mm"]
 
+# Whisper copies the style of its initial prompt. A prompt with written-out
+# disfluencies makes it transcribe fillers as "um"/"uh" (which
+# strip_inline_fillers removes) instead of guessing real words like "a" or
+# "I'm". It goes first so prompt truncation drops it before vocabulary terms.
+FILLER_PREAMBLE = "Um, uh, so, I think we should, uh, hmm, go."
+
+
+def _initial_prompt(vocabs: list[dict]) -> str:
+    vocab_prompt = build_combined_prompt(vocabs, None)
+    return f"{FILLER_PREAMBLE} {vocab_prompt}" if vocab_prompt else FILLER_PREAMBLE
+
 
 @dataclass
 class PipelineSettings:
@@ -93,7 +104,7 @@ def transcribe_clip(audio: np.ndarray, vocabs: list[dict], settings: PipelineSet
         path_or_hf_repo=str(settings.whisper_model_dir),
         verbose=None,
         language=settings.language,
-        initial_prompt=build_combined_prompt(vocabs, None) or None,
+        initial_prompt=_initial_prompt(vocabs),
         condition_on_previous_text=False,
     )
     text = result["text"].strip()
