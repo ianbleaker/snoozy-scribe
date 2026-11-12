@@ -17,7 +17,23 @@ cd snoozy-scribe
 ./setup.sh
 ```
 
-`setup.sh` builds `.venv`, creates `settings/config.yaml` if it doesn't exist, and builds and installs the app to `~/Applications/snoozy-scribe.app`. The first run also creates a self-signed code-signing certificate in your login keychain, so macOS asks for your password once. Open it from Spotlight; ✎ appears in the menu bar. Rerun `./setup.sh` any time (after `git pull`, say); it only rebuilds the app when it has to. Pass `--rebuild-app` to force a rebuild.
+`setup.sh` builds `.venv` and builds and installs the app to `~/Applications/snoozy-scribe.app`. The first run also creates a self-signed code-signing certificate in your login keychain, so macOS asks for your password once. Open it from Spotlight; ✎ appears in the menu bar. Rerun `./setup.sh` any time (after `git pull`, say); it only rebuilds the app when it has to. Pass `--rebuild-app` to force a rebuild.
+
+### Where things live
+
+Your settings and data live outside the repo, in `~/Library/Application Support/snoozy-scribe/`. The first run of the app or any of the scripts creates it, with a default `settings/config.yaml` and `settings/vocabulary/vocabulary.example.md`. It never overwrites a file that's already there.
+
+```
+settings/config.yaml           your config
+settings/vocabulary/<name>.md  vocabularies
+settings/prompts/<name>.md     optional prompt overrides (see Config)
+data/models/                   downloaded model weights
+data/input/                    drop folder for Craig exports
+data/cache/partial/            per-track segment cache for session transcription
+data/dictation-state.json      menu choices (vocabularies, hotkeys)
+```
+
+Relative paths in the config resolve against that folder. Transcripts go to `~/Documents/snoozy-scribe/transcripts/` by default (config `output_dir`), so they're easy to find in Finder. Set the `SNOOZY_SCRIBE_HOME` environment variable to use a different folder, e.g. to try a fresh install.
 
 ## Permissions
 
@@ -25,6 +41,8 @@ snoozy-scribe needs two permissions (System Settings → Privacy & Security):
 
 - **Microphone**, to record.
 - **Accessibility**, for the global hotkeys, to paste (synthesized ⌘V) and to read the focused window title. Input Monitoring isn't needed.
+
+The first transcription also asks once for access to your **Documents** folder, because the default `output_dir` is `~/Documents/snoozy-scribe/transcripts`. Allow it, or point `output_dir` somewhere else.
 
 A permissions window opens at launch whenever one is missing (it's also in the ✎ menu under "Permissions…"). Each row has a button that shows the macOS prompt, or opens the right Settings pane once you've been asked, and turns into a ✓ when granted. If a grant only takes effect after a restart, a Relaunch button appears.
 
@@ -46,23 +64,23 @@ A pill near the bottom of the screen shows "● Recording" with a level meter, t
 
 ### Menu
 
-- **Vocabulary ▸**: one checkmark per vocabulary file; tick any number to apply them to dictation. The selection is saved in `data/dictation-state.json`.
+- **Vocabulary ▸**: one checkmark per vocabulary file; tick any number to apply them to dictation. The selection is saved in `data/dictation-state.json` (under Application Support).
 - **Hotkeys ▸**: the current bindings; choose one to rebind it (see Hotkeys above), ⌫ clears the Add selected text one. Bindings set here are saved in `data/dictation-state.json` and override `config.yaml` until **Reset to config defaults**.
 - **History ▸**: the last `dictation.history_size` results (memory only; dictated text is never written to disk). Each has "Copy cleaned" and "Copy raw", and "(fallback used)" when the cleanup model's output was rejected and the raw text was pasted instead.
 - **Fix last dictation…**: enter `wrong -> right`. Adds `wrong` as a `Misheard as` variant of `right`, then copies the corrected last dictation to the clipboard.
 - **Add term…**: `Term`, or `Term | misheard1, misheard2`.
 - **Add selected text**: copies the selection from the frontmost app and opens Add term with it.
-- **Transcribe audio…** opens the transcription GUI. **Open settings folder**. **Edit cleanup prompt…** opens `settings/prompts/dictation-cleanup.md`, the cleanup model's instructions; edits apply on the next dictation. **Permissions…** opens the permissions window. **Launch at login** adds the app to System Settings → General → Login Items → Open at Login; if macOS asks for approval there, turn it on.
+- **Transcribe audio…** opens the transcription GUI. **Open settings folder** opens `~/Library/Application Support/snoozy-scribe/settings`. **Edit cleanup prompt…** opens your copy of the cleanup model's instructions, `settings/prompts/dictation-cleanup.md`, creating it from the built-in prompt the first time; edits apply on the next dictation. **Permissions…** opens the permissions window. **Launch at login** adds the app to System Settings → General → Login Items → Open at Login; if macOS asks for approval there, turn it on.
 
 ## Config
 
-All keys sit under `dictation:` in `settings/config.yaml` and are optional. `settings/config.example.yaml` lists each with its default: `hotkey`, `toggle_hotkey`, `add_selection_hotkey`, `cleanup`, `cleanup_model`, `inline_fillers`, `app_context`, `overlay` and `history_size`. Dictation also uses the top-level `whisper_model`, `language`, `model_dir` and `hallucination_phrases`.
+All keys sit under `dictation:` in `settings/config.yaml` (under Application Support) and are optional. The seeded config lists each with its default (the original is `snoozy_scribe/defaults/config.example.yaml`): `hotkey`, `toggle_hotkey`, `add_selection_hotkey`, `cleanup`, `cleanup_model`, `inline_fillers`, `app_context`, `overlay` and `history_size`. Dictation also uses the top-level `whisper_model`, `language`, `model_dir` and `hallucination_phrases`.
 
-The cleanup models' prompts are tracked files in `settings/prompts/`. The transcript cleanup pass (`clean_transcript.py`) reads its own optional `transcript_cleanup:` section; see [docs/session-transcription.md](docs/session-transcription.md#llm-cleanup).
+The cleanup models' prompts are built in, in `snoozy_scribe/defaults/prompts/`. To change one, put a copy at `settings/prompts/<name>.md` under Application Support (**Edit cleanup prompt…** does this for dictation): a copy there always wins, so later changes to the built-in prompt don't reach you until you delete it. The log names the prompt file in use. The transcript cleanup pass (`clean_transcript.py`) reads its own optional `transcript_cleanup:` section; see [docs/session-transcription.md](docs/session-transcription.md#llm-cleanup).
 
 ## Vocabulary
 
-Vocabulary files in `settings/vocabulary/` hold terms Whisper gets wrong, such as names and places. Each file is one vocabulary; dictation applies the ones ticked in the menu, session transcription the ones in config `vocabularies`. Format, merging and capture: [docs/vocabulary.md](docs/vocabulary.md).
+Vocabulary files in `settings/vocabulary/` (under Application Support) hold terms Whisper gets wrong, such as names and places. Each file is one vocabulary; dictation applies the ones ticked in the menu, session transcription the ones in config `vocabularies`. Format, merging and capture: [docs/vocabulary.md](docs/vocabulary.md).
 
 ## Transcribing audio
 
@@ -73,7 +91,6 @@ Vocabulary files in `settings/vocabulary/` hold terms Whisper gets wrong, such a
 - **Logs**: the app writes to `~/Library/Logs/snoozy-scribe.log`.
 - **App won't start after a Homebrew Python upgrade, or after moving the repo**: rerun `./setup.sh`. It recreates `.venv` and rebuilds the app.
 - **Old copy in `/Applications`**: earlier installs had you drag the app there, and that copy goes stale. Delete it and use `~/Applications/snoozy-scribe.app`; if you turned **Launch at login** on from the old copy, toggle it off and on from the new one. `setup.sh` warns when it finds one.
-- **Upgrading from rpg-scribe** (the app's old name): rerun `./setup.sh`. It removes `~/Applications/rpg-scribe.app`, and the new app moves **Launch at login** over to Open at Login on first launch. The new name is a new app identity to macOS, so grant Microphone and Accessibility again once. The old `rpg-scribe Code Signing` certificate can be deleted in Keychain Access.
 
 ## Development
 

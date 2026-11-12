@@ -1,7 +1,9 @@
 # Vocabulary
 
-Vocabulary files live in `settings/vocabulary/` (gitignored, except the
-`*.example.md` files). They hold terms Whisper gets wrong: post-fix
+Vocabulary files live in `settings/vocabulary/` under
+`~/Library/Application Support/snoozy-scribe/`. The first run puts
+`vocabulary.example.md` there (the original is
+`snoozy_scribe/defaults/vocabulary.example.md`). They hold terms Whisper gets wrong: post-fix
 corrections for known mis-transcriptions, and optional enrichment fields for
 prompt seeding.
 

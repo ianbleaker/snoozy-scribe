@@ -20,22 +20,8 @@ from snoozy_scribe.vocabulary import (
 
 
 def get_selected_vocabularies() -> list[str]:
-    """The persisted selection, sorted. Corrupt entries are dropped.
-
-    Migrates the old single-choice `campaign` key on first read: dictation
-    used to apply base.md (when present) plus that one file.
-    """
-    state = load_state()
-    if "vocabularies" not in state:
-        legacy = state.get("campaign")
-        if isinstance(legacy, str) and legacy:
-            names = {legacy}
-            if vocabulary_path("base").exists():
-                names.add("base")
-            selected = sorted(names)
-            update_state(vocabularies=selected, campaign=None)
-            return selected
-    names = state.get("vocabularies")
+    """The persisted selection, sorted. Corrupt entries are dropped."""
+    names = load_state().get("vocabularies")
     if not isinstance(names, list):
         return []
     return sorted({n for n in names if isinstance(n, str) and n})

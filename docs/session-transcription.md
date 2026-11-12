@@ -14,11 +14,9 @@ The pipeline decodes audio with ffmpeg, so install it first:
 brew install ffmpeg
 ```
 
-Edit `settings/config.yaml` with your Discord usernames → display name mapping (`speaker_map`). It's gitignored — local to your machine.
+Settings and data live in `~/Library/Application Support/snoozy-scribe/`, created on first run (see the README, "Where things live"); the paths below are relative to it unless they start with `~`. Edit `settings/config.yaml` there with your Discord usernames → display name mapping (`speaker_map`).
 
-Optionally, `cp settings/vocabulary/vocabulary.example.md settings/vocabulary/<name>.md`, fill in your terms and set `vocabularies: [<name>]` in the config — see [vocabulary.md](vocabulary.md).
-
-**Upgrading from the old layout** (`config.yaml`, `vocabulary.md`, `models/`, `input/` and `transcripts/` at the repo root): `transcribe.py`, `gui.py` and the dictation app check for it at startup. They exit and print the exact `mv` commands and config keys to fix. Nothing is moved automatically.
+Optionally, copy `settings/vocabulary/vocabulary.example.md` to `settings/vocabulary/<name>.md`, fill in your terms and set `vocabularies: [<name>]` in the config — see [vocabulary.md](vocabulary.md).
 
 ## Usage
 
@@ -35,13 +33,13 @@ python3 transcribe.py [input]
 
 For non-Craig input, the recording's start time (used by `--clock-timestamps` and the frontmatter `date`) is approximate: the file's `creation_time` tag when it has one, otherwise its modification time minus its duration, shown in local time. In a merged folder the earliest file's start is used.
 
-If omitted, the oldest `.zip` file in `input_dir` (`data/input/` by default) is picked up automatically — drop Craig `.zip` exports there and run without arguments. After a successful run, a zip that was extracted (whether passed explicitly or auto-picked) is moved into `<input_dir>/processed/`. Each track's transcribed segments are cached under `<output_dir>/.partial/<slug>/` (the config `output_dir`, even with `--output-dir`) as each speech region finishes, and kept after the run. A run that crashes or is cancelled resumes from the last finished region when rerun. Rerunning the same input, including a zip already in `data/input/processed/`, reuses them and only re-runs VAD and merging. A cached track is reused only if its audio file is unchanged (same size and same first MiB). Pass `--fresh` to retranscribe from scratch. If the cache was built with different settings (for example another `--model`), the run stops and lists what differs instead of discarding it. Caches unused for `partial_max_age_days` (default 30; `0` turns it off) are deleted at the start of each full run. `--prune-cache` deletes every cache and exits, and `--prune-cache DAYS` deletes only the ones unused for DAYS or more.
+If omitted, the oldest `.zip` file in `input_dir` (`data/input/` by default) is picked up automatically — drop Craig `.zip` exports there and run without arguments. After a successful run, a zip that was extracted (whether passed explicitly or auto-picked) is moved into `<input_dir>/processed/`. Each track's transcribed segments are cached under `data/cache/partial/<slug>/` as each speech region finishes, and kept after the run. A run that crashes or is cancelled resumes from the last finished region when rerun. Rerunning the same input, including a zip already in `data/input/processed/`, reuses them and only re-runs VAD and merging. A cached track is reused only if its audio file is unchanged (same size and same first MiB). Pass `--fresh` to retranscribe from scratch. If the cache was built with different settings (for example another `--model`), the run stops and lists what differs instead of discarding it. Caches unused for `partial_max_age_days` (default 30; `0` turns it off) are deleted at the start of each full run. `--prune-cache` deletes every cache and exits, and `--prune-cache DAYS` deletes only the ones unused for DAYS or more.
 
-The transcript is written to `output_dir` (`data/transcripts/` by default) as `<session-title>.md`. Lines Whisper's decode couldn't be trusted for show `!! [inaudible]` in the transcript; if the run had any, the original garbled text is written alongside it to `<session-title>.errors.md` for manual review against the audio. Lines deliberately dropped as filler, crosstalk backchannels or laughter are logged, with the reason, to `<session-title>.pruned.md`.
+The transcript is written to `output_dir` (`~/Documents/snoozy-scribe/transcripts/` by default; the first run asks for Documents access) as `<session-title>.md`. Lines Whisper's decode couldn't be trusted for show `!! [inaudible]` in the transcript; if the run had any, the original garbled text is written alongside it to `<session-title>.errors.md` for manual review against the audio. Lines deliberately dropped as filler, crosstalk backchannels or laughter are logged, with the reason, to `<session-title>.pruned.md`.
 
 Options:
 
-- `--config <path>` — use a config file other than `settings/config.yaml`.
+- `--config <path>` — use a config file other than the Application Support `settings/config.yaml`.
 - `--model <repo-id>` — override the configured `whisper_model`.
 - `--title <title>` — override the session title (defaults to the input's basename, without the `.zip` or audio extension if applicable).
 - `--speaker NAME` — speaker name for a single audio file, or for every file with `--separate` (default `Speaker`). Rejected for Craig and merged-folder input.
@@ -52,9 +50,9 @@ Options:
 - `--start HH:MM:SS` / `--end HH:MM:SS` — transcribe only part of the session. Either bound can be omitted to mean the start or end of the recording. Timestamps stay relative to the whole session. The transcript is written as `<session-title>-<start>-<end>.md` (e.g. `my-session-01h30m-02h15m.md`) unless `--output-name` is given. A windowed run doesn't save resumable progress and doesn't move the zip into `processed/`, so you can come back for other windows or a full run later.
 - `--test [SECONDS]` — a quick windowed run of SECONDS (default 120), starting at `--start` if given or at a random point otherwise, written to `<session-title>-<start>-<end>.md` like `--start`/`--end`.
 - `--shared-mic USERNAME@START[-END]=NAME1,NAME2` — label one track's lines in a span with several players' names; see [Players sharing a mic](#players-sharing-a-mic).
-- `--prune-cache [DAYS]` — delete cached segments under `<output_dir>/.partial/` (all of them, or only those unused for DAYS) and exit.
+- `--prune-cache [DAYS]` — delete cached segments under `data/cache/partial/` (all of them, or only those unused for DAYS) and exit.
 
-When two players share a room on separate headsets, each mic picks up the other, and the transcript can show the same line under both speakers. Matching cross-track lines are deduplicated before merging, but only when the audio confirms bleed. The quieter track has to carry an attenuated, correlated copy of the louder one, so a player echoing someone else is never removed. The thresholds are config keys (`bleed_level_gap_db`, `bleed_min_correlation`, `bleed_text_similarity`, `bleed_max_offset_s`; see `settings/config.example.yaml`). Pairs that match on text but miss the audio thresholds are kept. `show_bleed_markers: true` (or `--show-bleed-markers`) prefixes the quieter copy with `[possible bleed: <speaker>]` for review. `--verbose` prints the level gap and correlation of each pair, so you can tune the thresholds and rerun the cached zip cheaply.
+When two players share a room on separate headsets, each mic picks up the other, and the transcript can show the same line under both speakers. Matching cross-track lines are deduplicated before merging, but only when the audio confirms bleed. The quieter track has to carry an attenuated, correlated copy of the louder one, so a player echoing someone else is never removed. The thresholds are config keys (`bleed_level_gap_db`, `bleed_min_correlation`, `bleed_text_similarity`, `bleed_max_offset_s`; see the comments in `settings/config.yaml`). Pairs that match on text but miss the audio thresholds are kept. `show_bleed_markers: true` (or `--show-bleed-markers`) prefixes the quieter copy with `[possible bleed: <speaker>]` for review. `--verbose` prints the level gap and correlation of each pair, so you can tune the thresholds and rerun the cached zip cheaply.
 
 
 ### Players sharing a mic
@@ -73,20 +71,20 @@ On first run, the configured Whisper model is downloaded into `model_dir` (`data
 
 Config keys:
 
-- `output_dir` — directory transcript Markdown files are written to, and the root of the segment cache. Defaults to `./data/transcripts`. `--output-dir` (and the GUI's "Output folder") moves only the transcripts.
+- `output_dir` — directory transcript Markdown files are written to. Defaults to `~/Documents/snoozy-scribe/transcripts`. `--output-dir` (and the GUI's "Output folder") overrides it per run. The segment cache is always `data/cache/partial/`.
 - `input_dir` — directory to drop Craig `.zip` exports into for automatic pickup. Defaults to `./data/input`.
 - `model_dir` — where model weights are downloaded. Defaults to `./data/models`.
 - `vad_min_silence_ms` — minimum pause (in milliseconds) that splits speech into separate regions before transcription. Defaults to `800`.
 - `timestamp_format` — `strftime()` format for each line's timestamp. Defaults to `"%H:%M:%S"`.
 - `timestamp_mode` — `"elapsed"` stamps each line with time since the start of the recording, so the first segment reads `00:00:00`; `"clock"` stamps it with the real wall-clock time it was recorded. Defaults to `"elapsed"`. Overridden by `--elapsed-timestamps` / `--clock-timestamps`.
 - `line_format` — `str.format()` template for each transcript line, with `{timestamp}`, `{speaker}`, and `{text}` placeholders. Use Markdown here to style the output, e.g. `"[{timestamp}] **{speaker}**: {text}"` to bold speaker names. Defaults to `"[{timestamp}] {speaker}: {text}"`.
-- `vocabularies` — list of vocabulary names (`settings/vocabulary/<name>.md`) session transcription applies, merged alphabetically. A single name is also accepted. Omit it to run without a vocabulary. The old `campaign` key is rejected with a message telling you to rename it.
+- `vocabularies` — list of vocabulary names (`settings/vocabulary/<name>.md`) session transcription applies, merged alphabetically. A single name is also accepted. Omit it to run without a vocabulary.
 
 
 ## LLM cleanup
 
 ```sh
-.venv/bin/python clean_transcript.py data/transcripts/<session-title>.md
+.venv/bin/python clean_transcript.py ~/Documents/snoozy-scribe/transcripts/<session-title>.md
 ```
 
 An optional second pass over a finished transcript, using the same local model as dictation cleanup (no network calls once it's downloaded). For each line the model either drops it (content-free lines and false starts the speaker restarts) or lightly edits it: punctuation, capitalization, um/uh, stutters. It never rephrases. Per-line guards keep the original whenever a rewrite drifts or a long line would be dropped.
@@ -96,7 +94,7 @@ It writes two files next to the input, overwriting any from an earlier run:
 - `<session-title>-cleaned.md` — the cleaned transcript. Its frontmatter adds `source`, an `llm_cleanup` block (model, settings and counts) and a caveat. This is the input `/analyze-narrative` expects.
 - `<session-title>-cleaned.changes.md` — every dropped line, and every rewrite as its timestamp and speaker followed by only the changed word spans, each with one unchanged word either side so you can tell which of several identical fillers went (`` `lose, um, I` → `lose, I` ``).
 
-A full session (about 2,000 lines) takes several minutes. `--config <path>` uses a config file other than `settings/config.yaml`.
+A full session (about 2,000 lines) takes several minutes. `--config <path>` uses a config file other than the Application Support `settings/config.yaml`.
 
 Config keys, all optional, under `transcript_cleanup:`:
 
@@ -105,7 +103,7 @@ Config keys, all optional, under `transcript_cleanup:`:
 - `min_similarity` — a rewrite less similar than this to the original is discarded. Defaults to `0.8`.
 - `max_drop_words` — a line with more words than this is never dropped. Defaults to `6`. A line ending in `?` is never dropped either.
 
-The prompt is `settings/prompts/transcript-cleanup.md`; edit it to tune what gets dropped or edited.
+The prompt is built in (`snoozy_scribe/defaults/prompts/transcript-cleanup.md`). To tune what gets dropped or edited, copy it to `settings/prompts/transcript-cleanup.md` under Application Support and edit the copy. The copy then always wins, so later changes to the built-in prompt don't reach you until you delete it. The run logs which file it used, and the cleaned transcript's `llm_cleanup.prompt` says `built-in transcript-cleanup.md` or `settings/prompts/transcript-cleanup.md`.
 
 ## GUI
 

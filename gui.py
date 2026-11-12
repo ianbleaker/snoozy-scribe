@@ -25,9 +25,8 @@ import yaml
 
 from snoozy_scribe import identity, paths
 from snoozy_scribe.audio_input import AUDIO_EXTENSIONS, InputError, InputKind, detect_input
-from snoozy_scribe.config import check_legacy_layout
 
-REPO_DIR = paths.REPO_DIR
+CODE_DIR = paths.CODE_DIR
 PROGRESS_EVENT_PREFIX = "@@PROGRESS@@ "
 # Tail of the child's stderr kept for a failure dump; tqdm redraws land
 # there too, so an uncapped buffer would grow for the whole run.
@@ -60,10 +59,10 @@ class App(ctk.CTk):
         self.title(f"{identity.APP_NAME} — Transcribe audio")
         self.geometry(f"{WINDOW_WIDTH}x860")
 
+        paths.ensure_user_dirs()
         config = _load_config()
-        self._input_dir = paths.resolve(config.get("input_dir", "./data/input"))
-        default_output_dir = paths.resolve(config.get("output_dir", "./data/transcripts"))
-        self._legacy_layout = check_legacy_layout()
+        self._input_dir = paths.resolve(config.get("input_dir", paths.DEFAULT_INPUT_DIR))
+        default_output_dir = paths.resolve(config.get("output_dir", paths.DEFAULT_OUTPUT_DIR))
         model_repos = [repo for _, repo in MODELS]
         default_model = config.get("whisper_model")
 
@@ -223,8 +222,6 @@ class App(ctk.CTk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._set_idle()
-        for line in self._legacy_layout:
-            self._log_append(line, "error")
 
     # --- form state -------------------------------------------------------
 
@@ -252,17 +249,15 @@ class App(ctk.CTk):
             widget.configure(state=state)
         if enabled:
             self._apply_input_rules()
-        if self._legacy_layout:
-            # transcribe.py would exit with the same instructions.
-            self.start_button.configure(state="disabled")
 
     def _input_path(self) -> Path | None:
         text = self.input_entry.get().strip()
         if not text:
             return None
         path = Path(text).expanduser()
-        # transcribe.py runs with cwd=REPO_DIR, so relative paths mean that.
-        return path if path.is_absolute() else REPO_DIR / path
+        # Relative paths mean the home folder; _build_argv passes this
+        # resolved path, so transcribe.py never depends on the cwd.
+        return path if path.is_absolute() else Path.home() / path
 
     def _refresh_detected(self) -> None:
         path = self._input_path()
@@ -346,7 +341,7 @@ class App(ctk.CTk):
 
     def _pick_output_dir(self) -> None:
         current = self.output_dir_entry.get().strip()
-        path = filedialog.askdirectory(initialdir=current or str(REPO_DIR))
+        path = filedialog.askdirectory(initialdir=current or str(Path.home()))
         if path:
             self.output_dir_entry.delete(0, "end")
             self.output_dir_entry.insert(0, path)
@@ -359,10 +354,10 @@ class App(ctk.CTk):
     # --- run --------------------------------------------------------------
 
     def _build_argv(self) -> list[str]:
-        argv = [sys.executable, "-u", str(REPO_DIR / "transcribe.py")]
-        input_path = self.input_entry.get().strip()
-        if input_path:
-            argv.append(input_path)
+        argv = [sys.executable, "-u", str(CODE_DIR / "transcribe.py")]
+        input_path = self._input_path()
+        if input_path is not None:
+            argv.append(str(input_path))
         argv.append("--progress-events")
         output_dir = self.output_dir_entry.get().strip()
         if output_dir:
@@ -411,10 +406,10 @@ class App(ctk.CTk):
         # stdin=DEVNULL keeps transcribe.py's _CancelWatcher off (it only arms
         # on a TTY stdin); otherwise launching gui.py from a terminal would put
         # that terminal into cbreak mode. Config paths resolve against the
-        # repo root on their own; cwd=REPO_DIR covers relative argv paths.
+        # Application Support folder and the input path is absolute, so the
+        # cwd doesn't matter.
         self._proc = subprocess.Popen(
             argv,
-            cwd=REPO_DIR,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

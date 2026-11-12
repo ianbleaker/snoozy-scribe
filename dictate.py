@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -28,7 +28,7 @@ import rumps
 from PyObjCTools.AppHelper import callAfter, callLater
 
 from snoozy_scribe import identity, paths
-from snoozy_scribe.config import check_legacy_layout, load_config
+from snoozy_scribe.config import load_config
 from snoozy_scribe.dictation.context import context_line, frontmost_context
 from snoozy_scribe.dictation.clipboard import copy_selection, paste_text, secure_input_active, set_clipboard_text
 from snoozy_scribe.dictation.hotkeys import (
@@ -65,10 +65,6 @@ HOTKEY_ROLES = {
     "add_selection_hotkey": ("Add selected text", False, None),
 }
 CAPTURE_SECONDS = 10
-# Hand-written LaunchAgents that earlier versions used for Launch at login.
-# They showed only under Allow in the Background; the app now registers itself
-# with SMAppService, so it's listed under Open at Login.
-OLD_LAUNCH_AGENT_LABELS = (identity.LAUNCH_AGENT_LABEL, identity.LEGACY_LAUNCH_AGENT_LABEL)
 APP_BUNDLE_ID = identity.BUNDLE_ID
 # Shown in messages, with ~ for the home folder.
 LOG_PATH_DISPLAY = f"~/{identity.LOG_PATH.relative_to(Path.home())}"
@@ -563,13 +559,18 @@ class DictateApp(rumps.App):
         self._add_term_dialog(" ".join(selection.split()))
 
     def _open_gui(self, _sender) -> None:
-        subprocess.Popen([sys.executable, str(paths.REPO_DIR / "gui.py")], cwd=paths.REPO_DIR)
+        subprocess.Popen([sys.executable, str(paths.CODE_DIR / "gui.py")])
 
     def _open_settings(self, _sender) -> None:
         subprocess.run(["open", str(paths.SETTINGS_DIR)], check=False)
 
     def _open_cleanup_prompt(self, _sender) -> None:
-        subprocess.run(["open", str(paths.PROMPTS_DIR / "dictation-cleanup.md")], check=False)
+        # The first edit copies the built-in prompt; from then on the copy overrides it.
+        override = paths.PROMPTS_DIR / "dictation-cleanup.md"
+        if not override.exists():
+            override.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(paths.DEFAULTS_DIR / "prompts" / "dictation-cleanup.md", override)
+        subprocess.run(["open", str(override)], check=False)
 
     def _toggle_login(self, sender) -> None:
         # Read the status fresh: the user may have changed it in System Settings.
@@ -702,6 +703,7 @@ def run_once(wav_path: str) -> None:
 
     from snoozy_scribe.dictation import pipeline
 
+    paths.ensure_user_dirs()
     config = load_config(paths.DEFAULT_CONFIG_PATH)
     settings = pipeline.load_settings(config)
     vocabs = VocabState(notify=print).current_vocabs()
@@ -722,31 +724,8 @@ def load_cleaner(config: dict):
     dictation = config.get("dictation") or {}
     if not dictation.get("cleanup", True):
         return None
-    model_dir = paths.resolve(config.get("model_dir", "./data/models"))
+    model_dir = paths.resolve(config.get("model_dir", paths.DEFAULT_MODEL_DIR))
     return Cleaner(resolve_model_path(dictation.get("cleanup_model", DEFAULT_CLEANUP_MODEL), model_dir))
-
-
-def migrate_launch_agents() -> None:
-    """Move Launch at login from an old hand-written LaunchAgent to SMAppService."""
-    agents = Path.home() / "Library/LaunchAgents"
-    found = [label for label in OLD_LAUNCH_AGENT_LABELS if (agents / f"{label}.plist").exists()]
-    if not found:
-        return
-    if _login_service() is None:
-        return  # Leave them for the app bundle to migrate.
-    # Register first, so a failure keeps the old LaunchAgent working.
-    error = set_login_item(True)
-    if error:
-        log.warning("couldn't move Launch at login to SMAppService: %s", error)
-        return
-    for label in found:
-        try:
-            (agents / f"{label}.plist").unlink()
-        except OSError as e:
-            log.warning("couldn't remove LaunchAgent %s: %s", label, e)
-        # Unload it now so it leaves Allow in the Background before the next login.
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], check=False, capture_output=True)
-    log.info("moved Launch at login from LaunchAgent %s to SMAppService", ", ".join(found))
 
 
 def main() -> None:
@@ -775,15 +754,13 @@ def main() -> None:
 
     tqdm.tqdm.set_lock(threading.RLock())
 
-    legacy = check_legacy_layout()
     try:
-        if legacy:
-            raise SystemExit("\n".join(legacy))
+        paths.ensure_user_dirs()
         config = load_config(paths.DEFAULT_CONFIG_PATH)
-        migrate_launch_agents()
         app = DictateApp(config)
-    except (SystemExit, ValueError) as e:
+    except (SystemExit, ValueError, OSError) as e:
         # ValueError: a bad or clashing hotkey string in config.yaml.
+        # OSError: the Application Support folder couldn't be created or seeded.
         log.error("%s", e)
         rumps.alert(title=f"{identity.APP_NAME} can't start", message=str(e))
         sys.exit(1)

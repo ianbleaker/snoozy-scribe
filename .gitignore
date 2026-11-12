@@ -3,15 +3,3 @@ docs/craig-test-files/
 .venv/
 __pycache__/
 snoozy-scribe.app/
-
-settings/config.yaml
-settings/vocabulary/*.md
-!settings/vocabulary/*.example.md
-data/
-
-# legacy layout — keep so un-migrated files are never committed
-/config.yaml
-/vocabulary.md
-/models/
-/input/
-/transcripts/

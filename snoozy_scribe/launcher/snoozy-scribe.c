@@ -8,7 +8,9 @@
  * snoozy-scribe (plan #50, item 10). Embedding keeps the bundle's executable
  * as the process that asks for them.
  *
- * Built by make-app.sh, which passes REPO_DIR and LOG_PATH_SUFFIX as defines.
+ * Built by make-app.sh, which passes REPO_DIR (where the .venv and dictate.py
+ * are) and LOG_PATH_SUFFIX as defines. The process runs in $HOME: nothing
+ * depends on the cwd, and settings and data live in Application Support.
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -44,8 +46,8 @@ int main(int argc, char **argv) {
         setvbuf(stdout, NULL, _IOLBF, 0);
     }
 
-    if (chdir(REPO_DIR) != 0) {
-        perror("chdir " REPO_DIR);
+    if (home && chdir(home) != 0) {
+        perror("chdir $HOME");
         return 1;
     }
 

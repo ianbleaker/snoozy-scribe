@@ -41,7 +41,7 @@ from mlx_whisper.tokenizer import LANGUAGES
 
 from snoozy_scribe import identity, paths, silero
 from snoozy_scribe.audio_input import AUDIO_EXTENSIONS, InputError, InputKind, detect_input
-from snoozy_scribe.config import check_legacy_layout, load_config
+from snoozy_scribe.config import load_config
 from snoozy_scribe.models import resolve_model_path
 from snoozy_scribe.text_filters import (
     DEFAULT_HALLUCINATION_PHRASES,
@@ -65,7 +65,7 @@ VAD_SAMPLE_RATE = 16000
 # session wall-clock time. Sessions run well under 24h, so this never wraps.
 _ELAPSED_TIMESTAMP_EPOCH = datetime(2000, 1, 1)
 
-# Bump when a change alters what a .partial/ directory's saved segments mean
+# Bump when a change alters what a partial cache directory's saved segments mean
 # (e.g. #20: per-region transcription calls instead of one batched call per
 # track) so stale partials from before the change are discarded rather than
 # resumed as-is.
@@ -218,8 +218,8 @@ def _safe_track_filename(username: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", username)
 
 
-def partial_dir_for(output_dir: Path, slug: str) -> Path:
-    return output_dir / ".partial" / slug
+def partial_dir_for(slug: str) -> Path:
+    return paths.PARTIAL_CACHE_DIR / slug
 
 
 def write_partial_meta(
@@ -248,15 +248,15 @@ def write_partial_meta(
     (partial_dir / "_meta.json").write_text(json.dumps(meta))
 
 
-def prune_partials(output_dir: Path, max_age_days: float, keep: Collection[str] = ()) -> list[str]:
-    """Delete `.partial/<slug>/` dirs unused for at least `max_age_days`.
+def prune_partials(max_age_days: float, keep: Collection[str] = ()) -> list[str]:
+    """Delete partial cache `<slug>/` dirs unused for at least `max_age_days`.
 
     Age comes from `_meta.json`'s mtime, since every full run rewrites it
     (falling back to the directory's own mtime if it's missing).
     `max_age_days=0` removes every dir. `keep` names slugs never to remove
     (the current run's). Returns the removed slugs.
     """
-    root = output_dir / ".partial"
+    root = paths.PARTIAL_CACHE_DIR
     if not root.is_dir():
         return []
     cutoff = time.time() - max_age_days * 86400
@@ -1773,9 +1773,7 @@ class RunSettings:
     logprob_threshold: float
     best_of: int | None
     input_dir: Path
-    # Config output_dir: the partial cache's root, whatever --output-dir says.
-    output_dir: Path
-    # Where transcript files go: --output-dir if given, else output_dir.
+    # Where transcript files go: --output-dir if given, else config output_dir.
     transcript_dir: Path
     partial_max_age_days: float
     speaker_map: dict[str, str]
@@ -1885,7 +1883,7 @@ def prune_stale_partials(settings: RunSettings, keep: Collection[str]) -> None:
     """Apply `partial_max_age_days` to the cache, sparing the slugs in `keep`."""
     if settings.windowed or settings.partial_max_age_days <= 0:
         return
-    pruned = prune_partials(settings.output_dir, settings.partial_max_age_days, keep=keep)
+    pruned = prune_partials(settings.partial_max_age_days, keep=keep)
     if pruned:
         print(
             f"Pruned {len(pruned)} cached session(s) unused for "
@@ -1920,7 +1918,7 @@ def transcribe_audio(
     `prune` applies `partial_max_age_days` first; a batch prunes once up
     front instead, so one file's run can't remove a later file's cache."""
     slug = _slugify(source.title)
-    partial_dir = partial_dir_for(settings.output_dir, slug)
+    partial_dir = partial_dir_for(slug)
     # Never discard the cache here: rebuilding it can take an hour, and the
     # usual cause is a forgotten flag (e.g. the cache was built with --model).
     if not settings.windowed and not settings.fresh and partial_dir.exists():
@@ -2374,11 +2372,6 @@ def main() -> None:
     print(_rule())
     print()
 
-    legacy = check_legacy_layout()
-    if legacy:
-        print(*legacy, sep="\n")
-        sys.exit(1)
-
     parser = argparse.ArgumentParser(
         description="Transcribe audio (a Craig export, an audio file, or a folder of audio files) into Markdown."
     )
@@ -2401,8 +2394,7 @@ def main() -> None:
         type=Path,
         default=None,
         metavar="PATH",
-        help="Write transcript files here instead of the config `output_dir`. "
-        "The segment cache stays under the config `output_dir`/.partial/.",
+        help="Write transcript files here instead of the config `output_dir`.",
     )
     parser.add_argument("--model", help="Override the configured whisper_model")
     parser.add_argument(
@@ -2569,7 +2561,7 @@ def main() -> None:
         const=0,
         default=None,
         metavar="DAYS",
-        help="Delete cached per-track segments under <output_dir>/.partial/ "
+        help=f"Delete cached per-track segments under {paths.PARTIAL_CACHE_DIR}/ "
         "and exit without transcribing. With DAYS, only delete caches unused "
         "for at least that many days; without it, delete all of them.",
     )
@@ -2647,14 +2639,14 @@ def main() -> None:
     global _saves_partials
     _saves_partials = not windowed
 
+    paths.ensure_user_dirs()
     config = load_config(args.config)
     if config.get("speaker_map") is not None and not isinstance(config["speaker_map"], dict):
         sys.exit(f"error: speaker_map in {args.config} must be a mapping of Discord name to speaker name")
     if args.prune_cache is not None:
-        prune_root = paths.resolve(config.get("output_dir", "./data/transcripts"))
-        removed = prune_partials(prune_root, args.prune_cache)
+        removed = prune_partials(args.prune_cache)
         for slug in removed:
-            print(f"  removed {prune_root / '.partial' / slug}")
+            print(f"  removed {paths.PARTIAL_CACHE_DIR / slug}")
         print(f"Pruned {len(removed)} cached session(s).")
         return
     if not args.model and "whisper_model" not in config:
@@ -2679,12 +2671,12 @@ def main() -> None:
         else config.get("logprob_threshold", LOGPROB_THRESHOLD)
     )
     best_of = args.best_of if args.best_of is not None else config.get("best_of")
-    input_dir = paths.resolve(config.get("input_dir", "./data/input"))
-    output_dir = paths.resolve(config.get("output_dir", "./data/transcripts"))
+    input_dir = paths.resolve(config.get("input_dir", paths.DEFAULT_INPUT_DIR))
+    output_dir = paths.resolve(config.get("output_dir", paths.DEFAULT_OUTPUT_DIR))
     partial_max_age_days = _config_number(config, "partial_max_age_days", 30)
     if partial_max_age_days < 0:
         sys.exit(f"error: config `partial_max_age_days` must be 0 or more, got {partial_max_age_days!r}")
-    model_dir = paths.resolve(config.get("model_dir", "./data/models"))
+    model_dir = paths.resolve(config.get("model_dir", paths.DEFAULT_MODEL_DIR))
     speaker_map = config.get("speaker_map") or {}
     vad_min_silence_ms = _config_number(config, "vad_min_silence_ms", 800)
     vad_min_speech_ms = _config_number(config, "vad_min_speech_ms", 250)
@@ -2735,11 +2727,6 @@ def main() -> None:
     if args.elapsed_timestamps is not None:
         timestamp_mode = "elapsed" if args.elapsed_timestamps else "clock"
 
-    if "campaign" in config:
-        sys.exit(
-            "error: config key `campaign` was renamed; replace `campaign: X` with "
-            "`vocabularies: [X]` in settings/config.yaml"
-        )
     if args.vocabulary is not None:
         vocabulary_names = args.vocabulary
     else:
@@ -2798,7 +2785,6 @@ def main() -> None:
         logprob_threshold=logprob_threshold,
         best_of=best_of,
         input_dir=input_dir,
-        output_dir=output_dir,
         transcript_dir=args.output_dir.expanduser().resolve() if args.output_dir else output_dir,
         partial_max_age_days=partial_max_age_days,
         speaker_map=speaker_map,

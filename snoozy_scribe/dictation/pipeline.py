@@ -52,7 +52,7 @@ class PipelineSettings:
 def load_settings(config: dict) -> PipelineSettings:
     """Build settings from the loaded config, downloading the Whisper model if needed."""
     dictation = config.get("dictation") or {}
-    model_dir = paths.resolve(config.get("model_dir", "./data/models"))
+    model_dir = paths.resolve(config.get("model_dir", paths.DEFAULT_MODEL_DIR))
     return PipelineSettings(
         whisper_model_dir=resolve_model_path(config["whisper_model"], model_dir),
         language=config.get("language"),

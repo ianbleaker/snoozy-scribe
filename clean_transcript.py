@@ -7,6 +7,7 @@ See docs/session-transcription.md ("LLM cleanup").
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,10 @@ def main() -> None:
         help=f"Path to config YAML (default: {paths.DEFAULT_CONFIG_PATH})",
     )
     args = parser.parse_args()
+    # Show the package's INFO lines (e.g. which cleanup prompt is used), not
+    # every library's.
+    logging.basicConfig(format="%(message)s")
+    logging.getLogger("snoozy_scribe").setLevel(logging.INFO)
 
     transcript: Path = args.transcript
     if not transcript.is_file():
@@ -50,10 +55,11 @@ def main() -> None:
     except ValueError as e:
         sys.exit(f"error: {transcript.name}: {e}")
 
+    paths.ensure_user_dirs()
     config = load_config(args.config)
     settings = config.get("transcript_cleanup") or {}
     model = settings.get("model", DEFAULT_CLEANUP_MODEL)
-    model_dir = paths.resolve(config.get("model_dir", "./data/models"))
+    model_dir = paths.resolve(config.get("model_dir", paths.DEFAULT_MODEL_DIR))
 
     start_time = time.monotonic()
     print(f"Loading {model}…")
