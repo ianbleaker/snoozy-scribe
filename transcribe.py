@@ -2642,11 +2642,12 @@ def main() -> None:
     global _saves_partials
     _saves_partials = not windowed
 
+    paths.ensure_user_dirs()
     config = load_config(args.config)
     if config.get("speaker_map") is not None and not isinstance(config["speaker_map"], dict):
         sys.exit(f"error: speaker_map in {args.config} must be a mapping of Discord name to speaker name")
     if args.prune_cache is not None:
-        prune_root = paths.resolve(config.get("output_dir", "./data/transcripts"))
+        prune_root = paths.resolve(config.get("output_dir", paths.DEFAULT_OUTPUT_DIR))
         removed = prune_partials(prune_root, args.prune_cache)
         for slug in removed:
             print(f"  removed {prune_root / '.partial' / slug}")
@@ -2674,12 +2675,12 @@ def main() -> None:
         else config.get("logprob_threshold", LOGPROB_THRESHOLD)
     )
     best_of = args.best_of if args.best_of is not None else config.get("best_of")
-    input_dir = paths.resolve(config.get("input_dir", "./data/input"))
-    output_dir = paths.resolve(config.get("output_dir", "./data/transcripts"))
+    input_dir = paths.resolve(config.get("input_dir", paths.DEFAULT_INPUT_DIR))
+    output_dir = paths.resolve(config.get("output_dir", paths.DEFAULT_OUTPUT_DIR))
     partial_max_age_days = _config_number(config, "partial_max_age_days", 30)
     if partial_max_age_days < 0:
         sys.exit(f"error: config `partial_max_age_days` must be 0 or more, got {partial_max_age_days!r}")
-    model_dir = paths.resolve(config.get("model_dir", "./data/models"))
+    model_dir = paths.resolve(config.get("model_dir", paths.DEFAULT_MODEL_DIR))
     speaker_map = config.get("speaker_map") or {}
     vad_min_silence_ms = _config_number(config, "vad_min_silence_ms", 800)
     vad_min_speech_ms = _config_number(config, "vad_min_speech_ms", 250)

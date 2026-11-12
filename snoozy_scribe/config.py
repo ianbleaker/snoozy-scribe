@@ -15,8 +15,7 @@ def load_config(path: Path) -> dict:
     """
     if not path.exists():
         raise SystemExit(
-            f"error: config file not found at {path}. "
-            "Run `cp settings/config.example.yaml settings/config.yaml` and fill in your values."
+            f"error: config file not found at {path}."
         )
     try:
         config = yaml.safe_load(path.read_text())
@@ -26,7 +25,6 @@ def load_config(path: Path) -> dict:
         return {}
     if not isinstance(config, dict):
         raise SystemExit(
-            f"error: {path} must be a mapping of config keys. "
-            "Copy settings/config.example.yaml to see the expected layout."
+            f"error: {path} must be a mapping of config keys."
         )
     return config

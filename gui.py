@@ -59,9 +59,10 @@ class App(ctk.CTk):
         self.title(f"{identity.APP_NAME} — Transcribe audio")
         self.geometry(f"{WINDOW_WIDTH}x860")
 
+        paths.ensure_user_dirs()
         config = _load_config()
-        self._input_dir = paths.resolve(config.get("input_dir", "./data/input"))
-        default_output_dir = paths.resolve(config.get("output_dir", "./data/transcripts"))
+        self._input_dir = paths.resolve(config.get("input_dir", paths.DEFAULT_INPUT_DIR))
+        default_output_dir = paths.resolve(config.get("output_dir", paths.DEFAULT_OUTPUT_DIR))
         model_repos = [repo for _, repo in MODELS]
         default_model = config.get("whisper_model")
 

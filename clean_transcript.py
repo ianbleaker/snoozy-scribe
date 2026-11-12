@@ -50,10 +50,11 @@ def main() -> None:
     except ValueError as e:
         sys.exit(f"error: {transcript.name}: {e}")
 
+    paths.ensure_user_dirs()
     config = load_config(args.config)
     settings = config.get("transcript_cleanup") or {}
     model = settings.get("model", DEFAULT_CLEANUP_MODEL)
-    model_dir = paths.resolve(config.get("model_dir", "./data/models"))
+    model_dir = paths.resolve(config.get("model_dir", paths.DEFAULT_MODEL_DIR))
 
     start_time = time.monotonic()
     print(f"Loading {model}…")

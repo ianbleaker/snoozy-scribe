@@ -703,6 +703,7 @@ def run_once(wav_path: str) -> None:
 
     from snoozy_scribe.dictation import pipeline
 
+    paths.ensure_user_dirs()
     config = load_config(paths.DEFAULT_CONFIG_PATH)
     settings = pipeline.load_settings(config)
     vocabs = VocabState(notify=print).current_vocabs()
@@ -723,7 +724,7 @@ def load_cleaner(config: dict):
     dictation = config.get("dictation") or {}
     if not dictation.get("cleanup", True):
         return None
-    model_dir = paths.resolve(config.get("model_dir", "./data/models"))
+    model_dir = paths.resolve(config.get("model_dir", paths.DEFAULT_MODEL_DIR))
     return Cleaner(resolve_model_path(dictation.get("cleanup_model", DEFAULT_CLEANUP_MODEL), model_dir))
 
 
@@ -754,6 +755,7 @@ def main() -> None:
     tqdm.tqdm.set_lock(threading.RLock())
 
     try:
+        paths.ensure_user_dirs()
         config = load_config(paths.DEFAULT_CONFIG_PATH)
         app = DictateApp(config)
     except (SystemExit, ValueError) as e:
