@@ -559,7 +559,7 @@ class DictateApp(rumps.App):
         self._add_term_dialog(" ".join(selection.split()))
 
     def _open_gui(self, _sender) -> None:
-        subprocess.Popen([sys.executable, str(paths.REPO_DIR / "gui.py")], cwd=paths.REPO_DIR)
+        subprocess.Popen([sys.executable, str(paths.CODE_DIR / "gui.py")])
 
     def _open_settings(self, _sender) -> None:
         subprocess.run(["open", str(paths.SETTINGS_DIR)], check=False)

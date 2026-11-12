@@ -25,8 +25,6 @@ from snoozy_scribe import identity
 
 CODE_DIR = Path(__file__).resolve().parent.parent
 DEFAULTS_DIR = Path(__file__).resolve().parent / "defaults"
-# Temporary alias, removed once no caller uses it.
-REPO_DIR = CODE_DIR
 
 HOME_ENV = "SNOOZY_SCRIBE_HOME"
 USER_DIR = (

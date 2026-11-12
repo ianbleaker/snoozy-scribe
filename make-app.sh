@@ -4,8 +4,9 @@
 # bundle ID and log path come from snoozy_scribe/identity.py.
 #
 # The bundle's executable is a small compiled launcher with this repo's
-# absolute path baked in, so the .app can be moved anywhere (Applications, Dock,
-# Desktop). Rerun this script if the repo moves. setup.sh runs it and installs
+# absolute path baked in (the REPO_DIR define, used only to find the .venv and
+# dictate.py; the app runs in $HOME), so the .app can be moved anywhere
+# (Applications, Dock, Desktop). Rerun this script if the repo moves. setup.sh runs it and installs
 # the result; see docs/development.md.
 set -eu
 
