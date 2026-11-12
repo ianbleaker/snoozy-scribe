@@ -1,8 +1,9 @@
-# Copy this file to settings/config.yaml and fill in real values.
-# settings/config.yaml is gitignored and never pushed to GitHub.
+# snoozy-scribe's settings. This file lives at
+# ~/Library/Application Support/snoozy-scribe/settings/config.yaml and was
+# created there on first run (it's never overwritten, so edit it freely).
 #
-# Relative paths in this file resolve against the repo root, not the current
-# directory.
+# Relative paths in this file resolve against
+# ~/Library/Application Support/snoozy-scribe/, not the current directory.
 
 # mlx-whisper model repo (Hugging Face). Larger/non-quantized models are
 # slower but more accurate. Can be overridden per-run with
@@ -12,8 +13,8 @@
 whisper_model: mlx-community/whisper-large-v3-turbo
 
 # Local directory model weights are downloaded into (and read from). Created
-# automatically on first run if missing. Gitignored — weights are large and
-# environment-specific. Defaults to ./data/models if omitted.
+# automatically on first run if missing. Defaults to ./data/models (under
+# Application Support) if omitted.
 model_dir: ./data/models
 
 # Maps Craig's Discord usernames (discriminator stripped, e.g. "alice42#0"
@@ -25,14 +26,18 @@ speaker_map:
   someplayer: Some Player
 
 # Vocabularies transcribe.py applies: names are file stems in
-# settings/vocabulary/ (any *.md except *.example.md), used for term
+# ~/Library/Application Support/snoozy-scribe/settings/vocabulary/ (any *.md
+# except *.example.md), used for term
 # corrections and Whisper prompt seeding. Several are merged alphabetically:
 # a later vocabulary's term overrides an earlier one with the same name, and
 # the later ones survive when a long prompt gets truncated. Optional — if
 # omitted, no vocabulary is used. Overridable per-run with a repeatable
-# `transcribe.py --vocabulary <name>`. See
-# settings/vocabulary/vocabulary.example.md for the file format.
-vocabularies: [my-vocabulary]
+# `transcribe.py --vocabulary <name>`. See vocabulary.example.md in that
+# folder for the file format.
+#
+# Commented out because transcribe.py stops on a name with no matching file:
+# create settings/vocabulary/my-vocabulary.md first, then uncomment this.
+# vocabularies: [my-vocabulary]
 
 # Whisper language code (e.g. "en") to force for every track, instead of
 # auto-detecting per track. Auto-detection only samples the first VAD speech
@@ -114,19 +119,20 @@ show_bleed_markers: false
 save_gui_log: true
 
 # Directory the transcript Markdown files are written to. Defaults to
-# ./data/transcripts if omitted. The GUI's "Output folder" and `--output-dir`
-# can send transcripts elsewhere; the segment cache (.partial/) stays here.
-output_dir: ./data/transcripts
+# ~/Documents/snoozy-scribe/transcripts if omitted. The GUI's "Output folder"
+# and `--output-dir` can send transcripts elsewhere.
+output_dir: ~/Documents/snoozy-scribe/transcripts
 
-# Each full run deletes cached per-track segments (<output_dir>/.partial/<slug>/)
-# that no run has used for this many days, never the current session's. 0
+# Each full run deletes cached per-track segments (data/cache/partial/<slug>/
+# under Application Support) that no run has used for this many days, never
+# the current session's. 0
 # turns automatic pruning off; `--prune-cache [DAYS]` prunes on demand.
 # Defaults to 30 if omitted.
 partial_max_age_days: 30
 
 # Directory to drop Craig .zip exports into for automatic pickup. Processed
 # zips are moved into a `processed/` subfolder here. Defaults to
-# ./data/input if omitted.
+# ./data/input (under Application Support) if omitted.
 input_dir: ./data/input
 
 # Minimum pause (in milliseconds) that splits speech into separate regions
@@ -210,7 +216,8 @@ line_format: "[{timestamp}] {speaker}: {text}"
 # are the defaults. See README.md ("Config").
 dictation:
   # Hotkeys can also be set from the menu (Hotkeys ▸) by pressing them;
-  # those are saved in data/dictation-state.json and override these.
+  # those are saved in data/dictation-state.json under Application Support
+  # and override these.
   #
   # Hold-to-talk key: a modifier (right_option, left_option, right_command,
   # left_command, right_control, left_control, right_shift, left_shift, fn),
@@ -251,8 +258,8 @@ dictation:
 
 # Local LLM cleanup pass over a finished transcript (clean_transcript.py).
 # Every key is optional; the values below are the defaults. The system prompt
-# lives in settings/prompts/transcript-cleanup.md. See
-# docs/session-transcription.md ("LLM cleanup").
+# is built in; to change it, copy it to settings/prompts/transcript-cleanup.md
+# under Application Support. See docs/session-transcription.md ("LLM cleanup").
 transcript_cleanup:
   # mlx-lm instruct model, downloaded into model_dir. The same model as
   # dictation's cleanup_model by default, so only one download is needed.
