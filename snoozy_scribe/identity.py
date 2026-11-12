@@ -12,6 +12,10 @@ from pathlib import Path
 
 APP_NAME = "snoozy-scribe"
 BUNDLE_ID = "local.snoozy-scribe.gui"
+# The Application Support folder for settings and data. Fixed: dev and release
+# builds share it (one copy of the models, one set of vocabularies), so it
+# doesn't follow APP_NAME.
+SUPPORT_DIR_NAME = "snoozy-scribe"
 # Common name of the self-signed certificate setup.sh creates in the login
 # keychain; make-app.sh signs with it so permission grants survive rebuilds.
 SIGNING_IDENTITY = f"{APP_NAME} Code Signing"
