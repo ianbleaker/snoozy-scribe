@@ -81,22 +81,6 @@ fi
 eval "$(.venv/bin/python -m snoozy_scribe.identity --shell)"
 INSTALLED="$HOME/Applications/$APP_NAME.app"
 
-# The app's old name: remove its build and install, and clear its permission
-# grants. The new app moves an old Launch at login LaunchAgent to a login
-# item on first launch.
-rm -rf "$LEGACY_APP_NAME.app"
-LEGACY_INSTALLED="$HOME/Applications/$LEGACY_APP_NAME.app"
-if [ -d "$LEGACY_INSTALLED" ]; then
-    if [ "$(osascript -e "application id \"$LEGACY_BUNDLE_ID\" is running" 2>/dev/null)" = true ]; then
-        die "$LEGACY_APP_NAME is running. Quit it from its menu first, then rerun ./setup.sh."
-    fi
-    rm -rf "$LEGACY_INSTALLED"
-    for service in Microphone ListenEvent Accessibility PostEvent; do
-        tccutil reset "$service" "$LEGACY_BUNDLE_ID" >/dev/null 2>&1 || true
-    done
-    echo "Removed $LEGACY_INSTALLED (renamed to $APP_NAME)"
-fi
-
 # 10. The code-signing certificate. macOS keys permission grants to the
 # signature's designated requirement: for a certificate-signed app that names
 # the certificate, so grants survive rebuilds; for an ad-hoc one it's the

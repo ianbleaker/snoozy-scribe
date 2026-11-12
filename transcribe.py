@@ -41,7 +41,7 @@ from mlx_whisper.tokenizer import LANGUAGES
 
 from snoozy_scribe import identity, paths, silero
 from snoozy_scribe.audio_input import AUDIO_EXTENSIONS, InputError, InputKind, detect_input
-from snoozy_scribe.config import check_legacy_layout, load_config
+from snoozy_scribe.config import load_config
 from snoozy_scribe.models import resolve_model_path
 from snoozy_scribe.text_filters import (
     DEFAULT_HALLUCINATION_PHRASES,
@@ -2374,11 +2374,6 @@ def main() -> None:
     print(_rule())
     print()
 
-    legacy = check_legacy_layout()
-    if legacy:
-        print(*legacy, sep="\n")
-        sys.exit(1)
-
     parser = argparse.ArgumentParser(
         description="Transcribe audio (a Craig export, an audio file, or a folder of audio files) into Markdown."
     )
@@ -2735,11 +2730,6 @@ def main() -> None:
     if args.elapsed_timestamps is not None:
         timestamp_mode = "elapsed" if args.elapsed_timestamps else "clock"
 
-    if "campaign" in config:
-        sys.exit(
-            "error: config key `campaign` was renamed; replace `campaign: X` with "
-            "`vocabularies: [X]` in settings/config.yaml"
-        )
     if args.vocabulary is not None:
         vocabulary_names = args.vocabulary
     else:

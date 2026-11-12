@@ -25,7 +25,6 @@ import yaml
 
 from snoozy_scribe import identity, paths
 from snoozy_scribe.audio_input import AUDIO_EXTENSIONS, InputError, InputKind, detect_input
-from snoozy_scribe.config import check_legacy_layout
 
 REPO_DIR = paths.REPO_DIR
 PROGRESS_EVENT_PREFIX = "@@PROGRESS@@ "
@@ -63,7 +62,6 @@ class App(ctk.CTk):
         config = _load_config()
         self._input_dir = paths.resolve(config.get("input_dir", "./data/input"))
         default_output_dir = paths.resolve(config.get("output_dir", "./data/transcripts"))
-        self._legacy_layout = check_legacy_layout()
         model_repos = [repo for _, repo in MODELS]
         default_model = config.get("whisper_model")
 
@@ -223,8 +221,6 @@ class App(ctk.CTk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._set_idle()
-        for line in self._legacy_layout:
-            self._log_append(line, "error")
 
     # --- form state -------------------------------------------------------
 
@@ -252,9 +248,6 @@ class App(ctk.CTk):
             widget.configure(state=state)
         if enabled:
             self._apply_input_rules()
-        if self._legacy_layout:
-            # transcribe.py would exit with the same instructions.
-            self.start_button.configure(state="disabled")
 
     def _input_path(self) -> Path | None:
         text = self.input_entry.get().strip()
