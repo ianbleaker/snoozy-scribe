@@ -3,8 +3,3 @@ docs/craig-test-files/
 .venv/
 __pycache__/
 snoozy-scribe.app/
-
-settings/config.yaml
-settings/vocabulary/*.md
-!settings/vocabulary/*.example.md
-data/
