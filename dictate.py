@@ -29,7 +29,7 @@ from PyObjCTools.AppHelper import callAfter, callLater
 
 from snoozy_scribe import identity, paths
 from snoozy_scribe.config import check_legacy_layout, load_config
-from snoozy_scribe.dictation.context import context_line, frontmost_context
+from snoozy_scribe.dictation.context import context_line, focused_selection, frontmost_context
 from snoozy_scribe.dictation.clipboard import copy_selection, paste_text, secure_input_active, set_clipboard_text
 from snoozy_scribe.dictation.hotkeys import (
     DELETE_KEYCODE,
@@ -753,7 +753,16 @@ def main() -> None:
     parser.add_argument(
         "--print-context", action="store_true", help="Wait 3 s, then print the frontmost app and window"
     )
+    parser.add_argument(
+        "--print-selection", action="store_true", help="Wait 3 s, then print the frontmost app's selected text"
+    )
     args = parser.parse_args()
+    if args.print_selection:
+        import time
+
+        time.sleep(3)
+        print(focused_selection())
+        return
     if args.print_context:
         import time
 
