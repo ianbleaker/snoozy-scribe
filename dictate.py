@@ -758,8 +758,9 @@ def main() -> None:
         paths.ensure_user_dirs()
         config = load_config(paths.DEFAULT_CONFIG_PATH)
         app = DictateApp(config)
-    except (SystemExit, ValueError) as e:
+    except (SystemExit, ValueError, OSError) as e:
         # ValueError: a bad or clashing hotkey string in config.yaml.
+        # OSError: the Application Support folder couldn't be created or seeded.
         log.error("%s", e)
         rumps.alert(title=f"{identity.APP_NAME} can't start", message=str(e))
         sys.exit(1)
