@@ -11,7 +11,7 @@ from snoozy_scribe import whisper_stubs  # noqa: F401  (must precede mlx_whisper
 import mlx_whisper
 import numpy as np
 
-from snoozy_scribe import paths, silero_onnx
+from snoozy_scribe import paths, silero
 from snoozy_scribe.dictation.recorder import SAMPLE_RATE
 from snoozy_scribe.models import resolve_model_path
 from snoozy_scribe.text_filters import (
@@ -71,9 +71,9 @@ _vad_model = None
 def _has_speech(audio: np.ndarray, settings: PipelineSettings) -> bool:
     global _vad_model
     if _vad_model is None:
-        _vad_model = silero_onnx.SileroVADSequence()
+        _vad_model = silero.SileroVADSequence()
     return bool(
-        silero_onnx.get_speech_timestamps(
+        silero.get_speech_timestamps(
             audio,
             _vad_model,
             min_silence_duration_ms=settings.vad_min_silence_ms,
