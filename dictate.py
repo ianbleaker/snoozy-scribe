@@ -751,6 +751,7 @@ def probe_selection(seconds: float = 60) -> None:
     """Watch the frontmost app's selection, printing each change, to check the reader per app."""
     import time
 
+    import AppKit
     import ApplicationServices
 
     if not ApplicationServices.AXIsProcessTrusted():
@@ -772,7 +773,9 @@ def probe_selection(seconds: float = 60) -> None:
                     text = sel["text"].replace("\n", " ")
                     text = text if len(text) <= 60 else text[:57] + "..."
                     print(f"{app}: editable={sel['editable']}  {text!r}")
-            time.sleep(0.5)
+            # Not time.sleep: NSWorkspace only updates the frontmost app while a
+            # run loop runs (the menu-bar app always has one; a bare script doesn't).
+            AppKit.NSRunLoop.currentRunLoop().runUntilDate_(AppKit.NSDate.dateWithTimeIntervalSinceNow_(0.5))
     except KeyboardInterrupt:
         pass
 
