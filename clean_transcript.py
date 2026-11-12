@@ -7,6 +7,7 @@ See docs/session-transcription.md ("LLM cleanup").
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,10 @@ def main() -> None:
         help=f"Path to config YAML (default: {paths.DEFAULT_CONFIG_PATH})",
     )
     args = parser.parse_args()
+    # Show the package's INFO lines (e.g. which cleanup prompt is used), not
+    # every library's.
+    logging.basicConfig(format="%(message)s")
+    logging.getLogger("snoozy_scribe").setLevel(logging.INFO)
 
     transcript: Path = args.transcript
     if not transcript.is_file():
