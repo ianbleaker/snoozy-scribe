@@ -1,12 +1,15 @@
 """The local mlx-lm instruct model shared by dictation and transcript cleanup.
 
 Holds only the model-agnostic parts: loading, greedy generation, the word
-similarity both guards use, and reading prompts from settings/prompts/.
+similarity both guards use, and reading prompts (the user's override in
+settings/prompts/ under the Application Support folder, else the built-in
+default in snoozy_scribe/defaults/prompts/).
 """
 
 from __future__ import annotations
 
 import difflib
+import logging
 import re
 from pathlib import Path
 
@@ -16,6 +19,10 @@ DEFAULT_CLEANUP_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 _WORD = re.compile(r"[\w']+")
+
+log = logging.getLogger(__name__)
+# Resolved prompt paths already logged, so each is logged once per process.
+_logged_prompts: set[Path] = set()
 
 
 def _words(text: str) -> list[str]:
@@ -28,12 +35,32 @@ def word_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, _words(a), _words(b), autojunk=False).ratio()
 
 
+def _is_override(path: Path) -> bool:
+    return path.parent == paths.PROMPTS_DIR
+
+
 def load_prompt(name: str) -> str:
-    """Read settings/prompts/<name>.md. Read on every call, so edits apply without a restart."""
-    path = paths.PROMPTS_DIR / f"{name}.md"
+    """Read prompt `name`: the user's override if there is one, else the built-in.
+
+    Read on every call, so edits apply without a restart.
+    """
+    path = paths.prompt_path(name)
     if not path.exists():
         raise FileNotFoundError(f"prompt file not found: {path}")
+    if path not in _logged_prompts:
+        _logged_prompts.add(path)
+        log.info("using %s prompt %s", "override" if _is_override(path) else "default", path)
     return path.read_text().strip()
+
+
+def prompt_source(name: str) -> str:
+    """Which prompt `name` would be used, for transcript frontmatter.
+
+    Never an absolute path, since transcripts get shared.
+    """
+    if _is_override(paths.prompt_path(name)):
+        return f"settings/prompts/{name}.md"
+    return f"built-in {name}.md"
 
 
 class LocalLLM:

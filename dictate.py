@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import logging
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -564,7 +565,12 @@ class DictateApp(rumps.App):
         subprocess.run(["open", str(paths.SETTINGS_DIR)], check=False)
 
     def _open_cleanup_prompt(self, _sender) -> None:
-        subprocess.run(["open", str(paths.PROMPTS_DIR / "dictation-cleanup.md")], check=False)
+        # The first edit copies the built-in prompt; from then on the copy overrides it.
+        override = paths.PROMPTS_DIR / "dictation-cleanup.md"
+        if not override.exists():
+            override.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(paths.DEFAULTS_DIR / "prompts" / "dictation-cleanup.md", override)
+        subprocess.run(["open", str(override)], check=False)
 
     def _toggle_login(self, sender) -> None:
         # Read the status fresh: the user may have changed it in System Settings.

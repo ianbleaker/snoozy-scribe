@@ -1,7 +1,8 @@
 """LLM cleanup of dictated text, with a guard against the model answering it.
 
-The system prompt lives in settings/prompts/dictation-cleanup.md and is read
-on every call, so edits apply without restarting the app.
+The system prompt is the user's settings/prompts/dictation-cleanup.md override
+if there is one, else the built-in default (see local_llm.load_prompt). It's
+read on every call, so edits apply without restarting the app.
 
 A small instruct model sometimes *responds* to a dictated question instead of
 cleaning it up. The guard falls back to the regex-cleaned raw text whenever

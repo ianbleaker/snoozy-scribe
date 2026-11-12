@@ -16,7 +16,7 @@ from pathlib import Path
 import tqdm
 import yaml
 
-from snoozy_scribe.local_llm import LocalLLM, _words, load_prompt, word_similarity
+from snoozy_scribe.local_llm import LocalLLM, _words, load_prompt, prompt_source, word_similarity
 
 DEFAULT_CHUNK_LINES = 30
 DEFAULT_MIN_SIMILARITY = 0.8
@@ -208,7 +208,7 @@ def clean_transcript(
     out_frontmatter["source"] = path.name
     out_frontmatter["llm_cleanup"] = {
         "model": model,
-        "prompt": "settings/prompts/transcript-cleanup.md",
+        "prompt": prompt_source("transcript-cleanup"),
         "chunk_lines": chunk_lines,
         "min_similarity": min_similarity,
         "max_drop_words": max_drop_words,
