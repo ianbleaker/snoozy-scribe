@@ -1,7 +1,7 @@
 #!/bin/sh
-# Install or repair: builds .venv from requirements.lock, creates
-# settings/config.yaml if missing, and builds and installs the app to
-# ~/Applications. Safe to rerun, e.g. after `git pull` or a Homebrew Python
+# Install or repair: builds .venv from requirements.lock, and builds and
+# installs the app to ~/Applications. Settings and data live in
+# ~/Library/Application Support/snoozy-scribe/, created on first run. Safe to rerun, e.g. after `git pull` or a Homebrew Python
 # upgrade. See README.md ("Install") and docs/development.md.
 #
 # The app is signed with a self-signed certificate this script creates in the
@@ -66,22 +66,16 @@ fi
 echo "Installing dependencies from requirements.lock"
 .venv/bin/pip install --quiet --disable-pip-version-check --no-deps -r requirements.lock
 
-# 7. Config: never overwrite an existing one.
-if [ ! -f settings/config.yaml ]; then
-    cp settings/config.example.yaml settings/config.yaml
-    echo "Created settings/config.yaml from settings/config.example.yaml"
-fi
-
-# 8. ffmpeg is only needed for session transcription.
+# 7. ffmpeg is only needed for session transcription.
 if ! command -v ffmpeg >/dev/null 2>&1; then
     echo "warning: ffmpeg not found; needed only for session transcription: brew install ffmpeg" >&2
 fi
 
-# 9. App name, bundle ID and log path (-m finds the package from the repo).
+# 8. App name, bundle ID and log path (-m finds the package from the repo).
 eval "$(.venv/bin/python -m snoozy_scribe.identity --shell)"
 INSTALLED="$HOME/Applications/$APP_NAME.app"
 
-# 10. The code-signing certificate. macOS keys permission grants to the
+# 9. The code-signing certificate. macOS keys permission grants to the
 # signature's designated requirement: for a certificate-signed app that names
 # the certificate, so grants survive rebuilds; for an ad-hoc one it's the
 # build's code hash. Created once; never regenerated, since a new certificate
@@ -133,7 +127,7 @@ designated_requirement() {
     codesign -d -r- "$1" 2>/dev/null | grep 'designated =>' || true
 }
 
-# 11-12. Build and install the app when needed.
+# 10-11. Build and install the app when needed.
 if [ ! -d "$INSTALLED" ] || [ "$VENV_RECREATED" = 1 ] || [ "$REBUILD" = 1 ] \
     || { [ "$HAVE_CERT" = 1 ] && is_adhoc "$INSTALLED"; }; then
     if [ "$(osascript -e "application id \"$BUNDLE_ID\" is running" 2>/dev/null)" = true ]; then
@@ -175,13 +169,13 @@ else
     echo "App up to date (pass --rebuild-app to rebuild)."
 fi
 
-# 13. A copy dragged to /Applications by the old install goes stale.
+# 12. A copy dragged to /Applications by the old install goes stale.
 if [ -d "/Applications/$APP_NAME.app" ]; then
     echo
     echo "warning: an old copy is at /Applications/$APP_NAME.app. Delete it and use $INSTALLED." >&2
     echo "If you turned Launch at login on from that copy, toggle it off and on from $INSTALLED." >&2
 fi
 
-# 14.
+# 13.
 echo
 echo "Open $APP_NAME from Spotlight, or run: open -a \"$INSTALLED\""
