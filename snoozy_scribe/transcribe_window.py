@@ -272,9 +272,12 @@ class TranscribeWindow:
             self.save_log_check,
         ):
             form.cellForView_(view).setXPlacement_(AppKit.NSGridCellPlacementLeading)
-        form.setContentHuggingPriority_forOrientation_(
-            AppKit.NSLayoutPriorityDefaultHigh, AppKit.NSLayoutConstraintOrientationVertical
-        )
+        # Below the fields' compression resistance (750), which would
+        # otherwise squash them to the labels' height; above the log's.
+        form.setContentHuggingPriority_forOrientation_(700, AppKit.NSLayoutConstraintOrientationVertical)
+        # The Detected row shows only once there's something to report.
+        self._detected_row = form.rowAtIndex_(1)
+        self._detected_row.setHidden_(True)
 
         # --- controls ---
         self.start_button = cocoa_ui.button("Start", lambda _s: self._start(), self._targets)
@@ -399,6 +402,7 @@ class TranscribeWindow:
                     InputKind.LOOSE_FOLDER: f"Folder: {len(detected.audio_files)} audio files",
                 }[detected.kind]
         self.detected_label.setStringValue_(f"Detected: {text}" if text else "")
+        self._detected_row.setHidden_(not text)
         if self._log_scroll.isHidden():
             # A wrapped input error changes the form's height.
             self._fit_collapsed()
