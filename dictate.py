@@ -44,6 +44,7 @@ from snoozy_scribe.dictation.permissions import PermissionsWindow, all_granted, 
 from snoozy_scribe.dictation.recorder import SAMPLE_RATE, Recorder
 from snoozy_scribe.dictation.state import load_state, update_state
 from snoozy_scribe.dictation.vocab_state import VocabState, get_selected_vocabularies, set_vocabulary_selected
+from snoozy_scribe.transcribe_window import TranscribeWindow
 from snoozy_scribe.vocabulary import (
     VocabularyParseError,
     add_term,
@@ -245,7 +246,8 @@ class DictateApp(rumps.App):
             # After the menu closes, so ⌘C reaches the app with the selection.
             rumps.MenuItem("Add selected text", callback=lambda _s: self._after_menu(self._add_selection)),
             None,
-            rumps.MenuItem("Transcribe audio…", callback=self._open_gui),
+            # After the menu closes: showing it switches the activation policy.
+            rumps.MenuItem("Transcribe audio…", callback=lambda _s: self._after_menu(self._open_transcribe_window)),
             rumps.MenuItem("Open settings folder", callback=self._open_settings),
             rumps.MenuItem("Edit cleanup prompt…", callback=self._open_cleanup_prompt),
             self._hotkeys_menu,
@@ -284,6 +286,7 @@ class DictateApp(rumps.App):
             presses=self._presses(self._hotkeys),
         )
         self._tap.start()
+        self._transcribe_window: TranscribeWindow | None = None
         self._permissions = PermissionsWindow(tap_active=lambda: self._tap.active, can_relaunch=running_as_bundle())
         # Terminal runs skip this: their grants belong to Python, not the app.
         if running_as_bundle() and not all_granted():
@@ -558,8 +561,11 @@ class DictateApp(rumps.App):
             return
         self._add_term_dialog(" ".join(selection.split()))
 
-    def _open_gui(self, _sender) -> None:
-        subprocess.Popen([sys.executable, str(paths.CODE_DIR / "gui.py")])
+    def _open_transcribe_window(self) -> None:
+        # Created once and kept: closing it mid-run only hides it.
+        if self._transcribe_window is None:
+            self._transcribe_window = TranscribeWindow(standalone=False)
+        self._transcribe_window.show()
 
     def _open_settings(self, _sender) -> None:
         subprocess.run(["open", str(paths.SETTINGS_DIR)], check=False)

@@ -19,7 +19,7 @@ import objc
 import rumps
 from PyObjCTools.AppHelper import callAfter
 
-from snoozy_scribe import identity
+from snoozy_scribe import cocoa_ui, identity
 
 log = logging.getLogger(__name__)
 
@@ -104,24 +104,6 @@ BUTTON_WIDTH = 130
 RELAUNCH_AFTER_POLLS = 2
 
 
-class PermissionsWindowTarget(AppKit.NSObject):
-    """Button target and window delegate; forwards to the owning PermissionsWindow."""
-
-    @objc.python_method
-    def bind(self, owner):
-        self.owner = owner
-        return self
-
-    def rowClicked_(self, sender):
-        self.owner._row_clicked(PERMISSIONS[sender.tag()])
-
-    def relaunchClicked_(self, _sender):
-        self.owner.relaunch()
-
-    def windowWillClose_(self, _notification):
-        self.owner._timer.stop()
-
-
 class PermissionsWindow:
     """One row per permission with a live ✓/✗ and a Grant / Open Settings button.
 
@@ -137,7 +119,10 @@ class PermissionsWindow:
         self._inactive_polls = 0
         # rumps creates NSApplication only in run(); windows need it first.
         AppKit.NSApplication.sharedApplication()
-        self._target = PermissionsWindowTarget.alloc().init().bind(self)
+        # AppKit holds targets and delegates weakly; this keeps them alive.
+        self._targets: list = []
+        self._timer = cocoa_ui.Repeater(1, self.refresh)
+        self._delegate = cocoa_ui.Delegate(will_close=self._timer.stop)
 
         style = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -145,7 +130,7 @@ class PermissionsWindow:
         )
         window.setTitle_(f"{identity.APP_NAME} permissions")
         window.setReleasedWhenClosed_(False)
-        window.setDelegate_(self._target)
+        window.setDelegate_(self._delegate)
         window.center()
         content = window.contentView()
 
@@ -167,8 +152,7 @@ class PermissionsWindow:
             detail.setTextColor_(AppKit.NSColor.secondaryLabelColor())
             detail.setFrame_(AppKit.NSMakeRect(MARGIN + 30, y + 8, 290, 16))
             content.addSubview_(detail)
-            button = AppKit.NSButton.buttonWithTitle_target_action_("Grant", self._target, "rowClicked:")
-            button.setTag_(index)
+            button = cocoa_ui.button("Grant", lambda _s, n=name: self._row_clicked(n), self._targets)
             button.setFrame_(AppKit.NSMakeRect(WIDTH - MARGIN - BUTTON_WIDTH, y + 12, BUTTON_WIDTH, 32))
             content.addSubview_(button)
             self._marks[name] = mark
@@ -177,17 +161,16 @@ class PermissionsWindow:
         self._status = AppKit.NSTextField.labelWithString_("")
         self._status.setFrame_(AppKit.NSMakeRect(MARGIN, 22, 260, 18))
         content.addSubview_(self._status)
-        self._relaunch = AppKit.NSButton.buttonWithTitle_target_action_("Relaunch", self._target, "relaunchClicked:")
+        self._relaunch = cocoa_ui.button("Relaunch", lambda _s: self.relaunch(), self._targets)
         self._relaunch.setFrame_(AppKit.NSMakeRect(WIDTH - MARGIN - BUTTON_WIDTH, 14, BUTTON_WIDTH, 32))
         content.addSubview_(self._relaunch)
 
         self._window = window
-        self._timer = rumps.Timer(lambda _t: self.refresh(), 1)
 
     def show(self) -> None:
         if not self._window.isVisible():
             self.refresh()
-            if not self._timer.is_alive():
+            if not self._timer.is_running():
                 self._timer.start()
         AppKit.NSApp.activateIgnoringOtherApps_(True)
         self._window.makeKeyAndOrderFront_(None)

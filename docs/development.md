@@ -4,6 +4,8 @@
 
 ```
 transcribe.py  gui.py  dictate.py               entry points
+snoozy_scribe/transcribe_window.py               the transcription window (dictate.py and gui.py)
+snoozy_scribe/cocoa_ui.py                        AppKit helpers (stdlib + PyObjC only)
 setup.sh       make-app.sh                       install, app bundle build
 snoozy_scribe/    internal Python
 snoozy_scribe/defaults/  config.example.yaml, vocabulary.example.md, prompts/   built-in defaults

@@ -1,6 +1,7 @@
 """Classify a transcription input path: Craig export, audio file, or folder.
 
-Stdlib only, so gui.py can import it without pulling in mlx or numpy.
+Stdlib only, so the transcription window can import it without pulling in
+mlx or numpy.
 """
 
 from __future__ import annotations

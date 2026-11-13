@@ -2598,12 +2598,12 @@ def main() -> None:
         "--progress-events",
         action="store_true",
         help="Also print machine-readable '@@PROGRESS@@ {json}' progress lines "
-        "to stdout. Used by gui.py; not meant for interactive use.",
+        "to stdout. Used by the transcription window; not meant for interactive use.",
     )
     args = parser.parse_args()
     _progress_events.enabled = args.progress_events
     if args.progress_events:
-        # gui.py cancels by terminating this process. Turning SIGTERM into the
+        # The transcription window cancels by terminating this process. Turning SIGTERM into the
         # same exception the Escape-then-y cancel raises lets the `with` blocks
         # below unwind, so temp dirs (zip extraction, --test crops) are cleaned
         # up instead of leaking a whole extracted session per cancel.
