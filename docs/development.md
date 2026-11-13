@@ -24,12 +24,12 @@ To test a fresh install without touching your own settings, point `SNOOZY_SCRIBE
 3. `.venv/bin/pip install --no-deps -r requirements.lock`
 4. Warn if `ffmpeg` is missing (`brew install ffmpeg`; only session transcription needs it).
 5. Create the `snoozy-scribe Code Signing` certificate in the login keychain if `security find-identity -v -p codesigning` doesn't list it (see [Code signing](#code-signing)). If that fails, warn and carry on; the app is then signed ad-hoc.
-6. If `~/Applications/snoozy-scribe.app` is missing, the venv was recreated, `--rebuild-app` was passed, or the installed copy is ad-hoc signed while the certificate exists: refuse while the app is running, run `./make-app.sh`, and copy the bundle with `ditto snoozy-scribe.app ~/Applications/snoozy-scribe.app`. If the designated requirement changed (`codesign -d -r-`), or the build is ad-hoc, clear the old grants with `tccutil reset <service> local.snoozy-scribe.gui` for Microphone, ListenEvent, Accessibility and PostEvent.
+6. If `~/Applications/snoozy-scribe Dev.app` is missing, the venv was recreated, `--rebuild-app` was passed, or the installed copy is ad-hoc signed while the certificate exists: refuse while the app is running, run `./make-app.sh`, and copy the bundle with `ditto "snoozy-scribe Dev.app" ~/Applications/"snoozy-scribe Dev.app"`. An old `~/Applications/snoozy-scribe.app` with the dev bundle ID (the name before the dev/release split) is removed after the copy; its designated requirement counts as the old one, so the grants carry over. If Launch at login was on, toggle it off and on once: the login item records the bundle's path. If the designated requirement changed (`codesign -d -r-`), or the build is ad-hoc, clear the old grants with `tccutil reset <service> local.snoozy-scribe.gui` for Microphone, ListenEvent, Accessibility and PostEvent.
 7. Warn about a stale copy in `/Applications`.
 
 There's no config step: the first run creates the config in Application Support.
 
-The app's name, bundle ID, Application Support folder name, log path and certificate name all come from `snoozy_scribe/identity.py`; `make-app.sh` and `setup.sh` read them with `.venv/bin/python -m snoozy_scribe.identity --shell`.
+The app's name, bundle ID, Application Support folder name, log path and certificate name all come from `snoozy_scribe/identity.py`; `make-app.sh` and `setup.sh` read them with `.venv/bin/python -m snoozy_scribe.identity --shell`. There are two builds: the dev build from this repo ("snoozy-scribe Dev", bundle ID `local.snoozy-scribe.gui`, the `snoozy-scribe Code Signing` certificate) and the downloadable release ("snoozy-scribe", `io.github.ianbleaker.snoozy-scribe`, the `snoozy-scribe Release` certificate; `--shell --release` prints its values). Separate bundle IDs keep separate permission grants. Both share the Application Support folder. At runtime the code knows it's the release build from the enclosing bundle's `Info.plist`.
 
 `--no-deps` matters: mlx-whisper declares torch but doesn't need it for transcription, and a normal install would pull in ~700MB of torch.
 
@@ -37,7 +37,7 @@ Upgrading an existing install from before torch was dropped: delete `.venv` and 
 
 ## The app bundle
 
-The app bundle's executable is a small compiled launcher that runs `dictate.py` on this repo's `.venv`, with the repo path baked in. It needs Xcode's command-line tools (`xcode-select --install`) for clang. Output goes to `~/Library/Logs/snoozy-scribe.log`.
+The app bundle's executable is a small compiled launcher that runs `dictate.py` on this repo's `.venv`, with the repo path baked in. It needs Xcode's command-line tools (`xcode-select --install`) for clang. Output goes to `~/Library/Logs/snoozy-scribe Dev.log`.
 
 **Rerun `./setup.sh --rebuild-app` after moving the repo or upgrading Homebrew's Python.** With the certificate, the permission grants survive the rebuild.
 

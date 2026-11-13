@@ -17,7 +17,7 @@ cd snoozy-scribe
 ./setup.sh
 ```
 
-`setup.sh` builds `.venv` and builds and installs the app to `~/Applications/snoozy-scribe.app`. The first run also creates a self-signed code-signing certificate in your login keychain, so macOS asks for your password once. Open it from Spotlight; ✎ appears in the menu bar. Rerun `./setup.sh` any time (after `git pull`, say); it only rebuilds the app when it has to. Pass `--rebuild-app` to force a rebuild.
+`setup.sh` builds `.venv` and builds and installs the app to `~/Applications/snoozy-scribe Dev.app` (the dev build; it keeps its permission grants separate from a downloaded release). The first run also creates a self-signed code-signing certificate in your login keychain, so macOS asks for your password once. Open it from Spotlight; ✎ appears in the menu bar. Rerun `./setup.sh` any time (after `git pull`, say); it only rebuilds the app when it has to. Pass `--rebuild-app` to force a rebuild.
 
 ### Where things live
 
@@ -88,9 +88,9 @@ Vocabulary files in `settings/vocabulary/` (under Application Support) hold term
 
 ## Troubleshooting
 
-- **Logs**: the app writes to `~/Library/Logs/snoozy-scribe.log`.
+- **Logs**: the app writes to `~/Library/Logs/snoozy-scribe Dev.log` (a release build: `~/Library/Logs/snoozy-scribe.log`).
 - **App won't start after a Homebrew Python upgrade, or after moving the repo**: rerun `./setup.sh`. It recreates `.venv` and rebuilds the app.
-- **Old copy in `/Applications`**: earlier installs had you drag the app there, and that copy goes stale. Delete it and use `~/Applications/snoozy-scribe.app`; if you turned **Launch at login** on from the old copy, toggle it off and on from the new one. `setup.sh` warns when it finds one.
+- **Old copy in `/Applications`**: earlier installs had you drag the app there, and that copy goes stale. Delete it and use `~/Applications/snoozy-scribe Dev.app`; if you turned **Launch at login** on from the old copy, toggle it off and on from the new one. `setup.sh` warns when it finds one.
 
 ## Development
 

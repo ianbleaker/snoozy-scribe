@@ -84,8 +84,8 @@ def open_settings(name: str) -> None:
 
 
 def running_as_bundle() -> bool:
-    """True inside snoozy-scribe.app; False for a terminal run, whose grants belong to Python."""
-    return AppKit.NSBundle.mainBundle().bundleIdentifier() == identity.BUNDLE_ID
+    """True inside the dev or release app; False for a terminal run, whose grants belong to Python."""
+    return AppKit.NSBundle.mainBundle().bundleIdentifier() in identity.BUNDLE_IDS
 
 
 # --- setup window (main thread only) ------------------------------------------

@@ -74,6 +74,14 @@ fi
 # 8. App name, bundle ID and log path (-m finds the package from the repo).
 eval "$(.venv/bin/python -m snoozy_scribe.identity --shell)"
 INSTALLED="$HOME/Applications/$APP_NAME.app"
+# Before the dev/release split the dev app was "snoozy-scribe.app". Same
+# bundle ID and certificate, so its grants carry over to the renamed copy. A
+# release build installed under that name has another bundle ID; leave it.
+LEGACY="$HOME/Applications/snoozy-scribe.app"
+legacy_is_dev() {
+    [ -d "$LEGACY" ] && [ "$LEGACY" != "$INSTALLED" ] \
+        && [ "$(defaults read "$LEGACY/Contents/Info" CFBundleIdentifier 2>/dev/null)" = "$BUNDLE_ID" ]
+}
 
 # 9. The code-signing certificate. macOS keys permission grants to the
 # signature's designated requirement: for a certificate-signed app that names
@@ -134,11 +142,20 @@ if [ ! -d "$INSTALLED" ] || [ "$VENV_RECREATED" = 1 ] || [ "$REBUILD" = 1 ] \
         die "$APP_NAME is running. Quit $APP_NAME from its menu first, then rerun ./setup.sh."
     fi
     OLD_DR=""
-    [ -d "$INSTALLED" ] && OLD_DR=$(designated_requirement "$INSTALLED")
+    if [ -d "$INSTALLED" ]; then
+        OLD_DR=$(designated_requirement "$INSTALLED")
+    elif legacy_is_dev; then
+        OLD_DR=$(designated_requirement "$LEGACY")
+    fi
     ./make-app.sh
     mkdir -p "$HOME/Applications"
     rm -rf "$INSTALLED"
     ditto "$APP_NAME.app" "$INSTALLED"
+    if legacy_is_dev; then
+        rm -rf "$LEGACY"
+        echo "Removed the old $LEGACY (renamed to $INSTALLED)."
+        echo "If Launch at login was on, toggle it off and on from the menu once."
+    fi
     # Grants made for a different designated requirement (an ad-hoc build's
     # code hash, or the first switch to the certificate) still show as
     # switched on in System Settings but no longer apply, so clear them and
