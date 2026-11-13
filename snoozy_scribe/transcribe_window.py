@@ -105,6 +105,9 @@ class TranscribeWindow:
         self._standalone = standalone
         self._window = None
         self._proc: subprocess.Popen | None = None
+        # Set when the window is closed mid-run, so reopening shows that
+        # run's progress, or its result if it finished while hidden.
+        self._closed_mid_run = False
         self._elapsed_timer = cocoa_ui.Repeater(1, self._tick_elapsed)
         # Quitting the host app mustn't leave transcribe.py running. The
         # notification center holds its observer weakly, like the targets.
@@ -118,13 +121,15 @@ class TranscribeWindow:
     def show(self) -> None:
         AppKit.NSApplication.sharedApplication()
         # A window closed while idle is rebuilt, so it re-reads config.yaml
-        # like a fresh process would; one hidden mid-run keeps its progress.
+        # like a fresh process would; one closed mid-run is kept.
         # A minimized window isn't visible either, but it's still open.
         window = self._window
-        if window is None or (not window.isVisible() and not window.isMiniaturized() and self._proc is None):
+        keep = self._proc is not None or self._closed_mid_run
+        if window is None or (not window.isVisible() and not window.isMiniaturized() and not keep):
             self._build()
         elif window.isMiniaturized():
             window.deminiaturize_(None)
+        self._closed_mid_run = False
         cocoa_ui.ensure_main_menu(identity.APP_NAME)
         if not self._standalone:
             cocoa_ui.set_regular(True)
@@ -652,6 +657,7 @@ class TranscribeWindow:
         return True
 
     def _will_close(self) -> None:
+        self._closed_mid_run = self._proc is not None
         if not self._standalone:
             cocoa_ui.set_regular(False)
 

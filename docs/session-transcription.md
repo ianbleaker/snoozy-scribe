@@ -113,7 +113,7 @@ A basic desktop window you can use instead of the CLI. Open it from the dictatio
 python3 gui.py
 ```
 
-While it's open the app shows a Dock icon, so a long run can't get lost behind other windows. Closing the window during a run keeps the run going: choose "Transcribe audio…" again to see its progress. Quitting the dictation app stops the run. Started from `gui.py`, there's nothing to reopen it from, so closing it during a run asks whether to stop the run and quit.
+While it's open the app shows a Dock icon, so a long run can't get lost behind other windows. Closing the window during a run keeps the run going: choose "Transcribe audio…" again to see its progress, or its result if it has finished. Quitting the dictation app stops the run. Started from `gui.py`, there's nothing to reopen it from, so closing it during a run asks whether to stop the run and quit.
 
 The window runs `transcribe.py` for you and shows a progress bar, the elapsed time, and its log output (collapsed by default; it opens by itself if a run fails). It exposes only a subset of the CLI's options:
 
