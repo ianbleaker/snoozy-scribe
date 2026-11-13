@@ -107,11 +107,15 @@ The prompt is built in (`snoozy_scribe/defaults/prompts/transcript-cleanup.md`).
 
 ## GUI
 
+A basic desktop window you can use instead of the CLI. Open it from the dictation app's menu ("Transcribe audio…"), or run it on its own:
+
 ```sh
 python3 gui.py
 ```
 
-A basic desktop window you can use instead of the CLI. It runs `transcribe.py` for you and shows a progress bar, the elapsed time, and its log output (collapsed by default; it opens by itself if a run fails). It exposes only a subset of the CLI's options:
+While it's open the app shows a Dock icon, so a long run can't get lost behind other windows. Closing the window during a run keeps the run going: choose "Transcribe audio…" again to see its progress. Quitting the dictation app stops the run. Started from `gui.py`, there's nothing to reopen it from, so closing it during a run asks whether to stop the run and quit.
+
+The window runs `transcribe.py` for you and shows a progress bar, the elapsed time, and its log output (collapsed by default; it opens by itself if a run fails). It exposes only a subset of the CLI's options:
 
 - Audio — a Craig `.zip` or export folder, an audio file, or a folder of audio files ("File…" or "Folder…"). Leave it blank to pick up the oldest `.zip` in `input_dir`, as the CLI does. The line under it shows what was detected: Craig export, single audio file, or the number of audio files in a folder.
 - Output folder (`--output-dir`) — prefilled with the config `output_dir`.
@@ -126,5 +130,3 @@ A basic desktop window you can use instead of the CLI. It runs `transcribe.py` f
 - Shared mic (`--shared-mic`) — several entries separated by `;`
 
 Everything else still comes from `settings/config.yaml`, including `vocabularies`. Advanced flags (`--language`, `--vocabulary`, `--test`, `--fresh`, thresholds, etc.) need the CLI. Cancel stops the run after a confirmation, and progress on completed tracks is saved (except in windowed runs), just like the CLI's Escape-then-y. When a run finishes, the window offers buttons to open the transcript or reveal it in Finder, and its log is saved next to the transcript as `<session-title>.log` (uncheck "Save log next to the transcript", or set `save_gui_log: false` in the config, to skip it). A separate-files run that wrote several transcripts has no single transcript to open: "Open folder" opens the output folder, the log is saved there as `batch-YYYYmmdd-HHMMSS.log`, failed files are listed in red, and the status reads `Done — K of N failed` when any failed.
-
-The GUI also opens from the dictation app's menu ("Transcribe audio…").
