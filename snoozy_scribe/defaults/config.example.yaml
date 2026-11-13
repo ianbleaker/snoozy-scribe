@@ -113,8 +113,8 @@ bleed_max_offset_s: 2
 # with `transcribe.py --show-bleed-markers` / `--hide-bleed-markers`.
 show_bleed_markers: false
 
-# Whether gui.py saves its log panel next to the transcript as
-# `<session-title>.log` after a successful run. The GUI's "Save log"
+# Whether the transcription window saves its log panel next to the transcript
+# as `<session-title>.log` after a successful run. The window's "Save log"
 # checkbox starts from this value. The CLI ignores it.
 save_gui_log: true
 
