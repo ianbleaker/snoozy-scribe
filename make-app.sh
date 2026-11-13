@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the app bundle, a double-clickable macOS launcher for the dictate.py
-# menu-bar app (its menu opens the gui.py session transcriber). The name,
+# menu-bar app (its menu opens the session transcription window). The name,
 # bundle ID and log path come from snoozy_scribe/identity.py.
 #
 # The bundle's executable is a small compiled launcher with this repo's
