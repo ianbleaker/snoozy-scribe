@@ -21,7 +21,7 @@ To test a fresh install without touching your own settings, point `SNOOZY_SCRIBE
 
 1. Check for Apple Silicon, Homebrew and the Xcode command-line tools.
 2. Create `.venv` with Homebrew's `python3` (Apple's `/usr/bin/python3` lacks the `python3-config --embed` that `make-app.sh` needs), or recreate it if it no longer starts or was created at another path (its scripts, `pip` included, hold the venv's absolute path): `"$(brew --prefix)/bin/python3" -m venv .venv`
-3. `.venv/bin/pip install --no-deps -r requirements.lock`
+3. `.venv/bin/pip install --require-hashes --no-deps -r requirements.lock`
 4. Warn if `ffmpeg` is missing (`brew install ffmpeg`; only session transcription needs it).
 5. Create the `snoozy-scribe Code Signing` certificate in the login keychain if `security find-identity -v -p codesigning` doesn't list it (see [Code signing](#code-signing)). If that fails, warn and carry on; the app is then signed ad-hoc.
 6. If `~/Applications/snoozy-scribe Dev.app` is missing, the venv was recreated, `--rebuild-app` was passed, or the installed copy is ad-hoc signed while the certificate exists: refuse while the app is running, run `./make-app.sh`, and copy the bundle with `ditto "snoozy-scribe Dev.app" ~/Applications/"snoozy-scribe Dev.app"`. An old `~/Applications/snoozy-scribe.app` with the dev bundle ID (the name before the dev/release split) is removed after the copy; its designated requirement counts as the old one, so the grants carry over. If Launch at login was on, toggle it off and on once: the login item records the bundle's path. If the designated requirement changed (`codesign -d -r-`), or the build is ad-hoc, clear the old grants with `tccutil reset <service> local.snoozy-scribe.gui` for Microphone, ListenEvent, Accessibility and PostEvent.
@@ -51,20 +51,26 @@ If scripting it fails, create it by hand: Keychain Access → Certificate Assist
 
 ## Dependencies and the lock
 
-`requirements.lock` pins the exact tested set. `requirements.txt` lists the direct dependencies with version ranges. If you change it, regenerate the lock in a throwaway venv, removing torch and the packages only it pulls in. Passing the current lock as a constraint (`-c`) keeps already-pinned packages at their tested versions and only adds what's new:
+`requirements.lock` pins the exact tested set. `requirements.txt` lists the direct dependencies with version ranges. If you change it, regenerate the lock in a throwaway venv, removing torch and the packages only it pulls in. Passing the current lock's pins as a constraint (`-c`; just the `name==version` lines, since hashes in a constraints file switch pip into require-hashes mode) keeps already-pinned packages at their tested versions and only adds what's new:
 
 ```sh
 python3 -m venv /tmp/lockvenv
-/tmp/lockvenv/bin/pip install -r requirements.txt -c requirements.lock
+grep -o '^[^ #][^ ]*==[^ ]*' requirements.lock > /tmp/lockvenv/pins.txt
+/tmp/lockvenv/bin/pip install -r requirements.txt -c /tmp/lockvenv/pins.txt
 /tmp/lockvenv/bin/pip uninstall -y torch sympy mpmath networkx setuptools numba llvmlite scipy
 /tmp/lockvenv/bin/pip freeze > requirements.lock
+/tmp/lockvenv/bin/pip install uv
+MACOSX_DEPLOYMENT_TARGET=14.0 /tmp/lockvenv/bin/uv pip compile requirements.lock --no-deps --generate-hashes \
+    --python-version 3.14 --python-platform aarch64-apple-darwin -o requirements.lock
 ```
+
+The last step adds sha256 hashes to every pin without changing a version, so installs are reproducible: `setup.sh` installs with `--require-hashes`, and the packaged app's first launch syncs the same lock with `uv`. `MACOSX_DEPLOYMENT_TARGET=14.0` matches the app's minimum macOS (mlx publishes wheels for macOS 14 and later); without it uv targets macOS 13 and fails. The lock holds the hashes of every wheel for each pin, so each Mac still installs the wheel built for its own macOS version.
 
 numba, llvmlite and scipy come out too: mlx-whisper only uses them for word timestamps, which we never request, and `snoozy_scribe/whisper_stubs.py` stands in for them at import (about 250MB saved). Requesting `word_timestamps=True` would raise.
 
 Jinja2 and MarkupSafe stay in the lock: transformers (pulled in by mlx-lm) needs jinja2 to render the dictation cleanup model's chat template.
 
-Then rebuild `.venv` from the lock: `rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install --no-deps -r requirements.lock`. `pip check` will report that mlx-whisper requires torch, numba and scipy, which are not installed — that's expected.
+Then rebuild `.venv` from the lock: `rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install --require-hashes --no-deps -r requirements.lock`. `pip check` will report that mlx-whisper requires torch, numba and scipy, which are not installed — that's expected.
 
 ## Testing dictation without the app
 

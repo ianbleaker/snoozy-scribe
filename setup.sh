@@ -62,9 +62,10 @@ if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c 'import sys' >/dev/null 2>
 fi
 
 # 6. Dependencies. --no-deps skips torch, which mlx-whisper declares but
-# doesn't need (docs/development.md).
+# doesn't need (docs/development.md). The lock carries sha256 hashes, so a
+# tampered or changed wheel is refused.
 echo "Installing dependencies from requirements.lock"
-.venv/bin/pip install --quiet --disable-pip-version-check --no-deps -r requirements.lock
+.venv/bin/pip install --quiet --disable-pip-version-check --require-hashes --no-deps -r requirements.lock
 
 # 7. ffmpeg is only needed for session transcription.
 if ! command -v ffmpeg >/dev/null 2>&1; then
