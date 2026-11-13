@@ -93,6 +93,8 @@ have_signing_identity() {
     security find-identity -v -p codesigning 2>/dev/null | grep -qF "\"$SIGNING_IDENTITY\""
 }
 
+. "$REPO_DIR/packaging/codesign-cert.sh"
+
 create_signing_identity() {
     keychain="$HOME/Library/Keychains/login.keychain-db"
     tmp=$(mktemp -d)
@@ -102,15 +104,7 @@ create_signing_identity() {
         security find-certificate -c "$SIGNING_IDENTITY" -p "$keychain" >"$tmp/cert.pem" || return 1
     else
         echo "Creating the \"$SIGNING_IDENTITY\" certificate in your login keychain"
-        # Apple's LibreSSL: Homebrew's OpenSSL 3 writes .p12 files that
-        # `security import` can't read.
-        /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -subj "/CN=$SIGNING_IDENTITY" -keyout "$tmp/key.pem" -out "$tmp/cert.pem" \
-            -addext "basicConstraints=critical,CA:false" \
-            -addext "keyUsage=critical,digitalSignature" \
-            -addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1 || return 1
-        /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
-            -out "$tmp/identity.p12" -passout pass:snoozy-scribe || return 1
+        make_codesign_identity "$SIGNING_IDENTITY" "$tmp" snoozy-scribe || return 1
         # -T lets codesign use the key without a keychain prompt.
         security import "$tmp/identity.p12" -k "$keychain" -P snoozy-scribe \
             -T /usr/bin/codesign >/dev/null || return 1
