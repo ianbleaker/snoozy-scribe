@@ -119,8 +119,12 @@ class TranscribeWindow:
         AppKit.NSApplication.sharedApplication()
         # A window closed while idle is rebuilt, so it re-reads config.yaml
         # like a fresh process would; one hidden mid-run keeps its progress.
-        if self._window is None or (not self._window.isVisible() and self._proc is None):
+        # A minimized window isn't visible either, but it's still open.
+        window = self._window
+        if window is None or (not window.isVisible() and not window.isMiniaturized() and self._proc is None):
             self._build()
+        elif window.isMiniaturized():
+            window.deminiaturize_(None)
         cocoa_ui.ensure_main_menu(identity.APP_NAME)
         if not self._standalone:
             cocoa_ui.set_regular(True)
