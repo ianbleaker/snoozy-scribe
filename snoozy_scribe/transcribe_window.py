@@ -390,6 +390,9 @@ class TranscribeWindow:
                     InputKind.LOOSE_FOLDER: f"Folder: {len(detected.audio_files)} audio files",
                 }[detected.kind]
         self.detected_label.setStringValue_(f"Detected: {text}" if text else "")
+        if self._log_scroll.isHidden():
+            # A wrapped input error changes the form's height.
+            self._fit_collapsed()
         self._apply_input_rules()
 
     def _separate(self) -> bool:
@@ -688,16 +691,20 @@ class TranscribeWindow:
                 self._expanded_height = self._window.frame().size.height
             self._log_scroll.setHidden_(True)
             self.log_toggle.setTitle_("▸ Show log")
-            self._window.setMaxSize_(unlimited)
             self._window.setMinSize_(AppKit.NSMakeSize(MIN_WIDTH, 0))
-            self._root.layoutSubtreeIfNeeded()
-            content_height = self._root.fittingSize().height
-            height = self._window.frameRectForContentRect_(
-                AppKit.NSMakeRect(0, 0, WINDOW_WIDTH, content_height)
-            ).size.height
-            self._set_frame_height(height)
-            # Nothing to give extra height to while the log is hidden.
-            self._window.setMaxSize_(AppKit.NSMakeSize(Foundation.CGFLOAT_MAX, height))
+            self._fit_collapsed()
+
+    def _fit_collapsed(self) -> None:
+        """Size the window to its content while the log is hidden."""
+        self._window.setMaxSize_(AppKit.NSMakeSize(Foundation.CGFLOAT_MAX, Foundation.CGFLOAT_MAX))
+        self._root.layoutSubtreeIfNeeded()
+        content_height = self._root.fittingSize().height
+        height = self._window.frameRectForContentRect_(
+            AppKit.NSMakeRect(0, 0, WINDOW_WIDTH, content_height)
+        ).size.height
+        self._set_frame_height(height)
+        # Nothing to give extra height to while the log is hidden.
+        self._window.setMaxSize_(AppKit.NSMakeSize(Foundation.CGFLOAT_MAX, height))
 
     def _log_append(self, text: str, tag: str | None = None) -> None:
         if tag == "error" and self._log_scroll.isHidden():
